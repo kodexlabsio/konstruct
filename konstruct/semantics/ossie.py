@@ -38,6 +38,7 @@ import sqlglot
 import yaml
 from sqlglot import exp
 
+from konstruct import _core
 from konstruct.core import yamlio
 from konstruct.core.graph import RELATION_KINDS, Graph, Node
 from konstruct.core.sql import PARSE_ERRORS
@@ -50,7 +51,7 @@ FILE_SUFFIXES = ('.ossie.yaml', '.ossie.yml')
 EXPORT_VERSION = '0.2.0.dev0'
 VENDOR = 'KONSTRUCT'
 # The table name that marks a source column in a stored metric expression.
-_TOKENS = '_konstruct_column'
+_TOKENS = TOKENS = '_konstruct_column'
 # The expression dialects Konstruct can read, best first; OSSIE_SQL_2026 is ANSI SQL.
 _READABLE = ('OSSIE_SQL_2026', 'ANSI_SQL')
 _SQLGLOT_DIALECTS = {
@@ -299,6 +300,12 @@ class Binding:
     reads: dict[str, dict[str, str]] = field(default_factory=dict)
     """Metric name to the datasets its expression names and their relation ids, so the export
     knows when the metric can be written back as authored."""
+    missing: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    """(dataset, field) to the columns its expression reads that the dataset's relation lacks."""
+    unreadable: set[tuple[str, str]] = field(default_factory=set)
+    """The (dataset, field) pairs whose expression is not valid SQL."""
+    unbound: dict[str, str] = field(default_factory=dict)
+    """Dataset name to its source, for each dataset whose source is not in the graph."""
 
 
 def _tree(sql: str, dialect: str | None) -> exp.Expression | None:
@@ -309,15 +316,34 @@ def _tree(sql: str, dialect: str | None) -> exp.Expression | None:
         return None
 
 
-def bind(graph: Graph, model: Model) -> Binding:
-    """Resolve ``model``'s datasets, fields and metrics to the graph's relations and columns."""
+def bind(
+    graph: Graph,
+    model: Model,
+    *,
+    physical: bool = False,
+    parsed: dict[tuple[str, str | None], exp.Expression | None] | None = None,
+) -> Binding:
+    """Resolve ``model``'s datasets, fields and metrics to the graph's relations and columns.
+
+    With ``physical``, a metric may also read a column of its dataset's relation that no field
+    names, as a platform's metric view lets it. ``parsed`` holds expressions the caller has
+    parsed already, by text and dialect, which are only read."""
     result = Binding()
+    cache = parsed if parsed is not None else {}
+
+    def parse_sql(sql: str, dialect: str | None) -> exp.Expression | None:
+        if (sql, dialect) not in cache:
+            cache[sql, dialect] = _tree(sql, dialect)
+        return cache[sql, dialect]
+
+    token_ids: dict[str, str] = {}
     where = f'{model.path}: model {model.name!r}'
     trees: dict[tuple[str, str], exp.Expression] = {}  # each field over token columns
     tokens: dict[str, str] = {}  # column id -> token
 
     def token(node: Node) -> exp.Column:
         name = tokens.setdefault(node.id, f'c{len(tokens)}')
+        token_ids[name] = node.id
         return exp.column(name, table=_TOKENS)
 
     for dataset in model.datasets.values():
@@ -329,12 +355,14 @@ def bind(graph: Graph, model: Model) -> Binding:
             result.problems.append(
                 f'{where}: dataset {dataset.name!r} reads {dataset.source!r}, which does not exist'
             )
+            result.unbound[dataset.name] = dataset.source
             continue
         result.relations[dataset.name] = relation
         for name, (sql, dialect) in dataset.fields.items():
-            tree = _tree(sql, dialect)
+            tree = parse_sql(sql, dialect)
             if tree is None:
                 result.problems.append(f'{where}: field {dataset.name}.{name} is not valid SQL')
+                result.unreadable.add((dataset.name, name))
                 continue
             found = []
             unresolved = False
@@ -342,6 +370,7 @@ def bind(graph: Graph, model: Model) -> Binding:
                 node = graph.column(relation.id, column.name)
                 if node is None:
                     unresolved = True
+                    result.missing.setdefault((dataset.name, name), []).append(column.name)
                     result.problems.append(
                         f'{where}: field {dataset.name}.{name} reads {column.name!r}, which '
                         f'{graph.label(relation)} does not have'
@@ -373,7 +402,7 @@ def bind(graph: Graph, model: Model) -> Binding:
             result.problems.append(f'{where}: metric {metric.name!r} has no expression Konstruct can read')
             result.failed.add(metric.name)
             continue
-        tree = _tree(metric.sql, metric.dialect)
+        tree = parse_sql(metric.sql, metric.dialect)
         if tree is None:
             result.problems.append(f'{where}: metric {metric.name!r} is not valid SQL')
             result.failed.add(metric.name)
@@ -403,9 +432,15 @@ def bind(graph: Graph, model: Model) -> Binding:
                 )
                 result.failed.add(metric.name)
                 continue
+            if physical and key is not None and key not in result.fields and key[0] in result.relations:
+                column_node = graph.column(result.relations[key[0]].id, key[1])
+                if column_node is not None:
+                    result.fields[key] = [column_node]
+                    trees[key] = token(column_node)
             if key is None or key not in result.fields:
                 result.problems.append(
-                    f'{where}: metric {metric.name!r} reads {column.sql()!r}, which is not a field of the model'
+                    f'{where}: metric {metric.name!r} reads {column.sql()!r}, which '
+                    + ('the code no longer has' if physical else 'is not a field of the model')
                 )
                 result.failed.add(metric.name)
                 continue
@@ -425,7 +460,7 @@ def bind(graph: Graph, model: Model) -> Binding:
             used = {c.name for c in portable.find_all(exp.Column) if c.table == _TOKENS}
             result.portable[metric.name] = (
                 portable.sql(dialect=metric.dialect),
-                {t: i for i, t in tokens.items() if t in used},
+                {t: token_ids[t] for t in used},
             )
         if metric.dataset is not None and metric.dataset in result.relations:
             result.datasets[metric.name] = result.relations[metric.dataset].id
@@ -456,6 +491,259 @@ def bind(graph: Graph, model: Model) -> Binding:
             result.problems.append(
                 f'{where}: relationship {rel_name!r} joins fields that are not one column each'
             )
+    return result
+
+
+# A platform's semantic layer, bound
+
+
+@dataclass
+class LayerBinding:
+    """A platform semantic layer (``konstruct._core.conform_*``'s document) bound to the graph."""
+
+    binding: Binding
+    trees: dict[str, exp.Expression | None] = field(default_factory=dict)
+    """Metric name to its parsed expression, None if it does not parse."""
+    resolution: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Metric name to how reading it went, for the native check to classify."""
+    columns: list[dict[str, Any]] = field(default_factory=list)
+    """What is wrong with a field or table: ``unparsed``, ``unbound`` or ``column-missing``."""
+    owners: dict[tuple[str, str], str] = field(default_factory=dict)
+    """(table, field) to the table whose relation the field reads."""
+
+
+def layer_dialect(item: dict[str, Any], layer: dict[str, Any]) -> str | None:
+    found = item.get('dialect') or layer.get('dialect')
+    return str(found) if found else None
+
+
+_FILTERABLE = (exp.Sum, exp.Count, exp.Avg, exp.Min, exp.Max)
+"""The aggregates that skip a NULL, so that ``AGG(CASE WHEN c THEN x END)`` aggregates the rows
+where ``c`` holds."""
+
+
+def _own_condition(aggregate: exp.AggFunc) -> str | None:
+    """The condition ``AGG(CASE WHEN c THEN x END)`` (or ``IF(c, x, NULL)``, or the simple
+    ``CASE col WHEN v THEN x END``, read as ``col = v``) keeps the rows of, as text. The rows an
+    ``ELSE`` other than NULL keeps are all of them, except that a ``SUM`` with ``ELSE 0`` differs
+    from one without only by 0 for NULL on an empty set."""
+    case = aggregate.this
+    if isinstance(case, exp.Distinct) and len(case.expressions) == 1:
+        case = case.expressions[0]
+    if isinstance(case, exp.If):
+        condition, default = case.this, case.args.get('false')
+    elif isinstance(case, exp.Case) and len(case.args.get('ifs') or []) == 1:
+        branch = case.args['ifs'][0]
+        condition = (
+            branch.this if case.this is None else exp.EQ(this=case.this.copy(), expression=branch.this.copy())
+        )
+        default = case.args.get('default')
+    else:
+        return None
+    zero = isinstance(default, exp.Literal) and not default.is_string and default.name == '0'
+    if default is None or isinstance(default, exp.Null) or (zero and isinstance(aggregate, exp.Sum)):
+        return str(condition.sql())
+    return None
+
+
+def own_conditions(tree: exp.Expression) -> list[str]:
+    """The conditions a metric keeps the rows it aggregates under, as text: those every one of its
+    aggregates carries, as ``AGG(x) FILTER (WHERE c)`` or ``AGG(CASE WHEN c THEN x END)`` says
+    (no ``ELSE``, or ``ELSE NULL``; for ``SUM`` also ``ELSE 0``). A ``CASE`` with another ``ELSE``
+    keeps every row."""
+    per: list[set[str]] = []
+    for aggregate in tree.find_all(exp.AggFunc):
+        if aggregate.find_ancestor(exp.AggFunc) is not None:
+            continue
+        found: set[str] = set()
+        wrapper = aggregate.parent
+        if isinstance(wrapper, exp.Filter) and wrapper.this is aggregate:
+            found.add(wrapper.expression.this.sql())
+        if isinstance(aggregate, _FILTERABLE) and (condition := _own_condition(aggregate)) is not None:
+            found.add(condition)
+        per.append(found)
+    return sorted(set.intersection(*per)) if per else []
+
+
+_REPEATABLE = (exp.Min, exp.Max, exp.AnyValue)
+"""The aggregates a row repeated does not change."""
+
+
+def fan_out(item: dict[str, Any], tree: exp.Expression, layer: dict[str, Any]) -> str | None:
+    """Why a metric of a table that refers to a parent counts the parent's rows more than once, if
+    it does: it aggregates a column of the parent (``orders.total``) at the grain of the table it
+    belongs to (``line_items``), so each order is counted once for each of its line items. Not
+    what the parent's own metric computes, so the two are not compared."""
+    owner = str(item.get('table') or '')
+    parents = {
+        r['to'].lower()
+        for r in layer['relationships']
+        if r['from'].lower() == owner.lower()
+        and (r.get('cardinality') or 'many_to_one').replace('-', '_') != 'one_to_one'
+    }
+    for aggregate in tree.find_all(exp.AggFunc) if parents else ():
+        if isinstance(aggregate, _REPEATABLE) or (
+            isinstance(aggregate, exp.Count) and isinstance(aggregate.this, exp.Distinct)
+        ):
+            continue
+        for column in aggregate.find_all(exp.Column):
+            if column.table.lower() in parents:
+                return (
+                    f'it aggregates {column.table}.{column.name}, a column of a parent of {owner}, '
+                    f'once for each {owner} row'
+                )
+    return None
+
+
+def bind_layer(graph: Graph, layer: dict[str, Any], key: str, where: str) -> LayerBinding:
+    """Resolve a platform's semantic layer to the graph's relations and columns: each logical
+    table to the relation it reads, each fact and dimension to the columns its expression reads,
+    each metric to the columns it reads through them. Expressions are parsed with sqlglot, never
+    run. A field built on other fields, and a metric built on other metrics, are not bound: the
+    view checks them on their own."""
+    result = LayerBinding(Binding())
+    trees: dict[str, exp.Expression | None] = {}
+
+    parsed: dict[tuple[str, str | None], exp.Expression | None] = {}
+
+    def tree(item: dict[str, Any]) -> exp.Expression | None:
+        dialect = layer_dialect(item, layer)
+        if (item['expr'], dialect) not in parsed:
+            parsed[item['expr'], dialect] = _tree(item['expr'], dialect)
+        return parsed[item['expr'], dialect]
+
+    def problem(kind: str, name: str, state: str, detail: str) -> None:
+        result.columns.append({'document': key, 'kind': kind, 'name': name, 'state': state, 'detail': detail})
+
+    model = Model(name=layer['name'], path=where)
+    for table in layer['tables']:
+        model.datasets[table['name']] = Dataset(
+            table['name'], table['source'], primary_key=list(table['primary_key'])
+        )
+    by_name = {t['name'].lower(): t['name'] for t in layer['tables']}
+    named = {(t['name'].lower(), f['name'].lower()) for t in layer['tables'] for f in t['fields']}
+    built: set[tuple[str, str]] = set()
+    broken: set[tuple[str, str]] = set()  # facts and dimensions whose expression does not parse
+    for table in layer['tables']:
+        for item in table['fields']:
+            found = tree(item)
+            label = f'{table["name"]}.{item["name"]}'
+            if found is None:
+                broken.add((table['name'].lower(), item['name'].lower()))
+                problem(item['kind'], label, 'unparsed', 'its expression does not parse')
+                continue
+            own = (table['name'].lower(), item['name'].lower())
+            reads = {((c.table or table['name']).lower(), c.name.lower()) for c in found.find_all(exp.Column)}
+            if (reads & named) - {own}:
+                built.add(own)
+                problem(
+                    item['kind'],
+                    label,
+                    'unbound',
+                    'is built on other facts or dimensions of the view, which are checked on their own',
+                )
+                continue
+            # A field over a joined table's columns belongs to that table's relation.
+            qualifiers = {c.table.lower() for c in found.find_all(exp.Column)}
+            owner = table['name']
+            if len(qualifiers) == 1 and (only := by_name.get(next(iter(qualifiers)))) is not None:
+                owner = only
+            model.datasets[owner].fields[item['name']] = (item['expr'], layer_dialect(item, layer))
+            result.owners[table['name'], item['name']] = owner
+    names = {_core.conform_norm(m['name']) for m in layer['metrics']}
+    derived: dict[str, str] = {}
+    for item in layer['metrics']:
+        found = trees[item['name']] = tree(item)
+        if found is None:
+            continue
+        columns = list(found.find_all(exp.Column))
+        if any(((c.table or item.get('table') or '').lower(), c.name.lower()) in built for c in columns):
+            derived[item['name']] = 'is built on facts that read other facts, which are checked on their own'
+            continue
+        if any(
+            _core.conform_norm(c.name) in names
+            and _core.conform_norm(c.name) != _core.conform_norm(item['name'])
+            for c in columns
+        ):
+            derived[item['name']] = 'is derived from other metrics, which are compared as they are'
+            continue
+        qualified = bool(columns) and all(c.table and c.table.lower() != 'source' for c in columns)
+        owner = item.get('table')
+        model.metrics.append(
+            Metric(
+                item['name'],
+                item['expr'],
+                dataset=None if qualified or owner is None else owner,
+                dialect=layer_dialect(item, layer),
+                synonyms=list(item['synonyms']),
+            )
+        )
+    model.relationships = [
+        {k: r[k] for k in ('name', 'from', 'to', 'from_columns', 'to_columns')}
+        for r in layer['relationships']
+    ]
+    binding = result.binding = bind(graph, model, physical=True, parsed=parsed)
+    result.trees = trees
+    lacking = {name.lower(): source for name, source in binding.unbound.items()}
+    blamed: set[str] = set()
+    for item in layer['metrics']:
+        found = trees[item['name']]
+        name = item['name']
+        missing: list[str] = []
+        unbound = ''
+        if found is not None:
+            tables = {c.table.lower() for c in found.find_all(exp.Column) if c.table}
+            if item.get('table'):
+                tables.add(str(item['table']).lower())
+            unbound = ', '.join(sorted(lacking[t] for t in tables if t in lacking))
+            for column in found.find_all(exp.Column):
+                table = column.table or item.get('table') or ''
+                for (owner, field_name), names_ in binding.missing.items():
+                    if field_name.lower() == column.name.lower() and (
+                        not table or owner.lower() == table.lower() or owner == 'source'
+                    ):
+                        missing += names_
+                        blamed.add(f'{owner}.{field_name}')
+        unreadable = sorted(
+            {
+                f'{c.table or item.get("table")}.{c.name}'
+                for c in found.find_all(exp.Column)
+                if ((c.table or item.get('table') or '').lower(), c.name.lower()) in broken
+            }
+            if found is not None
+            else ()
+        )
+        result.resolution[name] = {
+            'parsed': found is not None,
+            'unreadable': ', '.join(unreadable),
+            'fan_out': fan_out(item, found, layer) if found is not None else None,
+            'derived': derived.get(name),
+            'unsupported': item.get('unsupported'),
+            'unbound_tables': unbound,
+            'portable': name in binding.portable,
+            'failed': name in binding.failed or name not in binding.metrics,
+            'table_unbound': bool(item.get('table')) and item['table'] in binding.unbound,
+            'problem': next((p for p in binding.problems if f'metric {name!r} ' in p), None),
+            'missing': sorted(set(missing)),
+        }
+    for table in layer['tables']:
+        name = table['name']
+        if name in binding.unbound:
+            problem('table', name, 'unbound', f'reads {table["source"]}, which the graph does not have')
+            continue
+        for item in table['fields']:
+            owner = result.owners.get((name, item['name']), name)
+            lacks = binding.missing.get((owner, item['name']))
+            label = f'{name}.{item["name"]}'
+            if lacks and f'{owner}.{item["name"]}' not in blamed:
+                relation = binding.relations.get(owner)
+                shown = graph.label(relation) if relation is not None else table['source']
+                problem(
+                    item['kind'],
+                    label,
+                    'column-missing',
+                    f'reads {", ".join(lacks)}, which {shown} does not have',
+                )
     return result
 
 

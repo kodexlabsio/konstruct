@@ -53,6 +53,10 @@ from konstruct import _core
 from konstruct.analysis.explain import Explainer, composed_from, short_sql
 from konstruct.core.graph import RELATION_KINDS, Graph, Node
 from konstruct.core.sql import PARSE_ERRORS
+from konstruct.semantics.ossie import TOKENS
+
+ROWS = '_konstruct_rows'
+"""The table name that stands for the rows of the relation an expression is evaluated over."""
 
 SCHEME = 4
 """The version of the fingerprints: two fingerprints compare only under the same scheme."""
@@ -609,6 +613,10 @@ class Formulas:
         self.calls = 0
         self.joins: dict[str, str] = {}
         self.outer: dict[str, bool] = {}
+        # What is worked out once however many expressions share a lineage.
+        self._explained: dict[str, Any] = {}
+        self._conjuncts: dict[str, list[tuple[str, int]]] = {}
+        self._shown: dict[str, str] = {}
 
     def _add(self, text: str, context: str, labels: list[exp.Expr], columns: list[exp.Column]) -> int | None:
         try:
@@ -821,6 +829,132 @@ class Formulas:
         self.labels.append(([], []))
         return self.core.add(self._variable(node.id, graph.label(node), self._not_null(node)), context)
 
+    def foreign(
+        self,
+        expression: str,
+        columns: dict[str, Node],
+        *,
+        dialect: str | None = None,
+        rows: Node | None = None,
+    ) -> int:
+        """The definition of an expression another system wrote, over graph columns: each
+        ``_konstruct_column.<token>`` in it stands for the column ``columns`` gives the token,
+        whose composed formula takes its place. Its aggregates run under the conditions of the
+        first column's relation, as the column's own would. ``rows`` is the relation the expression
+        is evaluated over, whose rows an aggregate that reads no column (``COUNT(*)``, ``COUNT(1)``,
+        ``SUM(1)``) aggregates: no column says which they are, so such aggregates over two relations
+        are not the same. Raises ValueError for SQL that does not parse
+        or nests too deeply."""
+        assert self.graph is not None, 'Formulas made without a graph'
+        graph = self.graph
+        try:
+            tree = sqlglot.parse_one(expression, read=Dialect.get_or_raise(dialect or self.dialect))
+        except PARSE_ERRORS as error:
+            raise ValueError(f'cannot read {expression[:200]!r}') from error
+        shown: dict[str, Node] = {}
+
+        def readable(item: exp.Expr) -> exp.Expr:
+            # Written as the column's own relation and name, which a witness shows.
+            if isinstance(item, exp.Column) and item.table == TOKENS and item.name in columns:
+                node = columns[item.name]
+                owner = graph.parent_of(node)
+                label = graph.label(owner) if owner is not None else ''
+                shown[f'{label}.{node.name}'] = node
+                return exp.column(node.name, table=label or None)
+            return item
+
+        tree = tree.transform(readable)
+        if rows is not None:
+            tree = tree.transform(lambda item: _over_rows(item, rows))
+
+        def column(item: exp.Column) -> str:
+            name = f'{item.table}.{item.name}' if item.table else item.name
+            if item.table == ROWS and rows is not None:
+                return self._variable(name, f'rows of {graph.label(rows)}')
+            node = shown.get(name)
+            if node is None:
+                return self._variable(name, name)
+            return f'(ref {self.column(node)})'
+
+        def volatile() -> str:
+            self.calls += 1
+            return str(self.calls)
+
+        emitter = _Emitter(column, volatile)
+        first = next(iter(columns.values()), None)
+        context = self._context(first) if first is not None and self.conditions else ''
+        definition = self._add(emitter.text(tree), context, emitter.labels, [])
+        if definition is None:
+            raise ValueError(f'{tree.sql()[:200]!r} is nested too deeply to compare')
+        return definition
+
+    def explained(self, column: Node) -> Any:
+        """The explanation of a column, made once."""
+        assert self.explainer is not None
+        if column.id not in self._explained:
+            self._explained[column.id] = self.explainer.explain(column)
+        return self._explained[column.id]
+
+    def condition_parts(self, text: str | None) -> list[int]:
+        """The definitions of the conjuncts of a condition that parse, each compared by what it
+        computes (see :meth:`condition`): a filter a term requires is one a layer's own filter
+        keeps when every one of its parts is one of the layer's, which the native core tests, since
+        no column of the graph says which of its rows a whole view keeps."""
+        parts = _split_and(text, self.dialect) if text else []
+        return [d for p in parts if (d := self.condition(p)) is not None]
+
+    def shown(self, expression: str, columns: dict[str, Node], dialect: str | None, where: str | None) -> str:
+        """A foreign expression with each column replaced by what the code composes it from,
+        and the conditions on the rows it reads."""
+        try:
+            tree = sqlglot.parse_one(expression, read=dialect)
+        except PARSE_ERRORS:
+            return expression
+        conditions: list[str] = []
+
+        def swap(found: exp.Expr) -> exp.Expr:
+            if isinstance(found, exp.Column) and found.table == TOKENS and found.name in columns:
+                explanation = self.explained(columns[found.name])
+                for step in explanation.steps:
+                    for condition in step.conditions:
+                        label, sep, text = condition.partition(': ')
+                        if sep and label in ('WHERE', 'HAVING', 'QUALIFY') and text not in conditions:
+                            conditions.append(text)
+                text = explanation.composed or explanation.label
+                try:
+                    return exp.Paren(this=sqlglot.parse_one(text, read=self.dialect))
+                except PARSE_ERRORS:
+                    return exp.column(explanation.label)
+            return found
+
+        assert self.graph is not None
+        shown = short_sql(self.graph, tree.transform(swap).sql(dialect=dialect))
+        if where:
+            conditions.append(where)
+        for condition in conditions:
+            if condition not in self._shown:
+                self._shown[condition] = short_sql(self.graph, condition, condition=True)
+        rows = ' AND '.join(self._shown[c] for c in conditions)
+        return shown + (f'  WHERE {rows}' if conditions else '')
+
+    def condition(self, text: str) -> int | None:
+        """The definition of a condition, with its columns named without a table, in lower case,
+        so that ``orders.status = 'x'`` is ``STATUS = 'x'``; None if it does not parse."""
+        try:
+            tree = sqlglot.parse_one(text, read=self.dialect)
+        except PARSE_ERRORS:
+            return None
+
+        def bare(item: exp.Expr) -> exp.Expr:
+            if isinstance(item, exp.Column):
+                return exp.column(item.name.lower())
+            return item
+
+        try:
+            return self.add(tree.transform(bare))
+        except ValueError:
+            return None
+
     def _outer(self, relation: Node) -> bool:
         """Whether the relation has an outer join, so that a column it reads may be NULL where
         the input's own tests say it is not. Which side may have no match is not recorded, so
@@ -934,6 +1068,33 @@ class Formulas:
             else:
                 found[self._mention(name, definition, label)] = _shown(value)
         return found
+
+
+def _over_rows(item: exp.Expr, rows: Node) -> exp.Expr:
+    """An aggregate that reads no column, over the rows that exist in ``rows``' relation:
+    ``AGG(x)`` as ``AGG(CASE WHEN <rows> IS NOT NULL THEN x END)``, with ``*`` as 1."""
+    if not isinstance(item, exp.AggFunc) or isinstance(item.this, exp.Distinct):
+        return item
+    if any(True for _ in item.find_all(exp.Column)):
+        return item
+    argument = item.this
+    if argument is None or isinstance(argument, exp.Star):
+        argument = exp.Literal.number(1)
+    present = exp.Not(this=exp.Is(this=exp.column(rows.id, table=ROWS), expression=exp.Null()))
+    owned = item.copy()
+    owned.set('this', exp.Case(ifs=[exp.If(this=present, true=argument.copy())]))
+    return owned
+
+
+def _split_and(text: str, dialect: Any) -> list[str]:
+    """The conjuncts of a condition, each as text; the text itself if it does not parse."""
+    try:
+        tree = sqlglot.parse_one(text, read=dialect)
+    except PARSE_ERRORS:
+        return [text]
+    if isinstance(tree, exp.And):
+        return [t.sql(dialect=dialect) for t in tree.flatten() if not isinstance(t, exp.And)]
+    return [text]
 
 
 def _shown(value: str | None) -> str:
