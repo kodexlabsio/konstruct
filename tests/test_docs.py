@@ -24,7 +24,10 @@ def test_the_mcp_reference_lists_every_tool() -> None:
         for node in build.body
         if isinstance(node, ast.FunctionDef)
         and any(
-            isinstance(d, ast.Call) and getattr(d.func, 'attr', '') == 'tool' for d in node.decorator_list
+            # A tool is served with @server.tool, or with @view when a host can draw it.
+            isinstance(d, ast.Call)
+            and (getattr(d.func, 'attr', '') == 'tool' or getattr(d.func, 'id', '') == 'view')
+            for d in node.decorator_list
         )
     }
     page = (ROOT / 'docs' / 'reference' / 'mcp.md').read_text()

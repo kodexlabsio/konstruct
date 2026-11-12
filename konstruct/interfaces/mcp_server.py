@@ -3,7 +3,9 @@
 The server rereads graph.json whenever it changes, so `konstruct build --update` in another
 terminal is picked up without restarting the agent. Besides its tools it offers the workflows of
 Konstruct's skills as prompts, and the report, the ontology and a summary of the graph as
-resources.
+resources. In a host with the MCP Apps extension it also draws the results of `impact`, `explain`
+and `gate` (and `conform`, where the server has it) in views, each a page `pnpm build` writes into
+``konstruct/outputs/views/``; the text result stays the whole answer, for every host.
 """
 
 from __future__ import annotations
@@ -15,9 +17,10 @@ import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from mcp.server import MCPServer
+from mcp.server.apps import Apps, ResourceCsp, ResourcePermissions
 from mcp.server.mcpserver.exceptions import ResourceError, ToolError
 from mcp.types import ToolAnnotations
 
@@ -28,6 +31,7 @@ from konstruct.engine.config import Config, ConfigError
 from konstruct.interfaces import toolkit
 from konstruct.interfaces.project import Project
 from konstruct.interfaces.untrusted import UNTRUSTED_CONTENT as UNTRUSTED_CONTENT
+from konstruct.outputs.html import view_html
 from konstruct.plugins.registry import describe as describe_error
 from konstruct.semantics.ontology import name_matches
 
@@ -174,13 +178,43 @@ PLUGIN_TOOL = ToolAnnotations(
 defaults, stated explicitly."""
 
 
+# A view gets everything it draws from the host, over the Apps bridge, so it asks the host to let it
+# reach nothing: no connection, no script, style, image or font from anywhere, no frame and no base.
+# Each page's own Content-Security-Policy says the same; the host's is the outer bound.
+VIEW_CSP = ResourceCsp(connect_domains=[], resource_domains=[], frame_domains=[], base_uri_domains=[])
+# The one thing a view asks for: writing to the clipboard, for its copy buttons. A host that refuses
+# it gets the text selected for the keyboard instead.
+VIEW_PERMISSIONS = ResourcePermissions(clipboard_write={})
+
+_Tool = TypeVar('_Tool', bound=Callable[..., Any])
+
+
+def view(apps: Apps, name: str, **options: Any) -> Callable[[_Tool], _Tool]:
+    """Serve a tool, with ``options`` as ``MCPServer.add_tool`` takes them, bound to the view
+    ``name``, and serve that view: a view is offered only for a tool the server has."""
+    uri = f'ui://konstruct/{name}'
+    apps.add_html_resource(
+        uri,
+        view_html(name),
+        name=f'{name}-view',
+        title=f'{name.capitalize()} view',
+        description=f"Draws the result of the {name} tool. The tool's text result holds the whole answer.",
+        csp=VIEW_CSP,
+        permissions=VIEW_PERMISSIONS,
+        prefers_border=True,
+    )
+    return apps.tool(resource_uri=uri, **options)
+
+
 def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> MCPServer:
     """The server over the graph of the project at ``root``. ``plugins=False`` serves no plugin's
     tools. ``prompts=False`` leaves out the workflow prompts and the instruction that names them,
     for a setup with only the general skill (the agent benchmark's general-skill arm)."""
     project = Project(root, plugins=plugins)
     instructions = INSTRUCTIONS + RESOURCES_NOTE + (PROMPTS_NOTE if prompts else '')
-    server = MCPServer('konstruct', version=__version__, instructions=instructions)
+    # The tools a host with the MCP Apps extension draws: each is bound to its view, which the
+    # extension serves as a resource. The extension is part of the server from its construction.
+    apps = Apps()
 
     def run(func: Callable[..., Any], *args: Any) -> dict[str, Any]:
         if not project.has_graph():
@@ -193,17 +227,50 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
             raise _untrusted_error(str(error)) from error
         return {'untrusted_content': UNTRUSTED_CONTENT, **result}
 
-    if prompts:
-        _prompts(server)
-    _resources(server, project)
-
-    @server.tool(annotations=READS)
+    @view(apps, 'impact', annotations=READS)
     def impact(ref: str, max_depth: int | None = None) -> dict[str, Any]:
         """Everything downstream of a table, model or column (e.g. `orders` or `orders.amount`):
         derived columns, relations, models that join or filter on it, tests, exposures, the
         orchestration tasks that run them and the business entities it touches. Use before
         renaming, dropping or changing it."""
         return run(project.impact, ref, max_depth)
+
+    @view(apps, 'explain', annotations=READS)
+    def explain(ref: str, english: bool = False) -> dict[str, Any]:
+        """What a column is, as SQL: its expression with CTEs and aliases inlined, the same formula
+        composed down to source columns, and step by step the expression of each column on the
+        way with the joins, filters and grouping that shape its rows. Use to answer "how is this
+        number calculated?" or before changing a calculation. With `english`, also `english`: the
+        formula, the joins, filters and grouping and the bound terms worded in plain English by a
+        fixed grammar (nothing a model writes), with the column each wording names; quote it to a
+        person who does not read SQL."""
+        result = run(project.explain, ref)
+        if english:
+            # The column resolved for the explanation, so wording it raises nothing new.
+            result['english'] = project.english(ref).to_dict()
+        return result
+
+    @view(apps, 'gate', annotations=UPDATES_OUTPUTS)
+    def gate(base: str | None = None) -> dict[str, Any]:
+        """The check a change must pass before you open a pull request: brings a copy of the graph
+        up to date with the working tree and reports removed columns something still reads,
+        approved definitions whose meaning changed, changed columns that compute a business idea
+        differently from an existing one, data laws that held on all the data and that the change
+        breaks, changed columns another repository pins in its konstruct.lock, and sensitive data
+        moved into a model or exposure not marked to hold it, each with what to do about it. Run it before proposing a change, fix what it reports, and run it again
+        until `passed` is true. It updates the copy from the files alone: it runs no dbt, connects
+        to no warehouse and leaves the project's graph as it is."""
+        from konstruct.analysis.diff import DiffError
+
+        try:
+            return run(lambda: gate_copy(project, base))
+        except DiffError as error:
+            raise _untrusted_error(str(error)) from error
+
+    server = MCPServer('konstruct', version=__version__, instructions=instructions, extensions=[apps])
+    if prompts:
+        _prompts(server)
+    _resources(server, project)
 
     @server.tool(annotations=READS)
     def trace(ref: str, max_depth: int | None = None) -> dict[str, Any]:
@@ -380,21 +447,6 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
         return run(lambda r: project.erasure(r, levels=levels), ref)
 
     @server.tool(annotations=READS)
-    def explain(ref: str, english: bool = False) -> dict[str, Any]:
-        """What a column is, as SQL: its expression with CTEs and aliases inlined, the same formula
-        composed down to source columns, and step by step the expression of each column on the
-        way with the joins, filters and grouping that shape its rows. Use to answer "how is this
-        number calculated?" or before changing a calculation. With `english`, also `english`: the
-        formula, the joins, filters and grouping and the bound terms worded in plain English by a
-        fixed grammar (nothing a model writes), with the column each wording names; quote it to a
-        person who does not read SQL."""
-        result = run(project.explain, ref)
-        if english:
-            # The column resolved for the explanation, so wording it raises nothing new.
-            result['english'] = project.english(ref).to_dict()
-        return result
-
-    @server.tool(annotations=READS)
     def history(ref: str, limit: int = 50) -> dict[str, Any]:
         """When a column's formula changed in git history, with each commit's author and date,
         and every change to the status, approval, owner or definition of the business terms bound
@@ -447,23 +499,6 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
 
         try:
             return run(project.diff, base, head)
-        except DiffError as error:
-            raise _untrusted_error(str(error)) from error
-
-    @server.tool(annotations=UPDATES_OUTPUTS)
-    def gate(base: str | None = None) -> dict[str, Any]:
-        """The check a change must pass before you open a pull request: brings a copy of the graph
-        up to date with the working tree and reports removed columns something still reads,
-        approved definitions whose meaning changed, changed columns that compute a business idea
-        differently from an existing one, data laws that held on all the data and that the change
-        breaks, changed columns another repository pins in its konstruct.lock, and sensitive data
-        moved into a model or exposure not marked to hold it, each with what to do about it. Run it before proposing a change, fix what it reports, and run it again
-        until `passed` is true. It updates the copy from the files alone: it runs no dbt, connects
-        to no warehouse and leaves the project's graph as it is."""
-        from konstruct.analysis.diff import DiffError
-
-        try:
-            return run(lambda: gate_copy(project, base))
         except DiffError as error:
             raise _untrusted_error(str(error)) from error
 

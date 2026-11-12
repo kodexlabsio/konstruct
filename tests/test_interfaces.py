@@ -8,7 +8,7 @@ Each file holds one kind of interface as a flat map from an entry to what it is:
 - ``json.json``: the shape of each ``--json`` document and of ``graph.json`` (every field's path
   and types, inferred from the example and small projects made to fill every list), and each
   document's ``format_version``;
-- ``mcp.json``: the MCP tools and their input schemas;
+- ``mcp.json``: the MCP tools and their input schemas, the resources, and the view each tool is drawn in;
 - ``python.json``: the names ``konstruct`` exports, their methods, signatures (with each
   parameter's position) and fields;
 - ``config.json``: the ``konstruct.toml`` keys Konstruct reads;
@@ -1310,14 +1310,30 @@ def test_the_documented_format_versions_are_the_ones_written() -> None:
 # MCP
 
 
-def test_mcp_tools(jaffle_built_graph: Path) -> None:
-    async def tools() -> list[Any]:
-        async with Client(build_server(jaffle_built_graph)) as client:
-            return list((await client.list_tools()).tools)
+def _leaves(prefix: str, value: Any) -> dict[str, str]:
+    """Each key of a nested mapping at its dotted path, with its value as JSON."""
+    if isinstance(value, dict) and value:
+        return {k: v for key, item in value.items() for k, v in _leaves(f'{prefix}.{key}', item).items()}
+    return {prefix: json.dumps(value, sort_keys=True)}
 
+
+def test_mcp_tools(jaffle_built_graph: Path) -> None:
+    async def tools() -> tuple[list[Any], list[Any]]:
+        async with Client(build_server(jaffle_built_graph)) as client:
+            return list((await client.list_tools()).tools), list((await client.list_resources()).resources)
+
+    listed, resources = anyio.run(tools)
     entries: dict[str, str] = {}
-    for tool in anyio.run(tools):
+    # The resources, the MCP Apps views among them, and the view each tool is drawn in.
+    for resource in resources:
+        entries[f'mcp resource {resource.uri}'] = str(resource.mime_type)
+        if resource.meta and 'ui' in resource.meta:
+            # One entry per key, so a key the views ask for later is an addition.
+            entries.update(_leaves(f'mcp resource {resource.uri} _meta.ui', resource.meta['ui']))
+    for tool in listed:
         entries[f'mcp {tool.name}'] = 'tool'
+        if tool.meta and 'ui' in tool.meta:
+            entries[f'mcp {tool.name} _meta.ui.resourceUri'] = tool.meta['ui']['resourceUri']
         schema = tool.input_schema
         required = set(schema.get('required', []))
         for name, spec in schema.get('properties', {}).items():
