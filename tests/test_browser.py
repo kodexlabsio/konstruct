@@ -162,6 +162,24 @@ def test_overview_and_model_page(jaffle_built_graph: Path, open_page: Any) -> No
 
 
 @pytest.mark.dbt
+def test_a_copy_button_selects_the_text_where_the_clipboard_is_out_of_reach(
+    jaffle_built_graph: Path, open_page: Any
+) -> None:
+    page = open_page(jaffle_built_graph / 'konstruct-out' / 'graph.html', '#/node/model.jaffle_shop.orders')
+    page.add_init_script("Object.defineProperty(navigator, 'clipboard', { value: undefined })")
+    page.reload()
+    page.wait_for_selector('#sec-code .copy')
+    written = page.inner_text('#sec-code code.sr-only')
+    page.click('#sec-code .copy')
+    assert page.inner_text('#sec-code .copy') == 'Selected: copy it with your keyboard'
+    # The exact text, with none of the line numbers the block draws beside it.
+    assert page.evaluate('String(getSelection())') == written
+    assert "ref('stg_payments')" in written and not written.startswith('1')
+    # Another version is other text, not selected yet.
+    page.click('#sec-code [role="tab"]:text("Compiled")')
+    assert page.inner_text('#sec-code .copy') == 'Copy'
+
+
 def test_links_selectors_and_full_screen(jaffle_built_graph: Path, open_page: Any) -> None:
     graph = jaffle_built_graph / 'konstruct-out' / 'graph.html'
     # Links that earlier versions wrote still open their node.

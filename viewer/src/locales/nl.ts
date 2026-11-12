@@ -257,6 +257,7 @@ const messages: Catalogue = {
     'code.cut': 'Het bestand is lang, dus alleen het begin wordt getoond.',
     'code.copy': 'Kopiëren',
     'code.copied': 'Gekopieerd',
+    'code.selected': 'Geselecteerd: kopieer het met het toetsenbord',
     'code.copyCommand': '{command} kopiëren',
     'markdown.cut': 'De beschrijving is lang, dus alleen het begin wordt getoond.',
 

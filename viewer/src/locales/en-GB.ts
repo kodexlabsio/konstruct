@@ -256,6 +256,7 @@ const messages = {
     'code.cut': 'The file is long, so only its start is shown.',
     'code.copy': 'Copy',
     'code.copied': 'Copied',
+    'code.selected': 'Selected: copy it with your keyboard',
     'code.copyCommand': 'Copy {command}',
     'markdown.cut': 'The description is long, so only its start is shown.',
 

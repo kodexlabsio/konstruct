@@ -251,6 +251,7 @@ const messages: Catalogue = {
     'code.cut': '文件较长，只显示开头部分。',
     'code.copy': '复制',
     'code.copied': '已复制',
+    'code.selected': '已选中：请用键盘复制',
     'code.copyCommand': '复制 {command}',
     'markdown.cut': '描述较长，只显示开头部分。',
 

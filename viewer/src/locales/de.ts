@@ -259,6 +259,7 @@ const messages: Catalogue = {
     'code.cut': 'Die Datei ist lang, daher wird nur ihr Anfang gezeigt.',
     'code.copy': 'Kopieren',
     'code.copied': 'Kopiert',
+    'code.selected': 'Markiert: mit der Tastatur kopieren',
     'code.copyCommand': '{command} kopieren',
     'markdown.cut': 'Die Beschreibung ist lang, daher wird nur ihr Anfang gezeigt.',
 
