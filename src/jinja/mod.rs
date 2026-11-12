@@ -16,6 +16,7 @@ pub mod eval;
 mod parse;
 #[cfg(feature = "python")]
 pub mod python;
+mod stack;
 pub mod value;
 
 pub use dbt::{Macros, Renderer, Tables};

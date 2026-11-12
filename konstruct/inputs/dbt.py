@@ -493,7 +493,7 @@ def load(
             return None
         return os.path.relpath(root / str(path), str(graph_root))
 
-    sections = {k: v for k in ('semantic_models', 'metrics') if (v := manifest.section(k)) is not None}
+    sections = {k: v for k in ('semantic_models', 'metrics') if isinstance(v := manifest.section(k), dict)}
     semantic = semantic_metrics(sections, rel_path)
     if semantic:
         graph.meta.setdefault('dbt_metrics', []).extend(semantic)

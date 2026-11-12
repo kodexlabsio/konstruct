@@ -43,6 +43,9 @@ regex-syntax = "0.8.11"
 ruff_python_ast = "=0.0.10"
 ruff_python_parser = "=0.0.10"
 ruff_text_size = "=0.0.10"
+# Grows the stack on the heap where a template or a value nests deeply (src/jinja/stack.rs), so a
+# render never overflows the thread's stack, however small. The parser above already needs it.
+stacker = "0.1.25"
 
 [features]
 # The Python extension module, built by maturin. abi3 makes one wheel per platform serve every

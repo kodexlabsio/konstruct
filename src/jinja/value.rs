@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use super::eval::{Callable, Error};
+use super::stack::deeper;
 
 /// A key of a dict: what Python hashes, with `True` equal to `1` and `1.0` to `1`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -127,6 +128,8 @@ pub enum Value {
     Int(i128),
     Float(f64),
     Str(Rc<str>),
+    /// Text that is already HTML, which an autoescaped output leaves as it is (Jinja2's `Markup`).
+    Safe(Rc<str>),
     List(Rc<RefCell<Vec<Value>>>),
     Tuple(Rc<Vec<Value>>),
     Dict(Rc<RefCell<Dict>>),
@@ -194,6 +197,7 @@ impl Value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::Str(_) => "str",
+            Value::Safe(_) => "Markup",
             Value::List(_) => "list",
             Value::Tuple(_) => "tuple",
             Value::Dict(_) => "dict",
@@ -204,17 +208,19 @@ impl Value {
     }
 
     pub fn is_str(&self) -> bool {
-        matches!(self, Value::Str(_))
+        matches!(self, Value::Str(_) | Value::Safe(_))
     }
 
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::Str(text) => Some(text),
+            Value::Str(text) | Value::Safe(text) => Some(text),
             _ => None,
         }
     }
 
     pub fn key(&self) -> Option<Key> {
+        // A tuple nested deeper than a hundred levels is not a key.
+        let _level = descend()?;
         Some(match self {
             Value::None => Key::None,
             Value::Bool(flag) => Key::Int(i128::from(*flag)),
@@ -226,7 +232,7 @@ impl Value {
                     Key::Float(number.to_bits())
                 }
             }
-            Value::Str(text) => Key::Str(Rc::clone(text)),
+            Value::Str(text) | Value::Safe(text) => Key::Str(Rc::clone(text)),
             Value::Tuple(items) => Key::Tuple(items.iter().map(Value::key).collect::<Option<_>>()?),
             Value::Undefined => Key::Str("".into()),
             _ => return None,
@@ -239,7 +245,7 @@ impl Value {
             Value::Bool(flag) => *flag,
             Value::Int(number) => *number != 0,
             Value::Float(number) => *number != 0.0,
-            Value::Str(text) => !text.is_empty(),
+            Value::Str(text) | Value::Safe(text) => !text.is_empty(),
             Value::List(items) => !items.borrow().is_empty(),
             Value::Tuple(items) => !items.is_empty(),
             Value::Dict(entries) => !entries.borrow().is_empty(),
@@ -256,7 +262,9 @@ impl Value {
             Value::List(items) => Some(items.borrow().clone()),
             Value::Tuple(items) => Some(items.as_ref().clone()),
             Value::Dict(entries) => Some(entries.borrow().iter().map(|(k, _)| k.clone()).collect()),
-            Value::Str(text) => Some(text.chars().map(|c| Value::from(c.to_string())).collect()),
+            Value::Str(text) | Value::Safe(text) => {
+                Some(text.chars().map(|c| Value::from(c.to_string())).collect())
+            }
             Value::Range(start, stop, step) => {
                 let count = range_len(*start, *stop, *step);
                 Some((0..count).map(|n| Value::Int(start + n * step)).collect())
@@ -272,7 +280,7 @@ impl Value {
             Value::List(items) => Some(items.borrow().len()),
             Value::Tuple(items) => Some(items.len()),
             Value::Dict(entries) => Some(entries.borrow().len()),
-            Value::Str(text) => Some(text.chars().count()),
+            Value::Str(text) | Value::Safe(text) => Some(text.chars().count()),
             Value::Range(start, stop, step) => Some(range_len(*start, *stop, *step) as usize),
             Value::Object(object) => object.items().map(|items| items.len()),
             _ => None,
@@ -282,7 +290,7 @@ impl Value {
     /// `str(value)`.
     pub fn text(&self) -> String {
         match self {
-            Value::Str(text) => text.to_string(),
+            Value::Str(text) | Value::Safe(text) => text.to_string(),
             Value::Undefined => String::new(),
             Value::Object(object) => object.text(),
             _ => self.repr(),
@@ -291,6 +299,13 @@ impl Value {
 
     /// `repr(value)`.
     pub fn repr(&self) -> String {
+        match descend() {
+            None => "...".to_string(),
+            Some(_guard) => deeper(|| self.repr_inner()),
+        }
+    }
+
+    fn repr_inner(&self) -> String {
         match self {
             Value::Undefined => "Undefined".into(),
             Value::None => "None".into(),
@@ -299,7 +314,11 @@ impl Value {
             Value::Int(number) => number.to_string(),
             Value::Float(number) => float_repr(*number),
             Value::Str(text) => string_repr(text),
+            Value::Safe(text) => format!("Markup({})", string_repr(text)),
             Value::List(items) => {
+                let Some(_open) = Open::new(Rc::as_ptr(items) as usize) else {
+                    return "[...]".to_string();
+                };
                 let items = items.borrow();
                 let inner: Vec<String> = items.iter().map(Value::repr).collect();
                 format!("[{}]", inner.join(", "))
@@ -312,6 +331,9 @@ impl Value {
                 ),
             },
             Value::Dict(entries) => {
+                let Some(_open) = Open::new(Rc::as_ptr(entries) as usize) else {
+                    return "{...}".to_string();
+                };
                 let entries = entries.borrow();
                 let inner: Vec<String> = entries
                     .iter()
@@ -342,9 +364,16 @@ impl Value {
     }
 
     pub fn equals(&self, other: &Value) -> bool {
+        match descend() {
+            None => false,
+            Some(_guard) => deeper(|| self.equals_inner(other)),
+        }
+    }
+
+    fn equals_inner(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Undefined, Value::Undefined) | (Value::None, Value::None) => true,
-            (Value::Str(a), Value::Str(b)) => a == b,
+            (Value::Str(a) | Value::Safe(a), Value::Str(b) | Value::Safe(b)) => a == b,
             (Value::List(a), Value::List(b)) => {
                 Rc::ptr_eq(a, b) || {
                     let (a, b) = (a.borrow(), b.borrow());
@@ -372,7 +401,7 @@ impl Value {
             (Value::Object(a), Value::Object(b)) => Rc::ptr_eq(a, b),
             (Value::Callable(a), Value::Callable(b)) => Rc::ptr_eq(a, b),
             (a, b) => match (a.as_number(), b.as_number()) {
-                (Some(x), Some(y)) => x.as_f64() == y.as_f64() && x.exact_eq(y),
+                (Some(x), Some(y)) => x.compare(y) == Some(Ordering::Equal),
                 _ => false,
             },
         }
@@ -380,8 +409,15 @@ impl Value {
 
     /// Python's ordering of two values, or an error for a pair it refuses to order.
     pub fn compare(&self, other: &Value) -> Result<Ordering, Error> {
+        match descend() {
+            None => Err(Error::new("maximum recursion depth exceeded in comparison")),
+            Some(_guard) => deeper(|| self.compare_inner(other)),
+        }
+    }
+
+    fn compare_inner(&self, other: &Value) -> Result<Ordering, Error> {
         match (self, other) {
-            (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
+            (Value::Str(a) | Value::Safe(a), Value::Str(b) | Value::Safe(b)) => Ok(a.cmp(b)),
             (Value::List(a), Value::List(b)) => {
                 let (a, b) = (a.borrow().clone(), b.borrow().clone());
                 sequence_order(&a, &b)
@@ -422,29 +458,64 @@ impl Number {
         }
     }
 
-    fn exact_eq(self, other: Number) -> bool {
-        match (self, other) {
-            (Number::Int(a), Number::Int(b)) => a == b,
-            _ => true,
-        }
-    }
-
-    fn compare(self, other: Number) -> Option<Ordering> {
+    pub fn compare(self, other: Number) -> Option<Ordering> {
         match (self, other) {
             (Number::Int(a), Number::Int(b)) => Some(a.cmp(&b)),
-            (a, b) => a.as_f64().partial_cmp(&b.as_f64()),
+            (Number::Int(a), Number::Float(b)) => int_against_float(a, b),
+            (Number::Float(a), Number::Int(b)) => int_against_float(b, a).map(Ordering::reverse),
+            (Number::Float(a), Number::Float(b)) => a.partial_cmp(&b),
         }
     }
 }
 
-pub fn range_len(start: i128, stop: i128, step: i128) -> i128 {
-    if step > 0 && start < stop {
-        (stop - start + step - 1) / step
-    } else if step < 0 && start > stop {
-        (start - stop - step - 1) / -step
-    } else {
-        0
+/// An integer against a float, exactly: neither is rounded to the other's precision.
+fn int_against_float(int: i128, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
     }
+    if float.is_infinite() {
+        return Some(if float > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let whole = float.trunc();
+    // 2**127, which no i128 reaches.
+    const LIMIT: f64 = 1.7014118346046923e38;
+    if whole >= LIMIT {
+        return Some(Ordering::Less);
+    }
+    if whole <= -LIMIT {
+        return Some(Ordering::Greater);
+    }
+    match int.cmp(&(whole as i128)) {
+        Ordering::Equal => {
+            let fraction = float - whole;
+            Some(if fraction > 0.0 {
+                Ordering::Less
+            } else if fraction < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            })
+        }
+        other => Some(other),
+    }
+}
+
+pub fn range_len(start: i128, stop: i128, step: i128) -> i128 {
+    let (low, high) = if step > 0 {
+        (start, stop)
+    } else {
+        (stop, start)
+    };
+    if step == 0 || low >= high {
+        return 0;
+    }
+    let span = high.abs_diff(low);
+    let length = (span - 1) / step.unsigned_abs() + 1;
+    i128::try_from(length).unwrap_or(i128::MAX)
 }
 
 /// `repr` of a float: the shortest digits that read back, in positional notation from 1e-4 up to
@@ -531,4 +602,105 @@ pub fn string_repr(text: &str) -> String {
     }
     out.push(quote);
     out
+}
+
+thread_local! {
+    /// How many values deep a traversal of values is, and the containers it has open.
+    static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static OPEN: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
+/// How deep a traversal of nested values (printing, comparing) goes before it stops.
+const MAX_VALUE_DEPTH: usize = 200;
+
+/// One level of a traversal of values, given back when it is dropped.
+struct Descent;
+
+fn descend() -> Option<Descent> {
+    DEPTH.with(|depth| {
+        if depth.get() >= MAX_VALUE_DEPTH {
+            None
+        } else {
+            depth.set(depth.get() + 1);
+            Some(Descent)
+        }
+    })
+}
+
+impl Drop for Descent {
+    fn drop(&mut self) {
+        DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// A container being printed, so that one that holds itself prints `[...]`.
+struct Open;
+
+impl Open {
+    fn new(id: usize) -> Option<Open> {
+        OPEN.with(|open| {
+            let mut open = open.borrow_mut();
+            if open.contains(&id) {
+                None
+            } else {
+                open.push(id);
+                Some(Open)
+            }
+        })
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        OPEN.with(|open| {
+            open.borrow_mut().pop();
+        });
+    }
+}
+
+impl Dict {
+    /// The keys and values, taken out (for dropping a deep value without recursion).
+    fn take_all(&mut self) -> Vec<Value> {
+        self.index.clear();
+        std::mem::take(&mut self.entries)
+            .into_iter()
+            .flat_map(|(k, v)| [k, v])
+            .collect()
+    }
+}
+
+impl Value {
+    /// What a container holds, taken out of it when nothing else holds the container.
+    fn take_children(&mut self, into: &mut Vec<Value>) {
+        match self {
+            Value::List(items) => {
+                if let Some(cell) = Rc::get_mut(items) {
+                    into.append(cell.get_mut());
+                }
+            }
+            Value::Tuple(items) => {
+                if let Some(vec) = Rc::get_mut(items) {
+                    into.append(vec);
+                }
+            }
+            Value::Dict(entries) => {
+                if let Some(cell) = Rc::get_mut(entries) {
+                    into.append(&mut cell.get_mut().take_all());
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A value nested a hundred thousand deep is dropped a level at a time, not by a hundred thousand
+/// calls: what a container holds is moved to a list before the container goes.
+impl Drop for Value {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        self.take_children(&mut pending);
+        while let Some(mut value) = pending.pop() {
+            value.take_children(&mut pending);
+        }
+    }
 }

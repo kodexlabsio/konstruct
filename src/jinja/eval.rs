@@ -4,10 +4,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use super::builtins;
-use super::parse::{Arg, Bin, Cmp, Expr, MacroDef, Stmt, Target};
+use super::parse::{Arg, Bin, Cmp, Esc, Expr, ForDef, MacroDef, Stmt, Target};
+use super::stack::deeper;
 use super::value::{Object, Value, range_len};
 
 #[derive(Debug, Clone)]
@@ -47,12 +48,20 @@ pub trait Callable {
 enum Kind {
     Macro {
         def: Rc<MacroDef>,
-        scope: Rc<Scope>,
-        host: Rc<Host>,
+        // Weak: the scope holds the macro, so a strong one would make a cycle that nothing frees.
+        scope: Weak<Scope>,
+        host: Weak<Host>,
         varargs: bool,
         kwargs: bool,
     },
     Native(NativeFn),
+    /// `loop` of a recursive `for`: called with children, it runs the body over them.
+    Loop {
+        def: Rc<ForDef>,
+        scope: Weak<Scope>,
+        host: Weak<Host>,
+        depth: usize,
+    },
 }
 
 pub struct Function {
@@ -88,6 +97,7 @@ impl Function {
             (Kind::Macro { .. }, None) => "<Macro anonymous>".to_string(),
             (Kind::Native(_), Some(name)) => format!("<function {name}>"),
             (Kind::Native(_), None) => "<function>".to_string(),
+            (Kind::Loop { .. }, _) => "<function loop>".to_string(),
         }
     }
 }
@@ -137,16 +147,39 @@ impl Scope {
     }
 }
 
-/// How much of the thread's stack a render may use before it stops, in bytes: macros nest as deep
-/// as that allows (about fifty levels) and the render fails instead of overflowing a small stack.
-const MAX_STACK: usize = 256 * 1024;
+/// The most evaluation steps one render takes, and the most all the renders of one renderer take:
+/// a loop, a call or a builtin on a large value costs steps in proportion to its size.
 const MAX_STEPS: u64 = 5_000_000;
+const MAX_TOTAL_STEPS: u64 = 100_000_000;
+/// The most bytes one render writes or builds in all, and the most one string or list may hold.
+const MAX_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_ALLOC: usize = 16 * 1024 * 1024;
+/// How many macros, loops and blocks may be open inside one another.
+const MAX_CALL_DEPTH: usize = 200;
+
+/// What every render of one renderer may do in all, so that models times macros do not multiply
+/// the limit of one.
+pub struct Budget {
+    steps: std::cell::Cell<u64>,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Budget {
+            steps: std::cell::Cell::new(MAX_TOTAL_STEPS),
+        }
+    }
+}
 
 pub struct Interp {
     host: Rc<Host>,
     steps: u64,
-    /// The address of the stack where this render started; the stack grows down from it.
-    floor: usize,
+    bytes: usize,
+    /// How many macros and recursive loops are open.
+    depth: usize,
+    budget: Rc<Budget>,
+    /// Whether an `{% autoescape true %}` block is running, for the filters that escape.
+    pub(crate) escape: bool,
     /// The text a `{% filter %}` block filters.
     hole: Option<Value>,
 }
@@ -161,24 +194,18 @@ fn stmt_mentions(stmt: &Stmt, name: &str) -> bool {
     let any = |exprs: &[&Expr]| exprs.iter().any(|e| expr_mentions(e, name));
     match stmt {
         Stmt::Text(_) | Stmt::NoTemplates(_) => false,
-        Stmt::Output(e) | Stmt::Do(e) => expr_mentions(e, name),
+        Stmt::Output(e, _) | Stmt::Do(e) => expr_mentions(e, name),
         Stmt::If(branches, otherwise) => {
             branches
                 .iter()
                 .any(|(test, body)| expr_mentions(test, name) || mentions(body, name))
                 || mentions(otherwise, name)
         }
-        Stmt::For {
-            iter,
-            filter,
-            body,
-            otherwise,
-            ..
-        } => {
-            expr_mentions(iter, name)
-                || filter.as_ref().is_some_and(|f| expr_mentions(f, name))
-                || mentions(body, name)
-                || mentions(otherwise, name)
+        Stmt::For(def) => {
+            expr_mentions(&def.iter, name)
+                || def.filter.as_ref().is_some_and(|f| expr_mentions(f, name))
+                || mentions(&def.body, name)
+                || mentions(&def.otherwise, name)
         }
         Stmt::Set(_, e) => expr_mentions(e, name),
         Stmt::SetBlock(_, filter, body) => {
@@ -191,6 +218,7 @@ fn stmt_mentions(stmt: &Stmt, name: &str) -> bool {
             pairs.iter().any(|(_, e)| expr_mentions(e, name)) || mentions(body, name)
         }
         Stmt::Block(body) => mentions(body, name),
+        Stmt::Autoescape(flag, body) => expr_mentions(flag, name) || mentions(body, name),
     }
 }
 
@@ -205,7 +233,7 @@ fn expr_mentions(expr: &Expr, name: &str) -> bool {
     match expr {
         Expr::Const(_) => false,
         Expr::Name(found) => found == name,
-        Expr::Tuple(items) | Expr::List(items) | Expr::Concat(items) => items.iter().any(sub),
+        Expr::Tuple(items) | Expr::List(items) | Expr::Concat(items, _) => items.iter().any(sub),
         Expr::Dict(pairs) => pairs.iter().any(|(k, v)| sub(k) || sub(v)),
         Expr::Neg(e) | Expr::Pos(e) | Expr::Not(e) | Expr::Attr(e, _) => sub(e),
         Expr::And(a, b) | Expr::Or(a, b) | Expr::Bin(_, a, b) | Expr::Item(a, b) => {
@@ -229,22 +257,45 @@ fn expr_mentions(expr: &Expr, name: &str) -> bool {
 }
 
 impl Interp {
-    pub fn new(host: Rc<Host>) -> Self {
-        let probe = 0u8;
+    pub fn new(host: Rc<Host>, budget: Rc<Budget>) -> Self {
         Interp {
             host,
             steps: 0,
-            floor: std::ptr::addr_of!(probe) as usize,
+            bytes: 0,
+            depth: 0,
+            budget,
+            escape: false,
             hole: None,
         }
     }
 
     fn tick(&mut self) -> Result<(), Error> {
-        self.steps += 1;
-        if self.steps > MAX_STEPS {
+        self.charge(1)
+    }
+
+    /// Takes `cost` steps of this render's and the renderer's.
+    pub(crate) fn charge(&mut self, cost: usize) -> Result<(), Error> {
+        let cost = cost as u64;
+        self.steps = self.steps.saturating_add(cost);
+        let left = self.budget.steps.get();
+        self.budget.steps.set(left.saturating_sub(cost));
+        if self.steps > MAX_STEPS || left < cost {
             return Err(Error::new("the template does too much work"));
         }
         Ok(())
+    }
+
+    /// Takes `size` of the bytes this render may build, and says no to one string or list that is
+    /// larger than any may be.
+    pub(crate) fn reserve(&mut self, size: usize) -> Result<(), Error> {
+        if size > MAX_ALLOC {
+            return Err(Error::new("the value is too large"));
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        if self.bytes > MAX_BYTES {
+            return Err(Error::new("the template builds too much"));
+        }
+        self.charge(size / 64)
     }
 
     pub fn run(&mut self, body: &[Stmt], scope: &Rc<Scope>) -> Result<String, Error> {
@@ -273,12 +324,38 @@ impl Interp {
     }
 
     fn exec(&mut self, stmt: &Stmt, scope: &Rc<Scope>, out: &mut String) -> Result<(), Error> {
+        deeper(|| self.exec_in(stmt, scope, out))
+    }
+
+    fn exec_in(&mut self, stmt: &Stmt, scope: &Rc<Scope>, out: &mut String) -> Result<(), Error> {
         self.tick()?;
         match stmt {
-            Stmt::Text(text) => out.push_str(text),
-            Stmt::Output(expr) => {
+            Stmt::Text(text) => {
+                self.reserve(text.len())?;
+                out.push_str(text);
+            }
+            Stmt::Output(expr, escape) => {
                 let value = self.eval(expr, scope)?;
-                out.push_str(&value.text());
+                let escaped = match escape {
+                    Esc::Off => false,
+                    Esc::On => true,
+                    Esc::Dynamic => self.escape,
+                };
+                let text = if escaped && !matches!(value, Value::Safe(_)) {
+                    builtins::html_escape(&value.text())
+                } else {
+                    value.text()
+                };
+                self.reserve(text.len())?;
+                out.push_str(&text);
+            }
+            Stmt::Autoescape(flag, body) => {
+                let flag = self.eval(flag, scope)?.truthy();
+                let saved = std::mem::replace(&mut self.escape, flag);
+                // The block is a scope of its own.
+                let result = self.exec_all(body, &Scope::child(scope), out);
+                self.escape = saved;
+                result?;
             }
             Stmt::If(branches, otherwise) => {
                 for (test, body) in branches {
@@ -288,21 +365,24 @@ impl Interp {
                 }
                 self.exec_all(otherwise, scope, out)?;
             }
-            Stmt::For {
-                target,
-                iter,
-                filter,
-                body,
-                otherwise,
-            } => {
-                self.exec_for(target, iter, filter.as_ref(), body, otherwise, scope, out)?;
+            Stmt::For(def) => {
+                let source = self.eval(&def.iter, scope)?;
+                let items = source.items().ok_or_else(|| {
+                    Error::new(format!("'{}' object is not iterable", source.type_name()))
+                })?;
+                self.run_loop(def, &source, items, scope, 0, out)?;
             }
             Stmt::Set(target, expr) => {
                 let value = self.eval(expr, scope)?;
                 self.assign(target, value, scope)?;
             }
             Stmt::SetBlock(target, filter, body) => {
-                let text = Value::from(self.run(body, scope)?);
+                let text = self.run(body, scope)?;
+                let text = if self.escape {
+                    Value::Safe(text.into())
+                } else {
+                    Value::from(text)
+                };
                 let value = match filter {
                     Some(chain) => self.with_hole(text, |me| me.eval(chain, scope))?,
                     None => text,
@@ -363,29 +443,26 @@ impl Interp {
     fn make_macro(&mut self, def: &Rc<MacroDef>, name: Option<String>, scope: &Rc<Scope>) -> Value {
         let kind = Kind::Macro {
             def: Rc::clone(def),
-            scope: Rc::clone(scope),
-            host: Rc::clone(&self.host),
+            scope: Rc::downgrade(scope),
+            host: Rc::downgrade(&self.host),
             varargs: mentions(&def.body, "varargs"),
             kwargs: mentions(&def.body, "kwargs"),
         };
         Value::Callable(Rc::new(Function { name, kind }))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn exec_for(
+    /// The body of a `for` over `items`, `depth` loops inside a recursive one.
+    fn run_loop(
         &mut self,
-        target: &Target,
-        iter: &Expr,
-        filter: Option<&Expr>,
-        body: &[Stmt],
-        otherwise: &[Stmt],
+        def: &Rc<ForDef>,
+        source: &Value,
+        items: Vec<Value>,
         scope: &Rc<Scope>,
+        depth: usize,
         out: &mut String,
     ) -> Result<(), Error> {
-        let source = self.eval(iter, scope)?;
-        let items = source.items().ok_or_else(|| {
-            Error::new(format!("'{}' object is not iterable", source.type_name()))
-        })?;
+        let (target, filter, body, otherwise) =
+            (&def.target, def.filter.as_ref(), &def.body, &def.otherwise);
         let inner = Scope::child(scope);
         let items = match filter {
             None => items,
@@ -403,28 +480,36 @@ impl Interp {
         if items.is_empty() {
             return self.exec_all(otherwise, scope, out);
         }
+        self.charge(items.len())?;
         // A list that the body appends to is read as it grows, as Python's iterator reads it.
-        let live = match (&source, filter) {
+        let live = match (source, filter) {
             (Value::List(list), None) => Some(Rc::clone(list)),
             _ => None,
         };
         let looping = Rc::new(Loop {
-            items: RefCell::new(items),
+            items: match &live {
+                Some(list) => Items::Live(Rc::clone(list)),
+                None => Items::Owned(items),
+            },
             index: Cell::new(0),
             changed: RefCell::new(None),
+            depth,
+            recursor: def.recursive.then(|| {
+                Value::Callable(Rc::new(Function {
+                    name: Some("loop".to_string()),
+                    kind: Kind::Loop {
+                        def: Rc::clone(def),
+                        scope: Rc::downgrade(scope),
+                        host: Rc::downgrade(&self.host),
+                        depth,
+                    },
+                }))
+            }),
         });
         inner.set("loop", Value::Object(looping.clone()));
         let mut at = 0;
-        loop {
-            if let Some(list) = &live {
-                let current = list.borrow();
-                if current.len() != looping.items.borrow().len() {
-                    *looping.items.borrow_mut() = current.clone();
-                }
-            }
-            let Some(item) = looping.items.borrow().get(at).cloned() else {
-                break;
-            };
+        while let Some(item) = looping.item(at) {
+            self.tick()?;
             looping.index.set(at);
             self.assign(target, item, &inner)?;
             self.exec_all(body, &inner, out)?;
@@ -451,7 +536,7 @@ impl Interp {
                     self.assign(target, item, scope)?;
                 }
             }
-            Target::Attr(name, attribute) => match self.lookup(name, scope) {
+            Target::Attr(name, attribute) => match &self.lookup(name, scope) {
                 Value::Object(object) => object.set_attr(attribute, value)?,
                 _ => return Err(Error::new("only a namespace takes an attribute")),
             },
@@ -460,6 +545,10 @@ impl Interp {
     }
 
     pub fn eval(&mut self, expr: &Expr, scope: &Rc<Scope>) -> Result<Value, Error> {
+        deeper(|| self.eval_in(expr, scope))
+    }
+
+    fn eval_in(&mut self, expr: &Expr, scope: &Rc<Scope>) -> Result<Value, Error> {
         self.tick()?;
         Ok(match expr {
             Expr::Const(value) => value.clone(),
@@ -500,13 +589,17 @@ impl Interp {
             }
             Expr::Bin(op, a, b) => {
                 let (left, right) = (self.eval(a, scope)?, self.eval(b, scope)?);
-                builtins::binary(*op, &left, &right)?
+                builtins::binary(self, *op, &left, &right)?
             }
             Expr::Compare(first, rest) => {
                 let mut left = self.eval(first, scope)?;
                 let mut result = true;
                 for (op, operand) in rest {
                     let right = self.eval(operand, scope)?;
+                    if matches!(op, Cmp::In | Cmp::NotIn) {
+                        // Looking in a collection reads it.
+                        self.charge(1 + right.length().unwrap_or(0) / 8)?;
+                    }
                     if !builtins::compare(*op, &left, &right)? {
                         result = false;
                         break;
@@ -515,12 +608,30 @@ impl Interp {
                 }
                 Value::Bool(result)
             }
-            Expr::Concat(parts) => {
-                let mut text = String::new();
+            Expr::Concat(parts, constant) => {
+                let mut values = Vec::with_capacity(parts.len());
                 for part in parts {
-                    text.push_str(&self.eval(part, scope)?.text());
+                    values.push(self.eval(part, scope)?);
                 }
-                Value::from(text)
+                // Where output is escaped, a join that has Markup in it is Markup, and escapes
+                // the rest.
+                let markup =
+                    self.escape && !*constant && values.iter().any(|v| matches!(v, Value::Safe(_)));
+                let mut text = String::new();
+                for value in &values {
+                    let piece = if markup {
+                        builtins::escaped_text(value)
+                    } else {
+                        value.text()
+                    };
+                    self.reserve(piece.len())?;
+                    text.push_str(&piece);
+                }
+                if markup {
+                    Value::Safe(text.into())
+                } else {
+                    Value::from(text)
+                }
             }
             Expr::Cond(test, then, otherwise) => {
                 if self.eval(test, scope)?.truthy() {
@@ -545,6 +656,9 @@ impl Interp {
                     builtins::slice(&object, start.as_ref(), stop.as_ref(), step.as_ref())?
                 } else {
                     let key = self.eval(key, scope)?;
+                    if let Value::Str(text) = &object {
+                        self.charge(text.len() / 64)?;
+                    }
                     builtins::get_item(&object, &key)?
                 }
             }
@@ -590,7 +704,7 @@ impl Interp {
                     );
                 }
                 Arg::StarStar(expr) => {
-                    if let Value::Dict(dict) = self.eval(expr, scope)? {
+                    if let Value::Dict(dict) = &self.eval(expr, scope)? {
                         for (key, value) in dict.borrow().iter() {
                             named.push((key.text(), value.clone()));
                         }
@@ -625,12 +739,7 @@ impl Interp {
         args: &[Value],
         kwargs: &Kwargs,
     ) -> Result<Value, Error> {
-        let probe = 0u8;
-        if self
-            .floor
-            .saturating_sub(std::ptr::addr_of!(probe) as usize)
-            > MAX_STACK
-        {
+        if self.depth >= MAX_CALL_DEPTH {
             return Err(Error::new("macros nest too deeply"));
         }
         let scope = Scope::child(defined_in);
@@ -673,7 +782,10 @@ impl Interp {
         if uses_kwargs {
             scope.set("kwargs", Value::dict(extra_kwargs));
         }
+        // The text of a macro is Markup when it is called where output is escaped.
+        let escaping = self.escape;
         let saved = std::mem::replace(&mut self.host, Rc::clone(host));
+        self.depth += 1;
         let result = (|| {
             for (at, param) in def.params.iter().enumerate() {
                 let given = args.get(at).cloned().or_else(|| {
@@ -692,7 +804,14 @@ impl Interp {
             self.run(&def.body, &scope)
         })();
         self.host = saved;
-        result.map(Value::from)
+        self.depth -= 1;
+        result.map(|text| {
+            if escaping {
+                Value::Safe(text.into())
+            } else {
+                Value::from(text)
+            }
+        })
     }
 }
 
@@ -712,12 +831,35 @@ impl Callable for Interp {
                     varargs,
                     kwargs: uses_kwargs,
                 } => {
-                    let (def, scope, host) = (Rc::clone(def), Rc::clone(scope), Rc::clone(host));
+                    let (def, scope, host) = (Rc::clone(def), upgrade(scope)?, upgrade_host(host)?);
                     self.call_macro(&def, &scope, &host, (*varargs, *uses_kwargs), args, kwargs)
                 }
                 Kind::Native(call) => {
                     let call = Rc::clone(call);
                     call(self, args, kwargs)
+                }
+                Kind::Loop {
+                    def,
+                    scope,
+                    host,
+                    depth,
+                } => {
+                    let (def, scope, host, depth) =
+                        (Rc::clone(def), upgrade(scope)?, upgrade_host(host)?, *depth);
+                    let children = args.first().cloned().unwrap_or(Value::Undefined);
+                    let items = children
+                        .items()
+                        .ok_or_else(|| Error::new("loop needs an iterable"))?;
+                    if self.depth >= MAX_CALL_DEPTH {
+                        return Err(Error::new("loops nest too deeply"));
+                    }
+                    let saved = std::mem::replace(&mut self.host, host);
+                    self.depth += 1;
+                    let mut out = String::new();
+                    let result = self.run_loop(&def, &children, items, &scope, depth + 1, &mut out);
+                    self.depth -= 1;
+                    self.host = saved;
+                    result.map(|()| Value::from(out))
                 }
             },
             Value::Bound(bound) => {
@@ -743,11 +885,36 @@ impl Callable for Interp {
     }
 }
 
+/// What a `for` loops over: its own copy, or a list that the body may change, which the loop reads
+/// as it is, as Python's iterator does.
+enum Items {
+    Owned(Vec<Value>),
+    Live(Rc<RefCell<Vec<Value>>>),
+}
+
 /// `loop` inside a `for`.
 struct Loop {
-    items: RefCell<Vec<Value>>,
+    items: Items,
     index: Cell<usize>,
     changed: RefCell<Option<Vec<Value>>>,
+    depth: usize,
+    recursor: Option<Value>,
+}
+
+impl Loop {
+    fn length(&self) -> usize {
+        match &self.items {
+            Items::Owned(items) => items.len(),
+            Items::Live(list) => list.borrow().len(),
+        }
+    }
+
+    fn item(&self, at: usize) -> Option<Value> {
+        match &self.items {
+            Items::Owned(items) => items.get(at).cloned(),
+            Items::Live(list) => list.borrow().get(at).cloned(),
+        }
+    }
 }
 
 impl Object for Loop {
@@ -757,28 +924,37 @@ impl Object for Loop {
 
     fn attr(&self, name: &str) -> Option<Value> {
         let at = self.index.get();
-        let items = self.items.borrow();
-        let length = items.len();
+        let length = self.length();
         Some(match name {
             "index" => Value::Int(at as i128 + 1),
             "index0" => Value::Int(at as i128),
-            "revindex" => Value::Int((length - at) as i128),
-            "revindex0" => Value::Int((length - at - 1) as i128),
+            "revindex" => Value::Int(length.saturating_sub(at) as i128),
+            "revindex0" => Value::Int(length.saturating_sub(at + 1) as i128),
             "first" => Value::Bool(at == 0),
-            "last" => Value::Bool(at + 1 == length),
+            "last" => Value::Bool(at + 1 >= length),
             "length" => Value::Int(length as i128),
-            "depth" => Value::Int(1),
-            "depth0" => Value::Int(0),
+            "depth" => Value::Int(self.depth as i128 + 1),
+            "depth0" => Value::Int(self.depth as i128),
             "previtem" => {
                 if at == 0 {
                     Value::Undefined
                 } else {
-                    items[at - 1].clone()
+                    self.item(at - 1).unwrap_or(Value::Undefined)
                 }
             }
-            "nextitem" => items.get(at + 1).cloned().unwrap_or(Value::Undefined),
+            "nextitem" => self.item(at + 1).unwrap_or(Value::Undefined),
             _ => return None,
         })
+    }
+
+    fn call(
+        &self,
+        call: &mut dyn Callable,
+        args: &[Value],
+        kwargs: &Kwargs,
+    ) -> Option<Result<Value, Error>> {
+        let recursor = self.recursor.as_ref()?;
+        Some(call.call_value(recursor, args, kwargs))
     }
 
     fn method(
@@ -808,11 +984,7 @@ impl Object for Loop {
     }
 
     fn text(&self) -> String {
-        format!(
-            "<LoopContext {}/{}>",
-            self.index.get() + 1,
-            self.items.borrow().len()
-        )
+        format!("<LoopContext {}/{}>", self.index.get() + 1, self.length())
     }
 }
 
@@ -823,3 +995,14 @@ pub fn range_size(start: i128, stop: i128, step: i128) -> i128 {
 
 #[allow(dead_code)]
 fn unused(_: Cmp, _: Bin) {}
+
+fn upgrade(scope: &Weak<Scope>) -> Result<Rc<Scope>, Error> {
+    scope
+        .upgrade()
+        .ok_or_else(|| Error::new("the scope of this macro is gone"))
+}
+
+fn upgrade_host(host: &Weak<Host>) -> Result<Rc<Host>, Error> {
+    host.upgrade()
+        .ok_or_else(|| Error::new("the context of this macro is gone"))
+}
