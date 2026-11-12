@@ -439,6 +439,7 @@ class Checker:
         self._additive: set[str] | None = None
         measures = {m.name for m in self.ontology.measures if not m.expression}
         self.terms = self._terms(measures)
+        self._term_nodes = {t.node.id: t for t in self.terms}
         self.bound_to: dict[str, list[_Term]] = defaultdict(list)
         for term in self.terms:
             for column in term.bound:
@@ -807,6 +808,13 @@ class Checker:
             if parts and all(p.key in route for p in parts):
                 found[str(text)] = ', '.join(sorted({route[p.key] for p in parts}))
         return found
+
+    def filter_keys(self, node: Node, text: str) -> list[str]:
+        """The keys of the conditions the filter ``text`` of the term ``node`` requires: the filter
+        holds on a column when :meth:`held_filters` has all of them. Empty when the filter does not
+        parse, or ``node`` is not a term this checker binds to a column."""
+        term = self._term_nodes.get(node.id)
+        return [] if term is None else [p.key for p in self._required(term, text)]
 
     def held_filters(self, column: Node) -> list[_Condition]:
         """The filters that hold on every source row ``column``'s value is computed from, each with

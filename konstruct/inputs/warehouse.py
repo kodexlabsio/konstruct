@@ -13,11 +13,15 @@ privilege the connection may lack, and then the columns carry none.
 
 from __future__ import annotations
 
+import datetime
+import json
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+from konstruct import _core
 from konstruct.core.graph import relation_key
 
 SYSTEM_SCHEMAS = frozenset({'information_schema', 'pg_catalog', 'pg_toast'})
@@ -852,3 +856,238 @@ def query(connector: Any, sql: str) -> list[tuple[Any, ...]] | None:
         return [tuple(r) for r in cursor.fetchall()]
     finally:
         connection.close()
+
+
+# The semantic layers a platform serves: metadata reads of a fixed set of statements, and no more.
+
+# A name is plain, or quoted with the quote doubled inside; a single quote is refused in any name,
+# since Snowflake's reads put the name in a single-quoted literal, and a backtick only where
+# Databricks quotes with it.
+_PLAIN = r'[A-Za-z_][A-Za-z0-9_$]*'
+_SNOWFLAKE_NAME = rf'(?:{_PLAIN}|"(?:[^"\']|"")+")'
+_DATABRICKS_NAME = rf'(?:{_PLAIN}|`(?:[^`\']|``)+`)'
+_SNOWFLAKE_QUALIFIED = rf'{_SNOWFLAKE_NAME}(?:\.{_SNOWFLAKE_NAME}){{0,2}}'
+_QUALIFIED = rf'{_DATABRICKS_NAME}(?:\.{_DATABRICKS_NAME}){{0,2}}'
+SEMANTIC_STATEMENTS = (
+    re.compile(r'SHOW SEMANTIC VIEWS( IN ACCOUNT)?'),
+    re.compile(rf"SELECT SYSTEM\$READ_YAML_FROM_SEMANTIC_VIEW\('{_SNOWFLAKE_QUALIFIED}'\)"),
+    re.compile(rf'DESCRIBE TABLE EXTENDED {_QUALIFIED} AS JSON'),
+)
+"""Every statement :func:`read_semantic_layers` may run, written out in full: a view's name is
+the only part that varies, and only as a plain or quoted identifier."""
+
+
+def _quoted(name: str) -> str:
+    """``name`` as a quoted Snowflake identifier, its quotes doubled."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _last_part(name: str) -> str:
+    """The last part of a qualified name, without its quotes."""
+    found = re.findall(rf'{_PLAIN}|"(?:[^"]|"")+"|`(?:[^`]|``)+`', name)
+    last = found[-1] if found else name
+    if last[:1] in ('"', '`'):
+        return last[1:-1].replace(last[0] * 2, last[0])
+    return last
+
+
+def semantic_statement(sql: str) -> str:
+    """``sql`` if it is one of :data:`SEMANTIC_STATEMENTS`; raises ValueError otherwise."""
+    if not any(pattern.fullmatch(sql) for pattern in SEMANTIC_STATEMENTS):
+        raise ValueError(f'not a statement conform may run: {sql[:80]!r}')
+    return sql
+
+
+def read_semantic_layers(connector: Any, views: list[str] | None = None) -> list[tuple[str, str, str]]:
+    """The semantic layers a Snowflake or Databricks connector serves, as ``(kind, name, YAML)``:
+    for Snowflake every semantic view (or those in ``views``), by ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``;
+    for Databricks each metric view in ``views``, from the ``view_text`` of ``DESCRIBE TABLE
+    EXTENDED ... AS JSON``. These are reads of metadata only; no view is queried.
+
+    Raises:
+        MissingDriver: The warehouse's extra is not installed.
+        ValueError: A view's name is not an identifier, or the connector serves no such layer.
+    """
+    import json
+
+    if isinstance(connector, SnowflakeConnector):
+        module = driver('snowflake.connector', 'snowflake')
+    elif isinstance(connector, DatabricksConnector):
+        module = driver('databricks.sql', 'databricks')
+    else:
+        raise ValueError('only Snowflake and Databricks serve semantic layers')
+    snowflake = isinstance(connector, SnowflakeConnector)
+    connection = module.connect(**connector.options)
+    try:
+
+        def run(sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+            cursor = connection.cursor()
+            cursor.execute(semantic_statement(sql))
+            names = [str(d[0]).lower() for d in cursor.description or []]
+            return names, [tuple(r) for r in cursor.fetchall()]
+
+        found: list[tuple[str, str, str]] = []
+        if snowflake:
+            if not views:
+                names, rows = run('SHOW SEMANTIC VIEWS')
+                col = {n: i for i, n in enumerate(names)}
+                # Names as SHOW gives them are exact, so each is quoted, whatever its case.
+                views = [
+                    '.'.join(_quoted(str(r[col[k]])) for k in ('database_name', 'schema_name', 'name'))
+                    for r in rows
+                    if {'database_name', 'schema_name', 'name'} <= col.keys()
+                    and not any("'" in str(r[col[k]]) for k in ('database_name', 'schema_name', 'name'))
+                ]
+            for view in views:
+                _, rows = run(f"SELECT SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW('{view}')")
+                if rows and rows[0] and rows[0][0]:
+                    found.append(('snowflake-yaml', _last_part(view), str(rows[0][0])))
+            return found
+        for view in views or []:
+            _, rows = run(f'DESCRIBE TABLE EXTENDED {view} AS JSON')
+            described = json.loads(str(rows[0][0])) if rows and rows[0] and rows[0][0] else {}
+            text = described.get('view_text')
+            if isinstance(text, str):
+                found.append(('databricks-yaml', _last_part(view), text))
+        return found
+    finally:
+        connection.close()
+
+
+# Semantic layers in files
+
+
+def layer_from_ossie(model: Any) -> dict[str, Any]:
+    """An Ossie model as the document the native readers give for a platform's."""
+    tables = [
+        {
+            'name': d.name,
+            'source': d.source,
+            'primary_key': list(d.primary_key),
+            'unique': [],
+            'synonyms': [],
+            'description': None,
+            'fields': [
+                {
+                    'name': n,
+                    'expr': sql,
+                    'dialect': dialect,
+                    'kind': 'dimension',
+                    'synonyms': [],
+                    'description': None,
+                }
+                for n, (sql, dialect) in d.fields.items()
+            ],
+        }
+        for d in model.datasets.values()
+    ]
+    metrics = [
+        {
+            'name': m.name,
+            'table': m.dataset,
+            'expr': m.sql,
+            'dialect': m.dialect,
+            'synonyms': list(m.synonyms),
+            'description': m.description,
+        }
+        for m in model.metrics
+        if m.sql is not None
+    ]
+    return {
+        'platform': 'ossie',
+        'name': model.name,
+        'dialect': None,
+        'description': model.description,
+        'filter': None,
+        'tables': tables,
+        'relationships': [dict(r) | {'cardinality': None} for r in model.relationships],
+        'metrics': metrics,
+        'verified_queries': [],
+    }
+
+
+def _json(value: Any) -> str:
+    """A layer's YAML as JSON for the native reader: a date as text, and a ``.nan`` or ``.inf``,
+    which JSON cannot hold, as a clear error."""
+    try:
+        return json.dumps(value, default=_iso, allow_nan=False)
+    except ValueError as error:
+        raise ValueError('a value is .nan or .inf, which a semantic layer does not hold') from error
+
+
+def _iso(value: Any) -> str:
+    """YAML reads a bare date as a date: layers carry it as ISO text."""
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return value.isoformat()
+    raise TypeError(f'{type(value).__name__} is not text, a number or a list')
+
+
+def read_layers(text: str, path: str) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    """The semantic layers a file holds, each with where it came from, and what could not be read.
+
+    A ``.sql`` file may hold ``CREATE SEMANTIC VIEW`` statements and Databricks metric views
+    (``CREATE VIEW ... WITH METRICS LANGUAGE YAML``); a YAML file is a Snowflake semantic model,
+    a Databricks metric view (its name is the file's) or an Ossie model."""
+    from pathlib import PurePath
+
+    from yaml import YAMLError
+
+    from konstruct.core import yamlio
+
+    found: list[tuple[str, dict[str, Any]]] = []
+    problems: list[str] = []
+    name = PurePath(path).name
+    stem = name.split('.')[0]
+    if name.lower().endswith('.sql'):
+        for kind, view, body in _core.conform_statements(text):
+            try:
+                if kind == 'snowflake-view':
+                    found.append((path, json.loads(_core.conform_read_ddl(body))))
+                else:
+                    found.append(
+                        (
+                            path,
+                            json.loads(
+                                _core.conform_read_yaml('databricks-yaml', _json(yamlio.load(body)), view)
+                            ),
+                        )
+                    )
+            except (ValueError, TypeError, YAMLError) as error:
+                problems.append(f'{path}: {view}: {error}')
+        return found, problems
+    layers, more = read_yaml_layer(text, path, stem)
+    return layers + found, problems + more
+
+
+def read_yaml_layer(text: str, path: str, stem: str) -> tuple[list[tuple[str, dict[str, Any]]], list[str]]:
+    """A YAML file as a semantic layer: see :func:`read_layers`."""
+    from konstruct.core import yamlio
+    from konstruct.semantics import ossie
+
+    try:
+        data = yamlio.load(text)
+    except Exception as error:  # yamlio refuses on its own limits as well as bad YAML
+        return [], [f'{path}: {error}']
+    if not isinstance(data, dict):
+        return [], [f'{path}: not a semantic layer']
+    try:
+        if isinstance(data.get('tables'), list):
+            return [
+                (
+                    path,
+                    json.loads(_core.conform_read_yaml('snowflake-yaml', _json(data), stem)),
+                )
+            ], []
+        if 'source' in data and ('measures' in data or 'dimensions' in data or 'fields' in data):
+            return [
+                (
+                    path,
+                    json.loads(_core.conform_read_yaml('databricks-yaml', _json(data), stem)),
+                )
+            ], []
+    except (ValueError, TypeError) as error:
+        return [], [f'{path}: {error}']
+    file = ossie.parse(text, path)
+    if file.models:
+        return [(path, layer_from_ossie(m)) for m in file.models], [f'{path}: {e}' for e in file.errors]
+    return [], [f'{path}: not a Snowflake semantic model, a Databricks metric view or an Ossie model']

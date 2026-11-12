@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from konstruct.analysis import query
 from konstruct.core import jsonio
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from konstruct.engine.config import Config
     from konstruct.engine.trust import Trust
     from konstruct.engine.watch import Judged
+    from konstruct.interfaces.layout import Style
     from konstruct.plugins.registry import Plugins
     from konstruct.semantics.ontology import Ontology
     from konstruct.semantics.world import Connection, EntityDetail, Metrics
@@ -72,6 +74,346 @@ def find_out_dir(start: Path) -> Path:
         if directory.name == OUT_DIR and (directory / 'graph.json').is_file():
             return directory
     return start / OUT_DIR
+
+
+@dataclass
+class Conformance:
+    """What the code says about each metric, key, relationship and column of the semantic layers
+    a project's platforms serve (``conform.json``, ``format_version`` 1).
+
+    A metric ``conforms`` when what it computes, composed through the graph from its table's
+    relation, is shown to be what the approved definitions and the other implementations of the
+    same concept say; ``differs`` when it is not, an error when the match was through the
+    columns it reads and a warning when through its name alone; ``unbound`` when there is
+    nothing to compare it with; ``unparsed`` when its expression could not be read, which is
+    never ``conforms``. "Shown to be the same" carries the error bound of the identity test."""
+
+    documents: list[dict[str, Any]] = field(default_factory=list)
+    """Each document read: its platform, name, where it came from and its counts."""
+    findings: list[dict[str, Any]] = field(default_factory=list)
+    """A finding for each metric, and for each key, relationship and column that is not as the
+    code says: its ``kind``, ``name``, ``verdict``, ``severity`` (``error``, ``warning`` or
+    ``info``) and ``detail``; for a metric also the expression as the layer wrote it, what the
+    code computes (when it differs), what it was compared with and how the match was made, the
+    missing filters and the witness."""
+    summary: dict[str, int] = field(default_factory=dict)
+    """The number of metrics, and of each verdict."""
+    inputs: list[str] = field(default_factory=list)
+    """The files the layers were read from, relative to the project when inside it."""
+    problems: list[str] = field(default_factory=list)
+    """What could not be read, and why."""
+
+    @property
+    def failing(self) -> list[dict[str, Any]]:
+        """The findings that are errors."""
+        return [f for f in self.findings if f['severity'] == 'error']
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'documents': self.documents,
+            'summary': self.summary,
+            'findings': self.findings,
+            'problems': self.problems,
+            'inputs': self.inputs,
+        }
+
+    def text(self, style: Style | None = None) -> str:
+        """The report as text."""
+        return str(self)
+
+    def __str__(self) -> str:
+        lines: list[str] = []
+        for layer in self.documents:
+            lines.append(f'{layer["name"]} ({layer["description"]})')
+            for item in (f for f in self.findings if f['document'] == layer['key']):
+                lines += _conform_lines(item)
+            counts = layer['counts']
+            lines.append(
+                f'  {counts["conforms"]} of {counts["metrics"]} metrics conform; {counts["differs"]} differ, '
+                f'{counts["unbound"]} unbound, {counts["unparsed"]} unparsed.'
+            )
+        lines += [f'could not read {p}' for p in self.problems]
+        if not self.documents and not self.problems:
+            lines.append('Nothing to check: no semantic view, metric view or Ossie model was given.')
+        return '\n'.join(lines)
+
+
+def _conform_lines(item: dict[str, Any]) -> list[str]:
+    kind, name, verdict = item['kind'], item['name'], item['verdict']
+    if kind == 'pair':
+        one, two = item['layers']
+        lines = [
+            f'  pair {name}  differs [{item["severity"]}]: {one["name"]} in {one["document"]}',
+            f'      and {two["name"]} in {two["document"]}',
+        ]
+        for missing in item.get('missing_filters', []):
+            lines.append(f'      missing filter: {missing["filter"]} ({missing["against"]}: {missing["by"]})')
+        if item.get('witness'):
+            lines.append(f'      witness: {item["witness"]}')
+        return lines
+    if kind != 'metric':
+        return [f'  {kind} {name}  {verdict}: {item["detail"]}']
+    head = f'  metric {name}  {verdict}'
+    if verdict == 'differs':
+        against = item.get('against') or []
+        names = ', '.join(f'{a["name"]} ({a["source"]}, by {a["grade"]})' for a in against)
+        head += f' from {names} [{item["severity"]}]'
+    elif verdict == 'conforms':
+        head += f' (error at most {item.get("error_bound", 0.0):.1e})'
+    elif item['detail']:
+        head += f': {item["detail"]}'
+    lines = [head]
+    if item.get('expression'):
+        lines.append(f'      view:  {item["expression"]}')
+    if item.get('code'):
+        lines.append(f'      code:  {item["code"]}')
+    for missing in item.get('missing_filters', []):
+        lines.append(f'      missing filter: {missing["filter"]} ({missing["against"]}: {missing["by"]})')
+    if item.get('witness'):
+        lines.append(f'      witness: {item["witness"]}')
+    return lines
+
+
+def _terms(graph: Graph, checker: Any, formulas: Any) -> list[dict[str, Any]]:
+    """Every term and Ossie metric of the graph, as what a metric of a layer might be compared
+    with; the native core binds them to the metrics (``src/conform/``). Each filter a term
+    requires comes with the keys of its conditions, which the core finds among those that hold on
+    a metric's rows, and the definitions of its parts, which a layer's own filter may be."""
+    found = []
+    for node in graph.nodes.values():
+        if node.kind != 'term':
+            continue
+        expression, tokens = node.attrs.get('ossie_expression'), node.attrs.get('ossie_columns')
+        formula = None
+        if (
+            isinstance(expression, str)
+            and isinstance(tokens, dict)
+            and all(i in graph.nodes for i in tokens.values())
+        ):
+            try:
+                formula = formulas.foreign(
+                    expression,
+                    {t: graph.nodes[i] for t, i in tokens.items()},
+                    dialect=node.attrs.get('formula_dialect'),
+                    rows=graph.nodes.get(node.attrs.get('ossie_dataset', '')),
+                )
+            except ValueError:
+                formula = None
+        owner = node.attrs.get('owner')
+        filters = [
+            {
+                'text': str(text),
+                'keys': checker.filter_keys(node, str(text)),
+                'definitions': formulas.condition_parts(str(text)),
+            }
+            for text in node.attrs.get('filters') or []
+        ]
+        found.append(
+            {
+                'name': node.name,
+                'names': [node.name, *node.attrs.get('synonyms', [])],
+                'source': 'ossie metric' if formula is not None else 'term',
+                'owner': owner.get('name') if isinstance(owner, dict) else owner,
+                'approved': node.attrs.get('status') == 'approved',
+                'path': str(node.path or ''),
+                'defined': [
+                    e.target for e in graph.out_edges(node.id, 'defines') if e.attrs.get('role') != 'input'
+                ],
+                'reads': list(tokens.values()) if isinstance(tokens, dict) else [],
+                'formula': formula,
+                'filters': filters,
+            }
+        )
+    return found
+
+
+def conform_layers(graph: Graph, ontology: Any, layers: list[tuple[str, dict[str, Any]]]) -> Conformance:
+    """Check platform semantic layers against the code. Python parses and resolves (sqlglot, the
+    graph, the formulas of the identity test, which filters hold on a column's rows as
+    ``check-sql`` says); the native core binds each metric to what might define it, then
+    classifies, grades and judges, from plain data."""
+    from konstruct import _core
+    from konstruct.analysis.checksql import Checker
+    from konstruct.analysis.identity import Formulas
+    from konstruct.semantics import ossie
+
+    checker = Checker(graph)
+    formulas = Formulas(graph)
+    request: dict[str, Any] = {
+        'claims': [],
+        'terms': _terms(graph, checker, formulas),
+        'keys': [],
+        'joins': [],
+        'columns': [],
+        'code_joins': [
+            {'from': r.columns[0], 'to': r.columns[1], 'cardinality': r.cardinality}
+            for r in checker.relationships
+            if r.columns
+        ],
+    }
+    unique = set(checker.unique)
+    entities = {c: e.name for e in ontology.entities for c in e.key_ids}
+    documents: list[dict[str, Any]] = []
+    made: dict[tuple[str, str], dict[str, Any]] = {}
+    for where, layer in layers:
+        key = f'{where}#{layer["name"]}'
+        bound = ossie.bind_layer(graph, layer, key, where)
+        binding = bound.binding
+        request['columns'] += bound.columns
+        documents.append(
+            {
+                'key': key,
+                'name': layer['name'],
+                'platform': layer['platform'],
+                'path': where,
+                'description': f'{layer["platform"]} semantic layer, read from {where}',
+            }
+        )
+        view = formulas.condition_parts(layer.get('filter'))
+        for item in layer['metrics']:
+            resolution = bound.resolution[item['name']]
+            claim: dict[str, Any] = {
+                'document': key,
+                'path': where,
+                'name': item['name'],
+                'synonyms': item['synonyms'],
+                'resolution': resolution,
+                'columns': [],
+                'view': view,
+            }
+            # What the metric's own aggregates keep their rows under holds a required filter too.
+            tree = bound.trees[item['name']]
+            if tree is not None:
+                for text in ossie.own_conditions(tree):
+                    claim['view'] = [*claim['view'], *formulas.condition_parts(text)]
+            request['claims'].append(claim)
+            if not resolution['portable'] or resolution['derived'] or resolution['fan_out']:
+                continue
+            if resolution['unbound_tables'] or resolution['unreadable']:
+                continue
+            sql, tokens = binding.portable[item['name']]
+            columns = {t: graph.nodes[c] for t, c in tokens.items()}
+            dialect = ossie.layer_dialect(item, layer)
+            try:
+                claim['formula'] = formulas.foreign(
+                    sql, columns, dialect=dialect, rows=binding.relations.get(item.get('table') or '')
+                )
+            except ValueError as error:
+                resolution['formula_error'] = str(error)
+                continue
+            claim['columns'] = [c.id for c in columns.values()]
+            made[key, item['name']] = {
+                'sql': sql,
+                'tokens': columns,
+                'dialect': dialect,
+                'layer': layer,
+            }
+        _conform_facts(graph, layer, key, bound, request, unique, entities)
+
+    def held(ids: list[str]) -> list[tuple[str, str]]:
+        # The conditions that hold on the rows of every one of the columns.
+        each = [{c.key: c.text for c in checker.held_filters(graph.nodes[i])} for i in ids]
+        common = set.intersection(*(set(h) for h in each)) if each else set()
+        return [(k, each[0][k]) for k in sorted(common)]
+
+    answer = json.loads(_core.conform_judge(json.dumps(request), formulas.core, held))
+    for item in answer['findings']:
+        meta = made.get((item['document'], item['name'])) if item['kind'] == 'metric' else None
+        if meta is not None:
+            item['expression'] = next(
+                m['expr'] for m in meta['layer']['metrics'] if m['name'] == item['name']
+            )
+            if item['verdict'] == 'differs':
+                item['code'] = formulas.shown(
+                    meta['sql'], meta['tokens'], meta['dialect'], meta['layer'].get('filter')
+                )
+        # The indexes are the run's own: the document carries the verdict and witness.
+        compared = item.pop('compare', None)
+        if compared:
+            verdict = formulas.compare(*compared)
+            item['verdict_detail'] = verdict.to_dict()
+            item['witness'] = str(verdict.witness) if verdict.witness is not None else None
+    zero = dict.fromkeys(('metrics', 'conforms', 'differs', 'unbound', 'unparsed'), 0)
+    for d in documents:
+        d['counts'] = answer['documents'].get(d['key'], zero)
+    return Conformance(documents, answer['findings'], answer['summary'])
+
+
+def _conform_facts(
+    graph: Graph,
+    layer: dict[str, Any],
+    key: str,
+    bound: Any,
+    request: dict[str, Any],
+    unique: set[str],
+    entities: dict[str, str],
+) -> None:
+    """The keys and relationships a layer declares, as the facts the core judges them by: which
+    column each is, whether it is unique and whose key it is, and which relationships the code
+    has between the columns."""
+    binding = bound.binding
+    for table in layer['tables']:
+        name = table['name']
+        if name in binding.unbound:
+            continue
+        for item in table['fields']:
+            owner = bound.owners.get((name, item['name']), name)
+            nodes = binding.fields.get((owner, item['name']), [])
+            if item['kind'] == 'fact' and len(nodes) == 1 and not binding.missing.get((owner, item['name'])):
+                column = nodes[0]
+                request['keys'].append(
+                    {
+                        'document': key,
+                        'name': f'{name}.{item["name"]}',
+                        'declared': 'fact',
+                        'unique': column.id in unique,
+                        'entity': entities.get(column.id),
+                        'evidence': f'{graph.label(column)} is unique and the key of entity {entities.get(column.id)}',
+                    }
+                )
+        for columns in [table['primary_key'], *table['unique']]:
+            if len(columns) != 1:
+                continue
+            found = binding.fields.get((name, columns[0])) or []
+            if len(found) != 1 and name in binding.relations:
+                physical = graph.column(binding.relations[name].id, columns[0])
+                found = [physical] if physical is not None else []
+            if len(found) == 1:
+                request['keys'].append(
+                    {
+                        'document': key,
+                        'name': f'{name}.{columns[0]}',
+                        'declared': 'primary key' if columns is table['primary_key'] else 'unique key',
+                        'unique': found[0].id in unique,
+                        'evidence': graph.label(found[0]),
+                    }
+                )
+
+    def end(table: str, columns: list[str], *, primary: bool = False) -> Any:
+        if not columns and primary:
+            owner = next((t for t in layer['tables'] if t['name'] == table), None)
+            columns = list(owner['primary_key']) if owner else []
+        if len(columns) != 1:
+            return None
+        found = binding.fields.get((table, columns[0])) or []
+        if len(found) == 1:
+            return found[0]
+        relation = binding.relations.get(table)
+        return graph.column(relation.id, columns[0]) if relation is not None else None
+
+    for rel in layer['relationships']:
+        many, one = end(rel['from'], rel['from_columns']), end(rel['to'], rel['to_columns'], primary=True)
+        if many is not None and one is not None:
+            request['joins'].append(
+                {
+                    'document': key,
+                    'name': rel['name'],
+                    'from': many.id,
+                    'to': one.id,
+                    'declared': rel.get('cardinality'),
+                    'evidence': f'{graph.label(many)} to {graph.label(one)}',
+                }
+            )
 
 
 class Project:
@@ -509,6 +851,102 @@ class Project:
             # An untrusted project, a missing extra, or a connection or query the warehouse refused.
             raise query.QueryError(f'cannot read query history: {error}') from error
         return check_history(self.graph, history, pseudonymise=pseudonymise, limit=limit)
+
+    def _relative(self, path: str) -> str:
+        try:
+            return str(Path(path).resolve().relative_to(self.path))
+        except ValueError:
+            return path
+
+    def conform(
+        self,
+        paths: Sequence[str | Path] = (),
+        *,
+        warehouse: bool = False,
+        views: Sequence[str] = (),
+        write: bool = False,
+    ) -> Conformance:
+        """Check the semantic layers deployed on data platforms against what the code computes.
+
+        Reads Snowflake semantic views (``CREATE SEMANTIC VIEW`` files and the YAML of
+        ``SYSTEM$READ_YAML_FROM_SEMANTIC_VIEW``), Databricks metric views (the YAML, or the
+        ``CREATE VIEW ... WITH METRICS`` file) and Apache Ossie models. Each metric is composed
+        through the graph from its table's relation and compared with the approved definitions
+        and the other implementations of the same concept; keys, relationships and columns are
+        checked against the code's tests and joins. No model SQL runs, and no expression is
+        executed.
+
+        With ``warehouse``, the layers the project's Snowflake and Databricks connections serve
+        are read too, by metadata statements only, so the project must be trusted
+        (``konstruct trust``).
+
+        Args:
+            paths: Files, or folders searched for ``.sql``, ``.yaml`` and ``.yml`` files.
+            warehouse: Also read the layers the warehouses serve.
+            views: Which views to read from the warehouse (every Snowflake semantic view by
+                default; Databricks metric views are read only when named).
+            write: Also write ``conform.json`` beside the graph, with the files it read.
+
+        Returns:
+            A verdict for every metric (``conforms``, ``differs``, ``unbound``, ``unparsed``),
+            key, relationship and column.
+
+        Raises:
+            konstruct.QueryError: A path does not exist, the project is not trusted, or the
+                warehouse refuses.
+
+        Example::
+
+            result = project.conform(['semantic_views/'])
+            for finding in result.failing:
+                print(finding['name'], finding['detail'])
+        """
+        from konstruct.engine.config import ConfigError
+        from konstruct.inputs.warehouse import MissingDriver, read_layers, read_semantic_layers
+
+        texts: list[tuple[str, str]] = []
+        for item in paths:
+            path = Path(item)
+            if not path.exists():
+                raise query.QueryError(f'{item} does not exist')
+            files = sorted(f for f in path.rglob('*') if f.is_file()) if path.is_dir() else [path]
+            texts += [
+                (self._relative(str(f)), f.read_text(encoding='utf-8-sig', errors='replace'))
+                for f in files
+                if f.suffix.lower() in ('.sql', '.yaml', '.yml')
+            ]
+        if warehouse:
+            from konstruct.engine.config import discover_warehouses
+            from konstruct.inputs.dbt import find_projects
+
+            try:
+                config = self.config()
+                found = [
+                    w
+                    for w in discover_warehouses(config, find_projects(config.root))
+                    if w.type in ('snowflake', 'databricks')
+                ]
+                if not found:
+                    raise query.QueryError('no Snowflake or Databricks warehouse is configured')
+                for served in found:
+                    for _, name, body in read_semantic_layers(served.connector(config.root), list(views)):
+                        texts.append((f'{served.type}:{name}.yaml', body))
+            except (ConfigError, MissingDriver, ValueError) as error:
+                raise query.QueryError(f'cannot read the warehouse: {error}') from error
+        documents: list[tuple[str, dict[str, Any]]] = []
+        problems: list[str] = []
+        for where, text in texts:
+            layers, more = read_layers(text, where)
+            documents += layers
+            problems += more
+        result = conform_layers(self.graph, self.ontology(), documents)
+        result.problems += problems
+        result.inputs = [
+            self._relative(path) for path, _ in texts if not path.startswith(('snowflake:', 'databricks:'))
+        ]
+        if write:
+            jsonio.write_text(self.out_dir / 'conform.json', json.dumps(document(result), indent=1) + '\n')
+        return result
 
     def ontology(self) -> Ontology:
         """The ontology of the data stack, derived from the graph.
