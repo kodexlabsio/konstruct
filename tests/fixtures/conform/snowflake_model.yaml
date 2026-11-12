@@ -1,0 +1,29 @@
+name: sales
+description: Sales
+tables:
+  - name: orders
+    base_table:
+      database: SNOWFLAKE_SAMPLE_DATA
+      schema: TPCH_SF1
+      table: ORDERS
+    primary_key:
+      columns: [o_orderkey]
+    dimensions:
+      - name: status
+        expr: o_orderstatus
+    time_dimensions:
+      - name: order_date
+        expr: o_orderdate
+    facts:
+      - name: price
+        expr: o_totalprice
+    metrics:
+      - name: revenue
+        expr: SUM(price)
+relationships: []
+verified_queries:
+  - name: revenue_by_status
+    question: What is revenue by status?
+    sql: SELECT status, SUM(price) FROM orders GROUP BY status
+    verified_at: 1700000000
+    verified_by: priya
