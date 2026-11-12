@@ -5,12 +5,16 @@ the same down to the bytes of graph.json."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from konstruct.core.graph import Graph
+from konstruct.core.sql import DIALECTS as DIALECT_NAMES
 from konstruct.inputs import dbt
 from tests import dbt_oracle
 from tests.conftest import copy_example, dbt_executable, run_dbt
@@ -346,15 +350,83 @@ NAMES = [
     '"db"."s"."t" ',
     'DB.S.T',
     'db.s.Ünï',
+    '`a.b`.c.d',
+    '"a.b".c.d',
+    'a.b.c.d',
+    'a.b.c.d.e',
+    'a.b.1z.c',
+    '0."x"."y"',
+    '"a".0.b',
+    '1.2.3',
+    '"unclosed.t',
 ]
+DIALECTS = [None, *sorted(set(DIALECT_NAMES.values()))]
 
 
-@pytest.mark.parametrize(
-    'dialect', [None, 'duckdb', 'bigquery', 'tsql', 'snowflake', 'postgres', 'mysql', 'spark']
-)
-def test_relation_names_are_the_keys_the_sql_parser_gave(dialect: str | None) -> None:
-    for name in NAMES:
+def fixture_names() -> list[str]:
+    """Every relation name the fixtures of the tests write."""
+    from tests.jinja_corpus import MANIFEST
+
+    manifest, _ = edge_cases()
+    names = list(NAMES)
+    for group in (MANIFEST['nodes'], MANIFEST['sources'], manifest['nodes'], manifest['sources']):
+        names += [item['relation_name'] for item in group.values() if item.get('relation_name')]
+    names += [
+        '"jaffle_shop"."main"."orders"',
+        '"wh"."analytics"."m001"',
+        '"memory"."main_staging"."stg_orders"',
+    ]
+    return names
+
+
+@pytest.mark.parametrize('dialect', DIALECTS)
+def test_relation_names_of_the_fixtures_are_the_keys_the_sql_parser_gave(dialect: str | None) -> None:
+    for name in fixture_names():
         assert dbt.parse_relation_name(name, dialect) == dbt_oracle.parse_relation_name(name, dialect), (
             name,
             dialect,
         )
+
+
+BACKTICKED = {'bigquery', 'spark', 'databricks', 'mysql', 'clickhouse'}
+# A name does not start with `$`, which is a parameter to some parsers, and is not only digits,
+# which sqlglot reads as a number after a quoted part, and does not start with `0`, which
+# BigQuery reads as hexadecimal (`0Xa`).
+UNQUOTED = st.builds(
+    lambda first, middle, last: first + middle + last,
+    st.sampled_from('abcXYZ_19'),
+    st.text(alphabet='abcXYZ_019$', max_size=4),
+    st.sampled_from('abcXYZ_'),
+)
+LETTERED = st.builds(
+    lambda first, rest: first + rest, st.sampled_from('abcXYZ_'), st.text(alphabet='abcXYZ_019$', max_size=4)
+)
+# A quoted part holds dots, and neither starts nor ends with one.
+QUOTED = st.builds(
+    lambda first, middle, last: first + middle + last,
+    st.sampled_from('abXY_ -'),
+    st.text(alphabet='abXY_ -.', max_size=4),
+    st.sampled_from('abXY_ -'),
+)
+
+
+@st.composite
+def relation_names(draw: st.DrawFn) -> tuple[str, str | None]:
+    """A name of one to four parts, each plain or quoted as its dialect quotes (with dots inside the
+    quotes), in a dialect Konstruct supports."""
+    dialect = draw(st.sampled_from(DIALECTS))
+    quotes = '`' if dialect in BACKTICKED else ('[]' if dialect == 'tsql' and draw(st.booleans()) else '"')
+    count = draw(st.integers(1, 4))
+    quoted = [draw(st.booleans()) for _ in range(count)]
+    # sqlglot lexes a part that starts with a digit, beside a quoted part, by rules that Konstruct
+    # does not copy: such a name is read as it is written. Names that mix them are not generated.
+    unquoted = LETTERED if any(quoted) else UNQUOTED
+    parts = [quotes[0] + draw(QUOTED) + quotes[-1] if q else draw(unquoted) for q in quoted]
+    return '.'.join(parts), dialect
+
+
+@settings(max_examples=int(os.environ.get('KONSTRUCT_RELATION_EXAMPLES', '600')), deadline=None)
+@given(relation_names())
+def test_generated_relation_names_are_the_keys_the_sql_parser_gave(case: tuple[str, str | None]) -> None:
+    name, dialect = case
+    assert dbt.parse_relation_name(name, dialect) == dbt_oracle.parse_relation_name(name, dialect), case
