@@ -12,6 +12,7 @@
 | `owl` | The ontology as OWL 2 in Turtle: entities as classes, their columns as data properties, relationships as object properties, and measures as annotations (see [below](#owl-and-turtle)) | Knowledge graphs, ontology editors and platforms that import RDF |
 | `semantic-view` | The ontology as one Snowflake `CREATE OR REPLACE SEMANTIC VIEW` statement: tables, relationships, dimensions and metrics (see [below](#snowflake-semantic-view)) | Snowflake semantic views and Cortex Analyst |
 | `metric-view` | The ontology as Databricks metric views, one `CREATE OR REPLACE VIEW ... WITH METRICS` statement per table (see [below](#databricks-metric-views)) | Unity Catalog metric views |
+| `odcs` | The ontology as ODCS 3.2 data contracts, one YAML document per model, with verified statements only where a test or `konstruct verify` is the evidence (see [below](#data-contracts)) | Data contract tools and catalogues that read ODCS |
 
 A [plugin](plugins.md#an-export-format) the project enables can add a format, which `konstruct export <format>` writes as it does these.
 
@@ -79,3 +80,49 @@ Each table above is the `source` of one metric view, `<table>_metrics`, written 
 | Aggregate measure that reads the source | A measure, its formula in Databricks SQL with each column as `source.<column>`, the term's name as `display_name`, up to ten synonyms, and a `comment` with its definition, grain, required filters and unit |
 
 Names that differ only by case are kept apart, and keywords are quoted. Left out: the same measures and relationships as the semantic view, apart from cycles, since a view joins only the tables its source refers to; a synonym or display name over 255 characters; a comment, synonym or display name that holds `$$`, which would end the statement; and data types, owners, status and verification.
+
+## Data Contracts
+
+`odcs` writes the ontology as [ODCS](https://github.com/bitol-io/open-data-contract-standard) 3.2 data contracts: one YAML document per model that holds an entity or a measure, in one stream (`---` between them), each starting with comments that say what it leaves out. Each contract has the status `draft`, and nothing in it claims to be enforced: Konstruct runs none of its quality rules, and says so in the file.
+
+```text
+konstruct export odcs -o contracts.yml
+konstruct contract check contracts.yml
+```
+
+| Ontology | ODCS field |
+|----------|-----------|
+| Relation | A `schema` object: `name`, `physicalName`, `physicalType` (`table` or `view`), `description`, and the entity's name and term as `businessName` and `synonyms` |
+| Column | A property: `physicalType` and `logicalType` from the column's type, `description`, `unique` and `primaryKey` where a test, key or `konstruct verify` shows the column unique, `required` where a `not_null` test says so |
+| Measure column | `semanticType: measure` when its composed formula is an aggregate, with `transformLogic` (the formula composed down to source columns), `transformSourceObjects` and the term's name as a synonym |
+| Relationship | A `foreignKey` under the object's `relationships`, with its cardinality and grade as `customProperties` |
+| `unique`, `not_null` and `relationships` tests | `quality` rules for the tools that run them: `duplicateValues`, `nullValues` (ODCS's predefined metrics, `mustBe: 0`) and a `sql` rule that counts values with no match, each naming its test |
+| Evidence | The object's `context.verifiedStatements` |
+
+Every fact carries its grade, `verified`, `declared` or `inferred` (see [Ontology](ontology.md)), in `customProperties` as `konstructGrade`. A *verified statement* is written only where Konstruct holds evidence for it, and names the evidence in `konstructEvidence` and its grade in `konstructGrade`:
+
+- a column is unique, or never null: the id of the dbt `unique` or `not_null` test that requires it (grade `declared`), or the result of `konstruct verify`, which checked the data (grade `verified`);
+- a relationship holds: the dbt `relationships` test (`declared`), or `konstruct verify`'s check of every value (`verified`); its cardinality is in a verified answer only when verify confirmed it (a one-to-one needs verify's own check of the referring column);
+- a measure's lineage: only when `konstruct verify` confirmed every lineage edge from the column down to source (`verified`); the statement says its lineage was confirmed, and gives the formula.
+
+A relationship read only from a join, an entity named only by a column's name, and a formula verify has not confirmed are written with their grade (`inferred`, or `declared` for a measure a person defined) and never as a statement. A key or uniqueness that `konstruct verify` found false is not written, and the file's comments say so. A dbt test is evidence that someone declared the claim, not that the data passes it; run `konstruct verify` to check the data.
+
+A key is written as `primaryKey` once for an object: the primary key the relation declares, else the unique key of the entity the relation is named for, else of its first entity; any other unique column is `unique`. A test with a `where` holds only for some rows, so it gives no `unique`, `primaryKey`, `required` or statement, and nulls that `konstruct verify` found remove `required` and the not-null statement.
+
+Not written, because the data stack does not hold them: `servers`, `team`, `roles`, SLAs, `support`, `price`, `slaProperties` and `domain`. A relationship whose names cannot stand in an ODCS reference (one that does not start with a letter or underscore, or holds a character other than letters, digits, `_` and `-`) is left out and listed in the file's comments. `--select` does not apply, and an ontology with no entity or measure in a model exports nothing and exits with status 1.
+
+### Checking a Contract
+
+`konstruct contract check FILE` reads a contract (one YAML document, or several) and tests the claims the graph can answer, without reading the warehouse:
+
+| Claim | Finding |
+|-------|---------|
+| A table, or a column of it | `missing-table`, `missing-column`: unsupported when the project has no such relation, contradicted when a relation has no such column. A `physicalName` (also of a property) names the relation or column in place of `name`, and may be partly qualified (`main.customers`). A name qualified otherwise than the graph's (`prod.db.main.customers` or `prod_db.main.customers` for `db.main.customers`, where the trailing schema and table match) is `table-qualifier`, unsupported, and the graph's relation is checked in its place. Names are compared in Unicode normal form C, and without the quote characters of a part |
+| `physicalType` or `logicalType` | `wrong-type`: contradicted when the type differs from the graph's, as the graph's dialect reads both: Snowflake's `NUMBER(38,0)` is `INTEGER`, `INT` and `BIGINT`, its `FLOAT` is `DOUBLE` and `REAL`, and its `TIMESTAMP_NTZ` is `TIMESTAMP`; BigQuery's `INT64` is every integer; Snowflake's `TEXT` is `VARCHAR`; BigQuery's `FLOAT64` is `FLOAT`; Databricks's `TIMESTAMP` is `TIMESTAMP_LTZ`; elsewhere `INTEGER` and `BIGINT` differ and `STRING` and `VARCHAR` do not. A nested type is compared with what it holds (`ARRAY<STRING>` is not `ARRAY<INT64>`, and `STRUCT` fields are compared by name and type). A precision, scale, length or element type given on one side only is no difference (`NUMERIC` is `NUMERIC(10,2)`, `VARCHAR` is `VARCHAR(20)`); given on both, it must be the same (`NUMERIC(12,2)` and `VARCHAR(50)` are not). A `number` may be claimed of an integer, and a decimal of scale zero is an integer |
+| `primaryKey: true`, `unique: true` | `key`, `unique`: contradicted when `konstruct verify` found the column repeated, unsupported when no test, primary key or verify result shows it unique; the properties with `primaryKey: true` of one object are one key, compared with the primary key the graph declares |
+| A claim in the wrong shape | `malformed`: contradicted (a property that is not a mapping, a flag that is not true or false, a relationship without `from` and `to`); the contract must have `kind: DataContract` |
+| `required: true` | `required`: contradicted when `konstruct verify` found nulls, unsupported when no `not_null` test, primary key or verify result says so; a supported `primaryKey` implies it |
+| A `relationships` entry | `relationship`: contradicted only on evidence: `konstruct verify` found the link false or the claimed target's values repeated; unsupported when nothing shows it, the graph has the referring column pointing elsewhere, or the claimed target is not known to be unique. A dbt `relationships` test between relations that hold no entity is a link the check knows |
+| `semanticType: measure` | `measure`: contradicted when the column's formula is not an aggregate, unsupported when nothing in the graph computes it |
+
+The command exits 1 when a claim is contradicted, or with `--strict` when any finding remains, and reads standard input when `FILE` is `-`. Konstruct runs no quality rule, which is text for the tools that run it: `contract check` lists each `sql` and predefined rule, at the object or a property, under "Quality rules, not run". `konstruct verify` checks keys and relationships against the data, but does not run a contract's rules. A relation whose text holds a lone surrogate is left out of the export and of the check, and named in the file's comments or the check's notes. Konstruct's own export checks with no findings. `--json` prints the result, and the `contract_check` MCP tool gives an agent the same.

@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from konstruct.analysis.checksql import HistoryCheck, SqlCheck
     from konstruct.analysis.compile import Compiled
     from konstruct.analysis.conflicts import Conflicts
+    from konstruct.analysis.contract import ContractCheck
     from konstruct.analysis.diff import Diff
     from konstruct.analysis.english import English
     from konstruct.analysis.erasure import ErasureMap
@@ -983,6 +984,37 @@ def laws_lines(result: Laws, style: Style) -> Lines:
         lines += table(style, rows)
         if len(blocked) > 20:
             lines.append(Text((f'  and {len(blocked) - 20} more; the JSON lists them all', 'dim')))
+    return lines
+
+
+def contract_check_lines(result: ContractCheck, style: Style) -> Lines:
+    counts = f'{_plural(result.claims, "claim")} in {_plural(result.contracts, "contract")}'
+    if not result.findings:
+        lines = _summary(style, Text((f'No findings: {counts} tested against the graph.', 'good')))
+    else:
+        found = _plural(len(result.findings), 'finding')
+        lines = _summary(style, Text((f'{found} in {counts}.', 'bad' if result.contradicted else 'warn')))
+    for finding in result.findings:
+        role = 'error' if finding.severity == 'contradicted' else 'warn'
+        lines.append(
+            Text(
+                '  ',
+                (finding.kind, role),
+                ' ',
+                (finding.where, 'subject'),
+                ' ',
+                (f'({finding.severity})', 'dim'),
+            )
+        )
+        lines += paragraph(style, Text(finding.message), indent=4)
+    if result.not_run:
+        lines += [blank(), section('Quality rules, not run', len(result.not_run))]
+        lines += [Text('  ', item) for item in result.not_run]
+        lines += _summary(
+            style, Text(('Konstruct runs no quality rule: they are text for the tools that do.', 'dim'))
+        )
+    for note in result.notes:
+        lines.append(Text(('note:', 'dim'), ' ', note))
     return lines
 
 

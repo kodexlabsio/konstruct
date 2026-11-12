@@ -66,6 +66,9 @@ PROMPTS_NOTE = """
 The prompts give whole workflows (a safe change, a review, reconciling two numbers, writing a
 query)."""
 
+MAX_CONTRACT_BYTES = 4_000_000
+"""The largest contract the ``contract_check`` tool reads: it parses what an agent sends."""
+
 PROMPT_PREFACE = """\
 Konstruct's MCP tools take the names and main arguments of the commands below (`impact`, `trace`,
 `describe`, `explain`, `define`, `ontology`, `entity`, `metric`, `relate`, `conflicts`,
@@ -74,7 +77,7 @@ Konstruct's MCP tools take the names and main arguments of the commands below (`
 for `konstruct check-sql --history`, `release_notes`, `timeline`, `mutation_test` for `konstruct verify
 --mutate`, `why` for `konstruct verify --why`, `definition_effect` for `konstruct verify
 --effect`, `receipt` for `konstruct receipts issue`, `laws` for `konstruct verify --laws` and
-`lock_check` for `konstruct lock --check`) and return what the command returns with `--json`; use
+`lock_check` for `konstruct lock --check` and `contract_check` for `konstruct contract check`) and return what the command returns with `--json`; use
 them where you can. Run the others (`konstruct build`, `status`, `list`, `verify`, `lock` and
 `export`) in a shell. The
 `konstruct://report`, `konstruct://ontology` and `konstruct://summary` resources hold the build's
@@ -557,6 +560,19 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
         that read it, and the command to accept it (`accept`) or to keep the locked meaning
         (`keep`). `passed` is true when nothing changed."""
         return run(project.check_lock)
+
+    @server.tool(annotations=READS)
+    def contract_check(contract: str) -> dict[str, Any]:
+        """Test the claims of an ODCS data contract (its YAML text, one document or several) against
+        the graph: each column and type, key, never-null column, relationship and measure it claims.
+        A finding is `contradicted` when the graph holds the opposite (a missing column, another type,
+        a key that verify found repeated, a relationship pointing elsewhere, a measure that is not an
+        aggregate, a claim in the wrong shape) and `unsupported` when nothing in the graph says so.
+        `not_run` lists the contract's quality rules, which Konstruct does not run. `ok` is false
+        when a claim is contradicted. Use before relying on, or publishing, a contract."""
+        if len(contract.encode('utf-8', 'surrogatepass')) > MAX_CONTRACT_BYTES:
+            raise _untrusted_error(f'the contract is over {MAX_CONTRACT_BYTES:,} bytes; check it in parts')
+        return run(project.check_contract, contract)
 
     @server.tool(annotations=READS)
     def query(question: str) -> dict[str, Any]:

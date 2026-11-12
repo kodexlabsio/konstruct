@@ -189,6 +189,7 @@ def test_the_readme_lists_every_command_and_format() -> None:
         'owl': 'OWL',
         'semantic-view': 'Snowflake semantic view',
         'metric-view': 'Databricks metric views',
+        'odcs': 'ODCS',
     }
     exports = _bullet(features, 'Other tools')
     missing += [f'export {f}' for f in FORMATS if f not in names or names[f] not in exports]
@@ -251,6 +252,7 @@ def test_the_licence_texts_are_named_for_what_they_cover() -> None:
         'jetbrains-mono.txt',
         'konstruct.txt',
         'manrope.txt',
+        'odcs-schema-apache-2.0.txt',
         'ontology-packs-apache-2.0.txt',
         'ontology-packs.txt',
     ]

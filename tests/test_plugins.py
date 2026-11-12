@@ -376,7 +376,7 @@ def test_the_plugins_command_lists_each_plugin(
     assert f'  {"packs":<10} {"pipelines":<24} API {PACKS}' in out
     assert 'konstruct-absent: enabled in konstruct.toml, but not installed' in out
     assert (
-        'Built in: inputs looker; exports openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view;'
+        'Built in: inputs looker; exports openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view, odcs;'
         in out
     )
     assert main(['plugins', '-C', str(root), '--json']) == 0
@@ -663,7 +663,7 @@ def test_export_formats_from_plugins(
     assert 'raised RuntimeError: no export today' in capsys.readouterr().err
     with pytest.raises(
         ExportError,
-        match="unknown export format 'nope'; choose from openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view, bytes, fails, nodes",
+        match="unknown export format 'nope'; choose from openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view, odcs, bytes, fails, nodes",
     ):
         Project(root).export('nope')
     # A format no installed distribution provides is a usage error, as before.
@@ -1867,6 +1867,7 @@ def test_tool_listings_a_plugin_gets_wrong_leave_the_rest_served(
         'mutation_test',
         'definition_effect',
         'lock_check',
+        'contract_check',
         'a_b_c',
         'list_terms',
         'list_x',

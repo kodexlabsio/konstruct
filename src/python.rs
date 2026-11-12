@@ -567,7 +567,7 @@ impl Router {
 }
 
 /// Konstruct's native core: graph traversal, name resolution, search, search by meaning,
-/// formula identity, topic routing, the readers of Airflow and Dagster files and the server.
+/// formula identity, topic routing, ODCS data contracts, the readers of Airflow and Dagster files and the server.
 #[pymodule(name = "_core")]
 mod core_module {
     use pyo3::exceptions::PyImportError;
@@ -599,6 +599,8 @@ mod core_module {
     use crate::model::{
         Edge, Graph, Node, Step, column_id, reading_key, relation_key, split_reading,
     };
+    #[pymodule_export]
+    use crate::odcs::python::{odcs_check, odcs_export};
     #[pymodule_export]
     use crate::scan::python::scan_python_files;
     #[pymodule_export]

@@ -301,6 +301,19 @@ def cmd_ontology(args: argparse.Namespace, console: Console) -> int:
     return 1 if args.strict and result.violations else 0
 
 
+def cmd_contract(args: argparse.Namespace, console: Console) -> int:
+    from konstruct.analysis.query import QueryError
+
+    try:
+        text = sys.stdin.read() if args.file == '-' else Path(args.file).read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError) as error:
+        raise QueryError(f'cannot read {args.file}: {getattr(error, "strerror", None) or error}') from error
+    project = _ready(_project(args), args, console)
+    result = project.check_contract(text)
+    _emit(console, result, args.json)
+    return 0 if result.ok and not (args.strict and result.findings) else 1
+
+
 def _found(console: Console, question: Any) -> Any:
     """``question()``'s answer, or None after saying what it did not find: like ``define``, a
     name that matches nothing exits with status 3."""
@@ -817,7 +830,17 @@ GROUPS = (
     ('Explore', ('search', 'describe', 'list', 'query', 'export')),
     (
         'Business meaning',
-        ('define', 'ontology', 'entity', 'metric', 'relate', 'compile-metric', 'conflicts', 'check-sql'),
+        (
+            'define',
+            'ontology',
+            'entity',
+            'metric',
+            'relate',
+            'compile-metric',
+            'conflicts',
+            'check-sql',
+            'contract',
+        ),
     ),
     ('Sensitive data', ('sensitivity', 'erasure')),
     ('Changes', ('diff', 'gate', 'release-notes', 'timeline', 'verify', 'lock')),
@@ -955,6 +978,7 @@ EXAMPLES: dict[str, tuple[tuple[str, str], ...]] = {
         ('konstruct export openlineage -o lineage.json', 'OpenLineage events for a catalogue'),
         ('konstruct export ossie -o model.yml', 'the ontology as an Apache Ossie model'),
         ('konstruct export semantic-view -o semantic_view.sql', 'the ontology as a Snowflake semantic view'),
+        ('konstruct export odcs -o contracts.yml', 'the ontology as ODCS 3.2 data contracts'),
     ),
     'diff': (
         ('konstruct diff', 'this branch against its merge base with main'),
@@ -1031,6 +1055,17 @@ EXAMPLES: dict[str, tuple[tuple[str, str], ...]] = {
     'receipts check': (
         ('konstruct receipts check', 'every receipt; exit 1 when one does not hold'),
         ('konstruct receipts check r-7f3a --json', 'one receipt, as JSON'),
+    ),
+    'contract': (
+        ('konstruct contract check contracts/orders.yml', "test a contract's claims against the graph"),
+    ),
+    'contract check': (
+        ('konstruct contract check contracts/orders.yml', 'exit 1 when a claim is contradicted'),
+        ('konstruct contract check contracts.yml --strict', 'a claim nothing supports fails too'),
+        (
+            'konstruct export odcs -o c.yml && konstruct contract check c.yml',
+            "Konstruct's own, as a round trip",
+        ),
     ),
     'plugins': (
         ('konstruct plugins', 'installed plugins, and whether each runs for this project'),
@@ -1565,7 +1600,7 @@ def parser() -> argparse.ArgumentParser:
     exporting = add(
         'export',
         'the graph as OpenLineage, Mermaid, Graphviz DOT or CSV, or the ontology as Apache Ossie, OWL, '
-        'a Snowflake semantic view or Databricks metric views',
+        'a Snowflake semantic view, Databricks metric views or ODCS data contracts',
     )
     exporting.add_argument(
         'format',
@@ -1955,6 +1990,27 @@ def parser() -> argparse.ArgumentParser:
     checking.add_argument('--no-build', action='store_true', help='fail rather than build a missing graph')
     checking.set_defaults(refresh=False)
     receipting.set_defaults(func=cmd_receipts)
+
+    contracting = add('contract', 'test the claims of an ODCS data contract against the graph')
+    contract_actions = contracting.add_subparsers(
+        dest='action', metavar='<action>', title='actions', parser_class=_Parser, required=True
+    )
+    contract_checking = contract_actions.add_parser(
+        'check',
+        help='test each claim of a contract (exits 1 when one is contradicted)',
+        description='Test each claim of a contract (exits 1 when one is contradicted).',
+        epilog=_examples('contract check'),
+        formatter_class=_Help,
+        parents=[common],
+    )
+    contract_checking.add_argument(
+        'file', metavar='FILE', help='an ODCS contract, one YAML document or several (- reads standard input)'
+    )
+    contract_checking.add_argument(
+        '--strict', action='store_true', help='also exit 1 for a claim nothing in the graph supports'
+    )
+    _query_options(contract_checking)
+    contracting.set_defaults(func=cmd_contract)
 
     mcp = add('mcp', 'run the MCP server on stdio (for agent configuration, not interactive use)')
     mcp.add_argument(
