@@ -255,6 +255,7 @@ const messages: Catalogue = {
     'code.cut': 'फ़ाइल लंबी है, इसलिए केवल उसकी शुरुआत दिखाई गई है।',
     'code.copy': 'कॉपी करें',
     'code.copied': 'कॉपी हो गया',
+    'code.selected': 'चयनित: कीबोर्ड से कॉपी करें',
     'code.copyCommand': '{command} कॉपी करें',
     'markdown.cut': 'विवरण लंबा है, इसलिए केवल उसकी शुरुआत दिखाई गई है।',
 

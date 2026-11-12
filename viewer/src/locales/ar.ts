@@ -260,6 +260,7 @@ const messages: Catalogue = {
     'code.cut': 'الملف طويل، لذا تُعرض بدايته فقط.',
     'code.copy': 'نسخ',
     'code.copied': 'تم النسخ',
+    'code.selected': 'محدَّد: انسخه بلوحة المفاتيح',
     'code.copyCommand': 'نسخ {command}',
     'markdown.cut': 'الوصف طويل، لذا تُعرض بدايته فقط.',
 

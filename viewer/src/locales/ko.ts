@@ -253,6 +253,7 @@ const messages: Catalogue = {
     'code.cut': '파일이 길어 앞부분만 표시합니다.',
     'code.copy': '복사',
     'code.copied': '복사됨',
+    'code.selected': '선택됨: 키보드로 복사하세요',
     'code.copyCommand': '{command} 복사',
     'markdown.cut': '설명이 길어 앞부분만 표시합니다.',
 

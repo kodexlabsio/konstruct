@@ -253,6 +253,7 @@ const messages: Catalogue = {
     'code.cut': 'ファイルが長いため、先頭のみ表示しています。',
     'code.copy': 'コピー',
     'code.copied': 'コピーしました',
+    'code.selected': '選択しました。キーボードでコピーしてください',
     'code.copyCommand': '{command} をコピー',
     'markdown.cut': '説明が長いため、先頭のみ表示しています。',
 
