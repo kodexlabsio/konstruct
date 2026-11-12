@@ -130,6 +130,17 @@ graph.html carries every metric of the world model, defined and proposed, for it
 
 The first frames are medians of five loads in headless Chromium, at 1600 by 1000. `uv run .kodex/scripts/map_benchmark.py --world` measures them on your machine, and `--models` sets the size.
 
+## Data Contracts
+
+On the 2,000-model project of the ontology's table above, `export odcs` writes a contract for each of its 2,000 models, and `contract check` reads those contracts back and tests them against the graph, with the ontology already derived:
+
+| Step | Time |
+|---|---:|
+| `export odcs`, every contract | 1.4 s |
+| `contract check` of those contracts (2,000 contracts, no findings) | 2.0 s |
+
+`uv run .kodex/scripts/benchmark.py 2000` prints both in its table of contracts.
+
 ## Conflicts and the Gate
 
 `konstruct conflicts` compares every two columns that appear to be one idea. What it compares of each column (its formula composed down to source, the keys of the filters and joins on its route, what depends on it downstream and the aggregate it applies last) is worked out once per column, so each pair costs one comparison of two formulas. The gate's own rule reports only conflicts of a column the change alters, so `konstruct gate`, the MCP `gate` tool and the coding agent hook compare only the pairs with such a column, and their cost grows with the change rather than with the number of pairs. When a plugin's gate check runs, the gate finds every conflict, as the check is given them all.

@@ -146,6 +146,12 @@ def world_model(graph: Graph, models: int) -> dict[str, float]:
 
     give_entities(graph)
     ontology_s, ontology = timed(derive, graph)
+    from konstruct.analysis.contract import check_contract
+    from konstruct.outputs import odcs
+
+    export_s, contracts = timed(odcs.export, graph, ontology, 'bench')
+    check_s, checked = timed(check_contract, graph, contracts, ontology)
+    assert not checked.findings, checked.findings[:3]
     last, eleventh = f'm{(models - 1) // 2:03}', f'm{min(10, models - 1):03}'
     metrics_s, found = timed(world.metrics, graph, None, ontology)
     named = f'{last}.c02'
@@ -158,6 +164,9 @@ def world_model(graph: Graph, models: int) -> dict[str, float]:
         'relationships': len(ontology.relationships),
         'metrics': len(found.metrics),
         'ontology_s': round(ontology_s, 2),
+        'odcs_contracts': checked.contracts,
+        'odcs_export_s': round(export_s, 2),
+        'odcs_check_s': round(check_s, 2),
         'metrics_s': round(metrics_s, 2),
         'metric_ms': round(1000 * median_time(world.metrics, graph, named, ontology), 1),
         'entity_ms': round(1000 * median_time(world.entity, graph, last, ontology), 1),
@@ -646,6 +655,12 @@ def markdown(rows: list[dict[str, Any]]) -> str:
             f'| {r["world_metric_ms"]} ms '
             f'| {r["world_entity_ms"]} ms | {r["world_relate_ms"]} ms ({r["world_relate_hops"]} relationships) '
             f'| {r["world_compile_ms"]} ms ({r["world_compile_hops"]} relationships) |'
+        )
+    lines += ['', '| Models | Contracts | `export odcs` | `contract check` |', '|---:|---:|---:|---:|']
+    for r in rows:
+        lines.append(
+            f'| {r["models"]:,} | {r["world_odcs_contracts"]:,} | {r["world_odcs_export_s"]} s '
+            f'| {r["world_odcs_check_s"]} s |'
         )
     fresh = next((r for r in rows if 'meaning_cpu_ms' in r), None)
     if fresh:
