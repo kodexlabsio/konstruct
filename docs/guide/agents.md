@@ -80,6 +80,8 @@ The hook works from the project root, the directory Claude Code names in `CLAUDE
 
 The server exposes `impact`, `trace`, `search`, `describe`, `conflicts`, `define`, `ontology`, `explain`, `history`, `path`, `query`, `diff`, `gate`, `check_sql`, `check_history`, `mutation_test` and `why`, returns the same structured results as `--json`, and rereads `graph.json` when a build changes it. Its `receipt` tool records what an answer rests on, so that `konstruct receipts check` can say later whether it still holds (see [Answer Receipts](receipts.md)). Its prompts are the workflows of the skills, and its resources are `REPORT.md`, the ontology and a summary of the graph (see [MCP Server](../reference/mcp.md)).
 
+In hosts that support the MCP Apps extension, `impact`, `explain` and `gate` also draw their results in the conversation: the steps downstream of a change with the transform at each, a formula with the joins and filters on its rows and the sentence in plain English, and the gate's findings with the file and fix for each. The agent still reads the same text result, and a host without the extension shows only that (see [Views](../reference/mcp.md#views)).
+
 ## Checking the SQL an Agent Writes
 
 `konstruct check-sql` reads a query an agent (or an analyst) wrote, without running it, and says where it disagrees with the project, before the query runs or its answer is given. The `check_sql` MCP tool runs the same check.
