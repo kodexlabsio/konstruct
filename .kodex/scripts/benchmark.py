@@ -54,8 +54,13 @@ many models (20 columns each, as the scale test builds them) with the core's rea
 PATH`` adds a module to time as well: ``konstruct/core/yamlio.py`` as an earlier commit has it
 (``git show d08c73d:konstruct/core/yamlio.py``), which read through PyYAML's pure Python loader.
 
+With ``--oracles`` the dbt manifest reader and the Jinja renderer are the Python ones the Rust core
+replaced (``tests/dbt_oracle.py`` and ``tests/jinja_oracle.py``), so that the same command measures
+a build before and after that change.
+
 Usage:
     uv run .kodex/scripts/benchmark.py                  # 100, 500, 1000 and 2000 models
+    uv run .kodex/scripts/benchmark.py 2000 --oracles   # the same with the Python reader and Jinja2
     uv run .kodex/scripts/benchmark.py 300 3000 --json results.json
     uv run .kodex/scripts/benchmark.py --tables 100 400  # conflicts and the gate alone
     uv run .kodex/scripts/benchmark.py --yaml 2000       # the schema files of 2,000 models
@@ -758,7 +763,18 @@ def main() -> int:
     )
     parser.add_argument('--old-yamlio', type=Path, help='a yamlio.py to time beside the core with --yaml')
     parser.add_argument('--json', type=Path, help='also write the results as JSON')
+    parser.add_argument(
+        '--oracles',
+        action='store_true',
+        help='read manifests and render Jinja with the Python code the Rust core replaced',
+    )
     args = parser.parse_args()
+    if args.oracles:
+        from tests import dbt_oracle
+
+        dbt_oracle.Renderer = jinja_oracle.Renderer
+        dbt.load = dbt_oracle.load
+        globals()['Renderer'] = jinja_oracle.Renderer
     # Without sizes, every size is measured, unless --tables or --yaml ask for theirs alone.
     sizes = args.sizes or ([] if args.tables or args.yaml else [100, 500, 1000, 2000])
     SIZES.extend(sizes)

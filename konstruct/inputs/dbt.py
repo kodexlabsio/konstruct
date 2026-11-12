@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -12,17 +11,15 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import yaml
 
-from konstruct._core import Tree
+from konstruct._core import Tree, read_artefact, relation_name
 from konstruct._core import file_identity as identity
 from konstruct.core import jsonio, yamlio
-from konstruct.core.graph import Graph, Node, NodeKind, column_id, relation_key
-
-if TYPE_CHECKING:
-    from konstruct.inputs.jinja import Renderer
+from konstruct.core.graph import Graph, Node, NodeKind
+from konstruct.inputs.jinja import known_packages, project_vars
 
 log = logging.getLogger(__name__)
 
@@ -401,115 +398,15 @@ def dbt_error(output: str, limit: int = 400) -> str:
     return text if len(text) <= limit else text[: limit - 3] + '...'
 
 
-def _read_json(path: Path) -> dict[str, Any] | None:
-    try:
-        data = json.loads(path.read_text(encoding='utf-8'))
-    except (OSError, ValueError, RecursionError):  # a committed artefact may be nested too deeply
-        return None
-    return data if isinstance(data, dict) else None
-
-
 def parse_relation_name(name: str | None, dialect: str | None) -> str | None:
-    if not name:
-        return None
-    from sqlglot import exp
-    from sqlglot.errors import SqlglotError
-
-    try:
-        table = exp.to_table(name, dialect=dialect)
-    except (SqlglotError, ValueError):
-        return relation_key(*name.replace('"', '').replace('`', '').split('.'))
-    return relation_key(table.catalog, table.db, table.name)
-
-
-def _relation_for(node: dict[str, Any], dialect: str | None) -> str | None:
-    parsed = parse_relation_name(node.get('relation_name'), dialect)
-    if parsed:
-        return parsed
-    name = node.get('alias') or node.get('identifier') or node.get('name')
-    if not name:
-        return None
-    return relation_key(node.get('database'), node.get('schema'), name)
-
-
-def _incremental(config: dict[str, Any]) -> dict[str, Any]:
-    """An incremental model's key and strategy, which decide what a run keeps of earlier rows."""
-    if config.get('materialized') != 'incremental':
-        return {}
-    found: dict[str, Any] = {k: config[k] for k in ('unique_key', 'incremental_strategy') if config.get(k)}
-    key = found.get('unique_key')
-    if isinstance(key, list):
-        found['unique_key'] = [str(k) for k in key]
-    return found
+    """The key of a relation name as a manifest writes it, in the SQL dialect of its adapter."""
+    return relation_name(name, dialect) if name else None
 
 
 def _description(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
-
-
-def _catalog_columns(
-    catalog: dict[str, Any] | None, unique_id: str
-) -> list[tuple[str, str | None, str | None]]:
-    if not catalog:
-        return []
-    entry = catalog.get('nodes', {}).get(unique_id) or catalog.get('sources', {}).get(unique_id)
-    if not entry:
-        return []
-    columns = sorted(entry.get('columns', {}).values(), key=lambda c: c.get('index') or 0)
-    return [(c['name'], c.get('type'), _description(c.get('comment'))) for c in columns if c.get('name')]
-
-
-def _primary_key(item: dict[str, Any]) -> list[str]:
-    """The columns of a model's ``primary_key`` constraint, declared on the model or on its columns."""
-    for constraint in item.get('constraints') or []:
-        if isinstance(constraint, dict) and constraint.get('type') == 'primary_key':
-            return [str(c) for c in constraint.get('columns') or []]
-    return [
-        str(column.get('name', name))
-        for name, column in (item.get('columns') or {}).items()
-        if isinstance(column, dict)
-        and any(
-            isinstance(c, dict) and c.get('type') == 'primary_key' for c in column.get('constraints') or []
-        )
-    ]
-
-
-def _add_columns(graph: Graph, parent: Node, item: dict[str, Any], catalog: dict[str, Any] | None) -> bool:
-    """Add a node's columns; whether the catalog lists them, rather than only its documentation."""
-    primary_key = _primary_key(item)
-    if primary_key:
-        parent.attrs['primary_key'] = primary_key
-        # A dbt constraint reaches the warehouse only under an enforced contract.
-        if ((item.get('config') or {}).get('contract') or {}).get('enforced'):
-            parent.attrs['primary_key_enforced'] = True
-    documented = {
-        name.lower(): col for name, col in (item.get('columns') or {}).items() if isinstance(col, dict)
-    }
-    seen: set[str] = set()
-    for name, dtype, comment in _catalog_columns(catalog, item['unique_id']):
-        doc = documented.get(name.lower(), {})
-        graph.add_column(
-            parent,
-            name,
-            data_type=dtype or doc.get('data_type'),
-            description=_description(doc.get('description')) or comment,
-            origin='dbt',
-        )
-        seen.add(name.lower())
-    for name, doc in documented.items():
-        if name in seen:
-            continue
-        graph.add_column(
-            parent,
-            doc.get('name', name),
-            data_type=doc.get('data_type'),
-            description=_description(doc.get('description')),
-            origin='dbt',
-            attrs={'documented_only': True} if catalog else {},
-        )
-    return bool(seen)
 
 
 _REF = re.compile(
@@ -520,7 +417,6 @@ _SOURCE = re.compile(r"\{\{\s*source\(\s*['\"]([^'\"]+)['\"]\s*,\s*['\"]([^'\"]+
 
 def render_refs(raw: str, manifest: dict[str, Any]) -> str:
     """Best-effort rendering of uncompiled dbt SQL: resolve ref() and source(), drop other Jinja."""
-    from konstruct.core.sql import strip_templating
 
     by_name: dict[str, str] = {}
     by_package: dict[tuple[str, str], str] = {}
@@ -533,6 +429,16 @@ def render_refs(raw: str, manifest: dict[str, Any]) -> str:
         for s in manifest.get('sources', {}).values()
         if s.get('relation_name')
     }
+    return _render_refs_in(raw, by_name, by_package, sources)
+
+
+def _render_refs_in(
+    raw: str,
+    by_name: dict[str, str],
+    by_package: dict[tuple[str, str], str],
+    sources: dict[tuple[str, str], str],
+) -> str:
+    from konstruct.core.sql import strip_templating
 
     def ref(match: re.Match[str]) -> str:
         first, second = match.group(1), match.group(2)
@@ -555,156 +461,52 @@ def load(
 ) -> DbtLoad | None:
     """Add a dbt project's nodes, columns, tests and exposures to ``graph``. ``keep`` chooses
     which macro files may be read to render uncompiled models (by default, all)."""
-    # The SQL parser and Jinja, which finding a project and reading its configuration do not need.
+    # The SQL parser, which finding a project and reading its configuration do not need.
     from konstruct.core.sql import dialect_for
-    from konstruct.inputs.jinja import Renderer, render_model
 
-    manifest = _read_json(project.manifest_path)
+    manifest = read_artefact(project.manifest_path)
     if manifest is None:
         graph.warn(f'dbt: {project.name}: no readable manifest at {project.manifest_path}')
         return None
-    catalog = _read_json(project.catalog_path)
-    metadata = manifest.get('metadata', {})
-    dialect = dialect or dialect_for(metadata.get('adapter_type'))
+    catalog = read_artefact(project.catalog_path)
+    dialect = dialect or dialect_for(manifest.adapter_type())
     root = project.root
+    graph_root = Path(str(graph.meta.get('root', root)))
     # The project's {% docs __overview__ %} block, which dbt's documentation site opens on.
-    overview = manifest.get('docs', {}).get(f'doc.{project.name}.__overview__', {}).get('block_contents')
-    if isinstance(overview, str) and overview.strip():
-        graph.meta.setdefault('overviews', {})[project.name] = overview.strip()
+    overview = manifest.overview(project.name)
+    if overview:
+        graph.meta.setdefault('overviews', {})[project.name] = overview
+    macro_paths = [p for p in project.source_paths if 'macro' in p.name]
+    variables = project_vars(root, manifest.project_name(), known_packages(root, manifest.macro_packages()))
+    found = manifest.load(
+        graph, catalog, project.name, root, graph_root, dialect, macro_paths or None, keep, variables
+    )
+    models = [ModelSql(*row) for row in found['models']]
+    if found['unrendered']:
+        by_name, by_package, sources = found['tables']
+        for at, raw in found['unrendered'].items():
+            models[at].sql = _render_refs_in(raw, by_name, by_package, sources)
 
     def rel_path(item: dict[str, Any]) -> str | None:
         path = item.get('original_file_path')
         if not path:
             return None
-        return os.path.relpath(root / str(path), str(graph.meta.get('root', root)))
+        return os.path.relpath(root / str(path), str(graph_root))
 
-    models: list[ModelSql] = []
-    catalogued: set[str] = set()
-    schemas: dict[tuple[str | None, str | None], int] = {}
-    renderer: Renderer | None = None
-    for item in manifest.get('nodes', {}).values():
-        kind = RELATION_TYPES.get(item.get('resource_type', ''))
-        if kind is None:
-            continue
-        relation = _relation_for(item, dialect)
-        config = item.get('config') or {}
-        node = graph.add_node(
-            Node(
-                id=item['unique_id'],
-                kind=kind,
-                name=item.get('alias') or item['name'],
-                relation=relation,
-                description=_description(item.get('description')),
-                path=rel_path(item),
-                origins=['dbt'],
-                attrs={
-                    'package': item.get('package_name'),
-                    'fqn': item.get('fqn', []),
-                    'materialized': config.get('materialized'),
-                    'tags': item.get('tags', []),
-                    'dbt_name': item['name'],
-                    'checksum': (item.get('checksum') or {}).get('checksum'),
-                    **_incremental(config),
-                },
-            )
-        )
-        if _add_columns(graph, node, item, catalog):
-            catalogued.add(node.id)
-        upstream = [n for n in item.get('depends_on', {}).get('nodes', []) if not n.startswith('macro.')]
-        for parent in upstream:
-            graph.add_edge(parent, node.id, 'feeds', origin='dbt')
-        key = (item.get('database'), item.get('schema'))
-        schemas[key] = schemas.get(key, 0) + 1
-        if kind == 'seed' or not relation:
-            continue
-        compiled = item.get('compiled_code')
-        raw = item.get('raw_code')
-        if compiled:
-            models.append(ModelSql(node.id, relation, compiled, True, upstream))
-        elif raw and item.get('language', 'sql') == 'sql':
-            if renderer is None:
-                macro_paths = [p for p in project.source_paths if 'macro' in p.name]
-                renderer = Renderer(project.root, manifest, macro_paths=macro_paths or None, keep=keep)
-            sql = render_model(raw, renderer, lambda text: render_refs(text, manifest))
-            models.append(ModelSql(node.id, relation, sql, False, upstream))
-
-    for item in manifest.get('sources', {}).values():
-        node = graph.add_node(
-            Node(
-                id=item['unique_id'],
-                kind='source',
-                name=item.get('identifier') or item['name'],
-                relation=_relation_for(item, dialect),
-                description=_description(item.get('description'))
-                or _description(item.get('source_description')),
-                path=rel_path(item),
-                origins=['dbt'],
-                attrs={
-                    'source_name': item.get('source_name'),
-                    'package': item.get('package_name'),
-                    # What the project says lands the table (`loader:` in sources.yml).
-                    **({'declared_loader': item['loader']} if item.get('loader') else {}),
-                },
-            )
-        )
-        if _add_columns(graph, node, item, catalog):
-            catalogued.add(node.id)
-
-    for item in manifest.get('exposures', {}).values():
-        owner = item.get('owner') or {}
-        node = graph.add_node(
-            Node(
-                id=item['unique_id'],
-                kind='exposure',
-                name=item['name'],
-                description=_description(item.get('description')),
-                path=rel_path(item),
-                origins=['dbt'],
-                attrs={
-                    k: v
-                    for k, v in {
-                        'type': item.get('type'),
-                        'label': item.get('label'),
-                        'maturity': item.get('maturity'),
-                        'owner': owner.get('name'),
-                        'url': item.get('url'),
-                    }.items()
-                    if v
-                },
-            )
-        )
-        for parent in item.get('depends_on', {}).get('nodes', []):
-            graph.add_edge(parent, node.id, 'feeds', origin='dbt')
-
-    for item in manifest.get('nodes', {}).values():
-        if item.get('resource_type') == 'test':
-            _add_test(graph, item, rel_path(item))
-
-    semantic = semantic_metrics(manifest, rel_path)
+    sections = {k: v for k in ('semantic_models', 'metrics') if (v := manifest.section(k)) is not None}
+    semantic = semantic_metrics(sections, rel_path)
     if semantic:
         graph.meta.setdefault('dbt_metrics', []).extend(semantic)
-
-    default_catalog, default_schema = max(schemas, key=lambda k: schemas[k]) if schemas else (None, None)
     return DbtLoad(
         project=project,
         dialect=dialect,
         models=models,
-        default_catalog=default_catalog,
-        default_schema=default_schema,
-        manifest_checksum=metadata.get('invocation_id'),
+        default_catalog=found['default_catalog'],
+        default_schema=found['default_schema'],
+        manifest_checksum=found['manifest_checksum'],
         has_catalog=catalog is not None,
-        catalogued=catalogued,
-        counts={
-            kind: sum(1 for item in group.values() if item.get('resource_type') == kind)
-            for kind, group in (
-                ('model', manifest.get('nodes', {})),
-                ('seed', manifest.get('nodes', {})),
-                ('snapshot', manifest.get('nodes', {})),
-                ('test', manifest.get('nodes', {})),
-                ('source', manifest.get('sources', {})),
-                ('exposure', manifest.get('exposures', {})),
-            )
-        },
+        catalogued=found['catalogued'],
+        counts=found['counts'],
     )
 
 
@@ -760,56 +562,6 @@ def _where_filters(value: Any) -> list[str]:
         for w in wheres or []
         if isinstance(w, dict) and w.get('where_sql_template')
     ]
-
-
-def _threshold(value: Any) -> str | None:
-    """A test's ``error_if`` when it is not dbt's default (``!= 0``), which fails on any row."""
-    text = str(value).strip() if value is not None else ''
-    return text if text and text.replace(' ', '') not in ('!=0', '>0', '>=1') else None
-
-
-def _add_test(graph: Graph, item: dict[str, Any], path: str | None) -> None:
-    meta = item.get('test_metadata') or {}
-    config = item.get('config') or {}
-    node = graph.add_node(
-        Node(
-            id=item['unique_id'],
-            kind='test',
-            name=item['name'],
-            description=_description(item.get('description')),
-            path=path,
-            origins=['dbt'],
-            attrs={
-                k: v
-                for k, v in {
-                    'test': meta.get('name') or 'singular',
-                    'severity': config.get('severity'),
-                    # A threshold other than dbt's own lets some rows fail the test.
-                    'error_if': _threshold(config.get('error_if')),
-                    'column': item.get('column_name'),
-                    'where': config.get('where'),
-                    'columns': (meta.get('kwargs') or {}).get('combination_of_columns'),
-                }.items()
-                if v
-            },
-        )
-    )
-    targets = item.get('depends_on', {}).get('nodes', [])
-    attached = item.get('attached_node') or (targets[0] if len(targets) == 1 else None)
-    column = item.get('column_name')
-    if attached and column and graph.column(attached, column):
-        graph.add_edge(node.id, column_id(attached, column), 'tests')
-    elif attached:
-        graph.add_edge(node.id, attached, 'tests')
-    kwargs = meta.get('kwargs') or {}
-    for target in targets:
-        if target == attached:
-            continue
-        field_name = kwargs.get('field')
-        if meta.get('name') == 'relationships' and field_name and graph.column(target, field_name):
-            graph.add_edge(node.id, column_id(target, field_name), 'tests', role='relationship target')
-        else:
-            graph.add_edge(node.id, target, 'tests')
 
 
 # dbt node selection, as used by `dbt run --select` in orchestration code

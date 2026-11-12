@@ -442,7 +442,7 @@ impl Graph {
     }
 
     /// `add_node`: adds `node`, or merges it into the node with its id.
-    fn merge_node(&self, py: Python<'_>, node: &Bound<'_, Node>) -> PyResult<Py<Node>> {
+    pub(crate) fn merge_node(&self, py: Python<'_>, node: &Bound<'_, Node>) -> PyResult<Py<Node>> {
         // A kind that cannot be hashed is refused, as testing it against the set of relation
         // kinds refuses it.
         node.borrow().kind.bind(py).hash()?;
@@ -752,7 +752,7 @@ impl Graph {
         }
     }
 
-    fn column_node(
+    pub(crate) fn column_node(
         &self,
         py: Python<'_>,
         parent: &Bound<'_, PyAny>,
@@ -871,7 +871,7 @@ impl Graph {
 
     #[pyo3(signature = (parent, name, *, data_type=None, description=None, origin=None, attrs=None))]
     #[allow(clippy::too_many_arguments)]
-    fn add_column(
+    pub(crate) fn add_column(
         slf: &Bound<'_, Self>,
         parent: &Bound<'_, Node>,
         name: &Bound<'_, PyString>,
@@ -933,7 +933,7 @@ impl Graph {
     /// Add an edge, or merge `attrs` into an existing one of the same kind between the same
     /// nodes. Self-loops are ignored and return None.
     #[pyo3(signature = (source, target, kind, **attrs))]
-    fn add_edge(
+    pub(crate) fn add_edge(
         &self,
         py: Python<'_>,
         source: &Bound<'_, PyString>,
@@ -1648,7 +1648,7 @@ impl Graph {
 
 impl Graph {
     /// Whether `slf` is a `Graph` itself, not an instance of a subclass.
-    fn is_exact(slf: &Bound<'_, Self>) -> bool {
+    pub(crate) fn is_exact(slf: &Bound<'_, Self>) -> bool {
         slf.get_type().is(slf.py().get_type::<Self>())
     }
 

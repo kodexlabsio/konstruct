@@ -499,6 +499,46 @@ def scan_python_files(paths: Sequence[str | PathLike[str]]) -> list[tuple[bool, 
     files read in parallel. A file that cannot be read is neither."""
 
 @final
+class Artefact:
+    """A dbt manifest or catalog, read as JSON and not made into Python objects."""
+
+    def adapter_type(self) -> str | None:
+        """The adapter the manifest was made for."""
+    def project_name(self) -> str | None:
+        """The project's name in the manifest's metadata."""
+    def macro_packages(self) -> list[str]:
+        """The packages the manifest's macros come from, one per macro."""
+    def overview(self, project: str) -> str | None:
+        """The project's overview text, stripped, when it has one."""
+    def section(self, name: str) -> Any:
+        """The top-level value ``name`` as Python objects, or None when there is none."""
+    def load(
+        self,
+        graph: Graph,
+        catalog: Artefact | None,
+        project_name: str,
+        root: StrPath,
+        graph_root: StrPath,
+        dialect: str | None,
+        macro_paths: Sequence[StrPath] | None,
+        keep: Callable[[list[Path]], Iterable[Path]] | None,
+        variables: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Adds the manifest's models, seeds, snapshots, sources, exposures and tests to ``graph``
+        and returns what the build needs of them: ``models`` (node id, relation, SQL or None for a
+        template that did not render, whether dbt compiled it, upstream ids), ``unrendered`` (the
+        raw text of those, by position) and ``tables`` for a plain reading of them, ``catalogued``,
+        ``counts``, ``default_catalog``, ``default_schema`` and ``manifest_checksum``."""
+
+def read_artefact(path: StrPath) -> Artefact | None:
+    """The manifest or catalog at ``path``; None when it cannot be read, is not JSON or is not an
+    object."""
+
+def relation_name(name: str, dialect: str | None = None) -> str | None:
+    """The key of a relation name as a manifest writes it (``"db"."main"."orders"``), in the SQL
+    dialect of its adapter: its catalog, schema and name unquoted and in lower case."""
+
+@final
 class Renderer:
     """Renders models of one dbt project, with its macros and its installed packages' macros, in a
     sandbox that reads no file but the macros', runs no query and reaches no environment."""
