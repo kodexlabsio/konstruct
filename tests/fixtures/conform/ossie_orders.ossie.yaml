@@ -1,0 +1,12 @@
+version: "0.2.0.dev0"
+name: lines
+datasets:
+  - name: line_items
+    source: SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.LINEITEM
+    primary_key: [l_orderkey, l_linenumber]
+    fields:
+      - {name: l_extendedprice, expression: {sql: l_extendedprice}}
+      - {name: l_quantity, expression: {sql: l_quantity}}
+metrics:
+  - name: line_value
+    expression: {sql: "SUM(line_items.l_extendedprice * line_items.l_quantity)"}
