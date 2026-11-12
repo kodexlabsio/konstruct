@@ -731,3 +731,21 @@ def test_formulas_with_presences_of_many_terms_stay_cheap() -> None:
     assert lineage < 10, f'7,000 columns over a presence of 243 terms took {lineage:.1f}s of CPU'
     assert fresh < 1, f'a lineage of 4,000 models adding two CASEs each took {fresh:.1f}s of CPU'
     assert flat < 5, f'a sum of 5 CASEs and 2,000 columns took {flat:.1f}s of CPU'
+
+
+def test_odcs_export_and_check_at_scale(tmp_path: Path) -> None:
+    """A contract for every model of the generated project, and the stream checked back against the
+    graph with no finding (as .kodex/scripts/benchmark.py measures them)."""
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / '.kodex' / 'scripts' / 'benchmark.py'
+    spec = importlib.util.spec_from_file_location('benchmark', script)
+    assert spec is not None and spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+    make_project(tmp_path)
+    graph = Project(tmp_path).build(run_dbt=False, warehouses=False).graph
+    found = benchmark.world_model(graph, MODELS)
+    assert found['odcs_contracts'] == MODELS
+    assert found['odcs_export_s'] < 10 and found['odcs_check_s'] < 10, found
+    print(f'\n{MODELS} models: export {found["odcs_export_s"]}s, check {found["odcs_check_s"]}s')
