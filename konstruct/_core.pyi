@@ -117,6 +117,29 @@ class FormulaSet:
         """Whether two definitions are shown to be the same, a bound on the error, whether they
         are without NULLs, and why they are not."""
 
+def conform_statements(text: str) -> list[tuple[str, str, str]]:
+    """The statements of SQL text that define a platform's semantic layer: the kind
+    (``snowflake-view`` or ``databricks-metric-view``), the view's name, and its text (for a metric
+    view, its YAML)."""
+
+def conform_read_ddl(text: str) -> str:
+    """A ``CREATE SEMANTIC VIEW`` statement as a document, in JSON; raises ValueError."""
+
+def conform_read_yaml(kind: str, document: str, name: str) -> str:
+    """A semantic model's YAML (``snowflake-yaml``) or metric view's (``databricks-yaml``), given as
+    JSON, as a document in JSON; raises ValueError."""
+
+def conform_norm(name: str) -> str:
+    """A name as concepts are matched by it: lower case, without separators."""
+
+def conform_judge(
+    request: str, formulas: FormulaSet, held: Callable[[list[str]], list[tuple[str, str]]]
+) -> str:
+    """The findings, in JSON, for the claims and facts of ``request`` (JSON), comparing the
+    definitions of ``formulas`` they name. ``held`` is given column ids and returns the
+    ``(key, text)`` of each condition that holds on the rows of all of them; it is called only for
+    a metric a term requires a filter of, or another layer has a metric of the same name for."""
+
 @final
 class VectorIndex:
     """Search by meaning over a graph's nodes (``konstruct.analysis.semantic``). Nodes are given
