@@ -676,6 +676,23 @@ mod tests {
     }
 
     #[test]
+    fn items_and_members_of_a_scalar_are_empty() {
+        let text = br#"[null, true, false, 1.5, "text", {}, []]"#;
+        let tape = Tape::parse(text).unwrap();
+        let doc = tape.doc(text);
+        let all: Vec<usize> = doc.items(0).collect();
+        assert_eq!(all.len(), 7);
+        for value in &all[..5] {
+            assert_eq!(doc.items(*value).count(), 0);
+            assert_eq!(doc.members(*value).count(), 0);
+        }
+        // An array has no members and an object no items, however empty.
+        assert_eq!(doc.members(all[6]).count(), 0);
+        assert_eq!(doc.items(all[5]).count(), 0);
+        assert_eq!(doc.members(0).count(), 0);
+    }
+
+    #[test]
     fn python_reads_nan_infinity_and_numbers_beyond_a_float() {
         let text = br#"[NaN, Infinity, -Infinity, 1e999, -1e999, 2]"#;
         assert!(Tape::parse(text).is_err());
