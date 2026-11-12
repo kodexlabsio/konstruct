@@ -517,6 +517,35 @@ def test_konstruct_own_exports_read_back_conforming(jaffle_built_graph: Path, tm
     assert result.summary['pairs'] == 0
 
 
+def test_an_untrusted_project_refuses_the_warehouse_through_every_interface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import anyio
+    from mcp import Client
+
+    from konstruct.interfaces.cli import main
+    from konstruct.interfaces.mcp_server import build_server
+    from tests.test_checksql import make_shop
+
+    make_shop(tmp_path)
+    (tmp_path / 'konstruct.toml').write_text('[[warehouse]]\ntype = "snowflake"\naccount = "x"\n')
+    monkeypatch.delenv('KONSTRUCT_TRUST_CONFIG', raising=False)
+    log: list[str] = []
+    _driver(monkeypatch, 'snowflake.connector', log, {})
+    with pytest.raises(QueryError, match=r'cannot read the warehouse: .* is not trusted'):
+        Project(tmp_path).conform(warehouse=True)
+    code = main(['--no-color', '-C', str(tmp_path), 'conform', '--warehouse'])
+    assert code == 1 and 'is not trusted' in capsys.readouterr().err
+
+    async def call() -> Any:
+        async with Client(build_server(tmp_path)) as client:
+            return await client.call_tool('conform', {'warehouse': True})
+
+    refused = anyio.run(call)
+    assert refused.is_error and 'is not trusted' in str(refused.content)
+    assert log == []  # nothing connected
+
+
 def test_a_date_in_a_layer_is_read_as_text_not_a_crash() -> None:
     text = 'name: m\ntables:\n  - name: o\n    base_table: {table: ORDERS}\n    facts:\n      - {name: f, expr: a, as_of: 2024-01-31}\n'
     found, problems = read_layers(text, 'd.yaml')
@@ -557,6 +586,48 @@ def test_names_from_show_are_quoted_and_a_quote_in_one_is_skipped(monkeypatch: p
     )
     found = warehouse.read_semantic_layers(warehouse.SnowflakeConnector(options={}))
     assert found == [('snowflake-yaml', 'my view', 'name: x')]
+
+
+def test_the_mcp_tool_skips_a_link_that_leaves_the_project_and_says_so(tmp_path: Path) -> None:
+    import anyio
+    from mcp import Client
+
+    from konstruct.interfaces.mcp_server import build_server
+    from tests.test_checksql import make_shop
+
+    make_shop(tmp_path)
+    outside = tmp_path.parent / f'{tmp_path.name}-outside.sql'
+    outside.write_text('CREATE SEMANTIC VIEW v TABLES (t AS a.b);')
+    folder = tmp_path / 'views'
+    folder.mkdir()
+    (folder / 'link.sql').symlink_to(outside)
+    (folder / 'own.sql').write_text(
+        'CREATE SEMANTIC VIEW own TABLES (o AS shop.raw.orders) METRICS (o.n AS COUNT(o.order_id));'
+    )
+
+    async def call(paths: list[str]) -> Any:
+        async with Client(build_server(tmp_path)) as client:
+            return await client.call_tool('conform', {'paths': paths})
+
+    for paths in (['views'], ['.']):
+        answer = anyio.run(call, paths)
+        assert not answer.is_error, answer.content
+        data = answer.structured_content
+        assert 'views/link.sql: a link to a file outside the project, not read' in data['problems']
+        assert 'own' in [d['name'] for d in data['documents']]
+        assert str(outside) not in str(answer.content)
+    # A file named outright that leads out is still refused.
+    refused = anyio.run(call, ['views/link.sql'])
+    assert refused.is_error and 'outside the project' in str(refused.content)
+
+
+def test_nothing_read_is_not_a_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from konstruct.interfaces.cli import main
+    from tests.test_checksql import make_shop
+
+    make_shop(tmp_path)
+    (tmp_path / 'junk.yaml').write_text('just: text\n')
+    assert main(['--no-color', '-C', str(tmp_path), 'conform', str(tmp_path / 'junk.yaml')]) == 1
 
 
 def test_a_formula_the_set_does_not_hold_is_an_error_not_a_panic() -> None:

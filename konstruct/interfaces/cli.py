@@ -246,6 +246,23 @@ def cmd_conflicts(args: argparse.Namespace, console: Console) -> int:
     return 1 if args.fail_on_conflict and result.conflicts else 0
 
 
+def cmd_conform(args: argparse.Namespace, console: Console) -> int:
+    if not args.paths and not args.warehouse:
+        console.error('give a file or folder of semantic layers, or --warehouse')
+        return 2
+    if args.view and not args.warehouse:
+        console.error('--view names a view in the warehouse: add --warehouse')
+        return 2
+    project = _ready(_project(args), args, console)
+    with console.progress('Checking the semantic layers'):
+        result = project.conform(
+            args.paths, warehouse=args.warehouse, views=args.view, write=not args.warehouse
+        )
+    _emit(console, result, args.json)
+    # Nothing read at all (every file failed) is not a pass.
+    return 1 if result.failing or not result.documents else 0
+
+
 def cmd_define(args: argparse.Namespace, console: Console) -> int:
     project = _ready(_project(args), args, console)
     result = project.define(' '.join(args.ref))
@@ -839,6 +856,7 @@ GROUPS = (
             'compile-metric',
             'conflicts',
             'check-sql',
+            'conform',
             'contract',
         ),
     ),
@@ -902,6 +920,14 @@ EXAMPLES: dict[str, tuple[tuple[str, str], ...]] = {
         ('konstruct conflicts', 'columns that compute one idea in different ways'),
         ('konstruct conflicts --format markdown --no-write', 'as markdown, writing nothing'),
         ('konstruct conflicts --fail-on-conflict', 'exit 1 on a conflict, for CI'),
+    ),
+    'conform': (
+        ('konstruct conform semantic_views/', 'check the layers in a folder against what the code computes'),
+        (
+            'konstruct conform --warehouse',
+            'also read the semantic views and metric views the warehouse serves',
+        ),
+        ('konstruct conform sales.sql --json', 'as JSON, exit 1 when a layer differs from the code'),
     ),
     'check-sql': (
         ('konstruct check-sql query.sql', 'check a query against the definitions before it runs'),
@@ -1411,6 +1437,21 @@ def parser() -> argparse.ArgumentParser:
     )
     _query_options(conflicting)
     conflicting.set_defaults(func=cmd_conflicts)
+
+    conforming = add('conform', 'check semantic views, metric views and Ossie models against the code')
+    conforming.add_argument(
+        'paths', nargs='*', metavar='PATH', help='files, or folders of .sql, .yaml and .yml files'
+    )
+    conforming.add_argument(
+        '--warehouse',
+        action='store_true',
+        help="also read the layers the project's Snowflake and Databricks connections serve (needs konstruct trust)",
+    )
+    conforming.add_argument(
+        '--view', action='append', default=[], metavar='NAME', help='read only this view from the warehouse'
+    )
+    _query_options(conforming)
+    conforming.set_defaults(func=cmd_conform)
 
     checking = add(
         'check-sql', "check SQL against the project's definitions, keys and relationships, without running it"

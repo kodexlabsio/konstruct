@@ -133,6 +133,7 @@ PUBLIC_RESULTS = {
     'analysis/release_notes.py': ['Approval', 'Affected', 'Change', 'ReleaseNotes'],
     'analysis/effect.py': ['ColumnEffect', 'Effect'],
     'analysis/conflicts.py': ['Difference', 'Side', 'Conflict', 'Conflicts'],
+    'interfaces/project.py': ['Conformance'],
     'analysis/checksql.py': ['Finding', 'SqlCheck', 'ShadowMetric', 'Adoption', 'HistoryCheck'],
     'semantics/ontology.py': ['Entity', 'MeasureColumn', 'Measure', 'Relationship', 'Rule', 'Ontology'],
     'semantics/world.py': ['Property', 'Metric', 'Metrics', 'EntityDetail', 'Hop', 'Connection'],

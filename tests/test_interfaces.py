@@ -57,6 +57,7 @@ from konstruct.interfaces.mcp_server import build_server
 
 ROOT = Path(__file__).resolve().parents[1]
 SNAPSHOTS = ROOT / 'tests' / 'golden' / 'interfaces'
+CONFORM_FIXTURES = ROOT / 'tests' / 'fixtures' / 'conform'
 UPDATE = bool(os.environ.get('KONSTRUCT_UPDATE_GOLDEN'))
 
 
@@ -644,6 +645,10 @@ def test_exit_statuses(
 ) -> None:
     nothing = tmp_path / 'nothing'
     nothing.mkdir()
+    broken_layer = tmp_path / 'broken.sql'
+    broken_layer.write_text(
+        'CREATE SEMANTIC VIEW v TABLES (o AS jaffle_shop.main.orders) METRICS (o.x AS SUM(o.nope));'
+    )
     newer = tmp_path / 'newer'
     (newer / 'konstruct-out').mkdir(parents=True)
     graph = json.loads((small / 'konstruct-out' / 'graph.json').read_text())
@@ -739,6 +744,11 @@ def test_exit_statuses(
         'check-sql --history --strict with a shadow metric of an approved term': recorded(
             'check-sql', '--history', '--strict'
         ),
+        'conform with warnings only': status(
+            '-C', str(jaffle_built_graph), 'conform', str(CONFORM_FIXTURES / 'dbt_semantic_view_jaffle.sql')
+        ),
+        'conform with an error': status('-C', str(jaffle_built_graph), 'conform', str(broken_layer)),
+        'conform with nothing to read': status('-C', str(jaffle_built_graph), 'conform'),
         **_receipt_statuses(tmp_path, status),
         **_law_statuses(tmp_path, status),
         **_lock_statuses(tmp_path, status),
@@ -1182,6 +1192,23 @@ def test_json_documents(
     add('gate', '-C', str(small), 'gate', '--base', 'HEAD', '--format', 'json')
     for name in CHECKED_QUERIES:
         add('check-sql', '-C', str(checked), 'check-sql', str(checked / f'{name}.sql'), '--json')
+    doubled = tmp_path / 'doubled.sql'  # the same metric computed another way, read after the first
+    doubled.write_text(
+        'CREATE SEMANTIC VIEW w TABLES (orders AS jaffle_shop.main.orders) '
+        'METRICS (orders.order_amount AS SUM(orders.amount) * 2);'
+    )
+    unread = tmp_path / 'unread.yaml'
+    unread.write_text('just: text\n')
+    add(
+        'conform',
+        '-C',
+        str(copy),
+        'conform',
+        str(CONFORM_FIXTURES / 'dbt_semantic_view_jaffle.sql'),
+        str(doubled),
+        str(unread),
+        '--json',
+    )
     _recorded_history(monkeypatch)
     add('check-sql --history', '-C', str(checked), 'check-sql', '--history', '--json')
     _receipted(tmp_path / 'receipts', add)
@@ -1303,7 +1330,12 @@ def test_the_documented_format_versions_are_the_ones_written() -> None:
         names, version = (cell.strip() for cell in row.strip('|').split('|'))
         for name in names.replace(' and ', ', ').split(', '):
             documented[name.strip('`').removesuffix(' --json')] = int(version)
-    files = {'conflicts.json': 'conflicts', 'verify.json': 'verify', 'laws.json': 'verify --laws'}
+    files = {
+        'conflicts.json': 'conflicts',
+        'conform.json': 'conform',
+        'verify.json': 'verify',
+        'laws.json': 'verify --laws',
+    }
     assert {files.get(k, k): v for k, v in documented.items()} == written
 
 

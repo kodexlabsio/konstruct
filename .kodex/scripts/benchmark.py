@@ -17,6 +17,8 @@ models through CTEs, with a manifest, a catalog and Airflow DAGs. For each size 
   the first impact and the first search (each also builds its index), then the median time of a
   search, a query, a path from the 11th model to the deepest and a describe of the deepest
   model, and one run of conflicts over every candidate column;
+* ``Project.conform`` on a Snowflake semantic view with a table, two dimensions and a metric for
+  each model: the read, the composition of every metric and the verdicts;
 * the formula identity test: translating every column's composed formula into the core's
   program, then fingerprinting all of them and grouping them by fingerprint;
 * how long graph.html takes to show its overview and to draw its full lineage graph in headless
@@ -193,6 +195,30 @@ def world_model(graph: Graph, models: int) -> dict[str, float]:
     }
 
 
+def conform_times(project: Project, root: Path, models: int) -> dict[str, float]:
+    """``Project.conform`` on a Snowflake semantic view with a table, a primary key, three
+    dimensions and a metric for each model, and on the same view with one metric of each table
+    over two tables' columns: the read, the composition of every metric and the verdicts."""
+    lines = ['CREATE OR REPLACE SEMANTIC VIEW bench', '  TABLES (']
+    tables, dimensions, metrics = [], [], []
+    for i in range(models):
+        name = f'm{i:03}'
+        relation = project.graph.nodes[f'model.big.{name}'].relation
+        tables.append(f'    {name} AS {relation} PRIMARY KEY (c00)')
+        dimensions += [f'    {name}.d{c} AS {name}.c{c:02}' for c in (0, 1)]
+        metrics.append(f'    {name}.s{i:03} AS SUM({name}.c02)')
+    lines += [',\n'.join(tables), '  )', '  DIMENSIONS (', ',\n'.join(dimensions), '  )']
+    lines += ['  METRICS (', ',\n'.join(metrics), '  );']
+    layer = root / 'bench_layer.sql'
+    layer.write_text('\n'.join(lines))
+    elapsed, result = timed(project.conform, [layer])
+    return {
+        'metrics': result.summary['metrics'],
+        'findings': len(result.findings),
+        's': round(elapsed, 2),
+    }
+
+
 def render_times(page_path: Path) -> tuple[float | None, float | None]:
     """Seconds for graph.html to show its overview, and its full lineage graph, in headless
     Chromium (medians of three loads); None when Playwright's Chromium is not installed."""
@@ -347,6 +373,7 @@ def measure(models: int) -> dict[str, Any]:
         fresh = {} if models != max(SIZES) else measure_fresh_search(root)
         meaning = median_time(search, unindexed, 'customer lifetime value', 20, None, 'semantic')
         modelled = {f'world_{k}': v for k, v in world_model(Graph.read(project.graph_path), models).items()}
+        modelled |= {f'conform_{k}': v for k, v in conform_times(Project(root), root, models).items()}
         return {
             'models': models,
             'columns': sum(1 for n in graph.nodes.values() if n.kind == 'column'),
@@ -738,6 +765,13 @@ def markdown(rows: list[dict[str, Any]]) -> str:
             f'| {r["models"]:,} | {r["world_odcs_contracts"]:,} | {r["world_odcs_export_s"]} s '
             f'| {r["world_odcs_check_s"]} s |'
         )
+    lines += [
+        '',
+        '| Models | Metrics checked | `konstruct conform` |',
+        '|---:|---:|---:|',
+    ]
+    for r in rows:
+        lines.append(f'| {r["models"]:,} | {r["conform_metrics"]:,} | {r["conform_s"]} s |')
     fresh = next((r for r in rows if 'meaning_cpu_ms' in r), None)
     if fresh:
         lines += [

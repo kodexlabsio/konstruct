@@ -99,6 +99,17 @@ A build writes `graph.json` once, and every command that changes the graph (`kon
 
 CPU time counts Konstruct's process and the worker processes the builds start; the wall times were taken on a shared machine of four cores. The first commit the timeline builds analyses every model; each commit after it is analysed only where its SQL differs, and a property's formula is composed only where what it is computed from changed. `uv run .kodex/scripts/timeline_benchmark.py` measures both on your machine, and `--models` sets the size.
 
+## Checking Semantic Layers
+
+`konstruct conform` on a Snowflake semantic view with a table, a primary key, two dimensions and a metric for each model of the generated projects (a `SUM` of one column per model, each model reading the one before): reading the statement, composing every metric through the graph and giving every verdict. The ontology is derived once and is not in the time.
+
+| Models | Metrics checked | `konstruct conform` |
+|---:|---:|---:|
+| 500 | 500 | 0.33 s |
+| 2,000 | 2,000 | 1.6 s |
+
+These are medians of seven runs on 4 cores. `uv run .kodex/scripts/benchmark.py 2000` measures it with the rest, and `uv run .kodex/scripts/profile_conform.py 2000` shows where the time goes: reading each metric's expression and binding it to the graph, then the formulas, then the native judge. The conditions on the rows a metric reads are gathered only when something is held to them (a required filter, or another implementation of the same concept), and what the code computes is written out only for the metrics that differ.
+
 ## The Ontology's Questions
 
 The generated projects have no keys or measures, so the benchmark gives each model of the 2,000-model project an entity, with a primary key on its first column under an enforced contract, and a measure, a `SUM` around its third. The ontology then has 2,000 entities and 2,652 relationships, and `metric` lists 4,000 proposals: a sum and an entity count for each model.

@@ -145,16 +145,16 @@ def test_gate_draws_each_finding_with_its_file_and_fix(host: Any) -> None:
     assert passed.view.evaluate('document.documentElement.dataset.theme') == 'light'
 
 
-def test_conform_draws_each_verdict_with_both_formulas_and_the_witness(host: Any) -> None:
+def test_conform_draws_each_verdict_with_both_formulas_and_the_missing_filter(host: Any) -> None:
     page = host('conform', recorded('conform'))
     frame = page.view
     stats = frame.inner_text('.stats')
-    assert '4\nMetrics' in stats and '2\nconforms' in stats
-    differs = frame.locator('.finding').first.inner_text()
-    assert 'net_revenue' in differs and 'differs' in differs
-    assert 'SUM(payments.amount)' in differs and 'SUM(raw_payments.amount / 100)' in differs
-    assert "status = 'completed'" in differs and "where amount = 100, status = 'returned'" in differs
-    assert 'The same, with an error of at most 2.7e-19.' in frame.inner_text('.capped.findings')
+    assert '2\nMetrics' in stats and '1\ndiffers' in stats and '1\nunbound' in stats
+    differs = frame.locator('.finding', has_text='completed_order').first.inner_text()
+    assert 'differs' in differs
+    assert 'COUNT(orders.order_key)' in differs and 'COUNT(raw_orders.id)' in differs
+    assert "orders.status = 'completed'" in differs and 'Completed order' in differs
+    assert 'key-misfiled' in frame.inner_text('.capped.findings')
 
 
 def test_an_error_result_is_shown_as_the_error(host: Any) -> None:

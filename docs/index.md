@@ -11,6 +11,7 @@ What it provides:
 - **It finds columns by meaning.** A search for "revenue" finds a column called `net_sales_amt`, through the abbreviations and synonyms of data work, its formula and its lineage, with exact names still first. Everything is computed locally from the graph. [Searching by Meaning](guide/search.md)
 - **It shows how a column is calculated.** `konstruct explain` composes a column's SQL through every model upstream, so `customer_ltv.lifetime_value` reads as `SUM(raw_payments.amount / 100)`, with the joins and filters of each step listed beside it. A test evaluates composed formulas on the data and checks they give the model's values row for row. [Explaining a Column](guide/explain.md)
 - **It checks its lineage against the data.** `konstruct verify` perturbs each input column, reruns each model and records which outputs change. On dbt Labs' jaffle-shop all 87 claimed column edges are confirmed, and nothing changed that the graph did not predict. `--mutate` measures whether a project's tests would catch a wrong model, and `--why` lists the source rows behind one value. [How Much to Trust the Lineage](guide/verify.md)
+- **It checks the semantic layers on your platforms.** `konstruct conform` reads Snowflake semantic views, Databricks metric views and Ossie models and says, for each metric, key and relationship, whether it is what the code computes. [Checking Semantic Layers](guide/conform.md)
 - **It finds conflicting definitions.** `konstruct conflicts` compares columns that compute the same business idea by what their formulas compute, not how they are written, and shows the sources, filters, joins and aggregations that differ. [Finding Conflicting Definitions](guide/conflicts.md)
 - **It reviews changes column by column.** `uses: kodexlabsio/konstruct@v0` comments with what a change does to each column, ignoring formatting and renamed CTEs, and fails the check when a removed column is still read downstream. `konstruct gate` also fails on an approved definition whose meaning changed, and `konstruct hook` runs it after Claude Code edits SQL or dbt YAML. It also prints a `dbt build --select` for only what the change affects. [Reviewing Changes](guide/reviewing-changes.md)
 - **One chain across tools.** A column computed in dbt, copied by an Airflow SQL task, written by a Dagster asset and shown on a dashboard is one lineage chain, through DuckDB, Postgres, Snowflake, BigQuery, Databricks, Trino and Iceberg.
@@ -56,6 +57,7 @@ guide/metric-queries
 guide/ontology-packs
 guide/ossie
 guide/conflicts
+guide/conform
 guide/sensitivity
 guide/usage
 guide/exporting
