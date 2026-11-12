@@ -35,15 +35,15 @@ configuration says. Konstruct's own components always run.
 
 ```text
 $ konstruct plugins
-Plugins (plugin API 1.2)
+Plugins (plugin API 1.3)
 
 konstruct-yaml-pipelines 0.1.0: enabled
-  inputs     pipelines                API 1.2
-  checks     pipelines                API 1.2
+  inputs     pipelines                API 1.3
+  checks     pipelines                API 1.3
   packs      pipelines                API 1.0
-  mcp_tools  pipelines                API 1.2
+  mcp_tools  pipelines                API 1.3
 
-Built in: inputs looker; exports openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view, odcs; checks breaking, approved-definition-changed, conflicting-definition, data-law-broken, consumer-pin-changed; packs konstruct.
+Built in: inputs looker; exports openlineage, mermaid, dot, csv, ossie, owl, semantic-view, metric-view, odcs; checks breaking, approved-definition-changed, conflicting-definition, data-law-broken, consumer-pin-changed, platform-definition-differs; packs konstruct.
 ```
 
 ## The Security Model
@@ -129,8 +129,9 @@ plugin that targets its own major and a minor no higher than its own, so a plugi
 1.0 runs on a Konstruct that runs 1.2, but not on one that runs 2.0, and a plugin for 1.2 is
 refused by a Konstruct that runs only 1.0. A refused plugin is reported with the version it
 targets and the versions Konstruct runs, rather than being run against types it was not written
-for. `konstruct plugins` prints the version a release runs (plugin API 1.2 at present; 1.1 added the
-maps of `PLUGIN_MAP_ATTRS`, and 1.2 the data laws in a gate check's context). The
+for. `konstruct plugins` prints the version a release runs (plugin API 1.3 at present; 1.1 added the
+maps of `PLUGIN_MAP_ATTRS`, 1.2 the data laws in a gate check's context, and 1.3 the project's
+root and the recorded `conform.json`). The
 plugin API is the `konstruct.plugins` module: the protocols and types below, documented in the
 [Python API](../reference/python-api.md#plugins).
 

@@ -165,6 +165,8 @@ def gate(
     plugins: Plugins | None = None,
     laws: Laws | None = None,
     laws_from: str | None = None,
+    root: Path | None = None,
+    conform: dict[str, Any] | None = None,
 ) -> Gate:
     """The gate for ``diff``, given the graph at the head: every check that ``plugins`` (default:
     Konstruct's own checks) runs. A plugin's check that raises, returns something other than
@@ -175,7 +177,8 @@ def gate(
     which sees them all, and otherwise only those of the columns the change alters, which are all
     that Konstruct's own checks report, at a cost that grows with the change rather than with the
     square of the columns that share a name. ``laws`` are the data laws as confirmed before the
-    change, from ``laws.json``, and ``laws_from`` says where they came from."""
+    change, from ``laws.json``, and ``laws_from`` says where they came from. ``root`` is the
+    project's, and ``conform`` the ``conform.json`` recorded before the change."""
     from konstruct.plugins.registry import Plugins
 
     registry = plugins or Plugins.builtin()
@@ -184,7 +187,7 @@ def gate(
         touching = None if any(not p.builtin for p in checks) else set(_changed_columns(graph, diff))
         conflicts = find_conflicts(graph, touching=touching)
     result = Gate(base=diff.shown_base, changed=len(diff.source_files), laws_from=laws_from)
-    context = CheckContext(graph=graph, diff=diff, conflicts=conflicts, laws=laws)
+    context = CheckContext(graph=graph, diff=diff, conflicts=conflicts, laws=laws, root=root, conform=conform)
     for plugin in checks:
         result.findings += _run(plugin, context)
     for plugin in registry.failed('checks'):
@@ -472,12 +475,121 @@ SENSITIVE_FLOW = BuiltinCheck(
     _sensitive_flow,
 )
 
+
+def recorded_conform(root: Path, out_dir: Path, base: str | None = None) -> dict[str, Any] | None:
+    """The ``conform.json`` committed at ``base`` (default: the merge base with main), or with no
+    git base to read, the one in ``out_dir``; None when there is none or it cannot be read."""
+    import subprocess
+
+    from konstruct.analysis.diff import DiffError, default_base, file_at, resolve_ref
+    from konstruct.core import jsonio
+
+    path = out_dir / 'conform.json'
+    text: str | None = None
+    top = subprocess.run(
+        ['git', '-C', str(root), 'rev-parse', '--show-toplevel'], capture_output=True, text=True, check=False
+    )
+    if top.returncode == 0:
+        repository = Path(top.stdout.strip()).resolve()
+        try:
+            ref = resolve_ref(root, base) if base else default_base(root)
+            text = file_at(repository, ref, path.resolve().relative_to(repository).as_posix())
+        except (DiffError, ValueError):
+            text = None
+    elif path.is_file():
+        text = path.read_text(encoding='utf-8')
+    try:
+        found = jsonio.loads(text) if text else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
+
+
+def _platform_definition_differs(context: CheckContext) -> list[Finding]:
+    """A metric of a semantic layer that conformed to the code when ``konstruct conform`` last
+    recorded it (or whose required filters held, with no formula to compare), and is now an error,
+    or can no longer be compared because the graph lost what it reads: the layers it read are
+    checked again at the head. A change that only removes or alters the metric it was compared
+    with is the pair's finding, not the metric's."""
+    from konstruct.inputs.warehouse import read_layers
+    from konstruct.interfaces.project import conform_layers
+    from konstruct.semantics.ontology import derive
+
+    recorded, root = context.conform, context.root
+    if not recorded or root is None:
+        return []
+
+    def where(path: str) -> str:
+        try:
+            return str(Path(path).resolve().relative_to(root.resolve()))
+        except ValueError:
+            return path
+
+    paths = {d['key']: where(d['path']) for d in recorded.get('documents', [])}
+    # `held`: the filters it was required to hold held, and there was no formula to compare.
+    held = {
+        (paths.get(f['document'], f['document']), f['name'])
+        for f in recorded.get('findings', [])
+        if f.get('kind') == 'metric' and (f.get('verdict') == 'conforms' or f.get('held'))
+    }
+    layers = []
+    for relative in recorded.get('inputs', []):
+        path = root / relative
+        if path.is_file():
+            layers += read_layers(path.read_text(encoding='utf-8', errors='replace'), str(path))[0]
+    if not held or not layers:
+        return []
+    result = conform_layers(context.graph, derive(context.graph), layers)
+    # The document says which file it is, so a path with a `#` in it is not cut at that.
+    now = {d['key']: where(d['path']) for d in result.documents}
+    found = []
+    for item in result.findings:
+        if item['kind'] == 'pair' and item['severity'] == 'error':
+            # Two layers that agreed now compute the concept differently.
+            ours = [(now[layer['document']], layer['name']) for layer in item['layers']]
+            if any(key in held for key in ours):
+                (one, two) = item['layers']
+                shown = now[one['document']]
+                found.append(
+                    Finding(
+                        'platform-definition-differs',
+                        f'{shown}: metric {one["name"]} and {two["name"]} in {now[two["document"]]}: {item["detail"]}',
+                        shown,
+                    )
+                )
+            continue
+        # A metric that is now an error, or that the graph no longer lets Konstruct read.
+        if item['kind'] != 'metric' or not (
+            item['severity'] == 'error'
+            or item['verdict'] in ('unparsed', 'column-missing')
+            or (item['verdict'] == 'unbound' and item.get('cause') == 'graph')
+        ):
+            continue
+        shown = now[item['document']]
+        if (shown, item['name']) in held:
+            found.append(
+                Finding(
+                    'platform-definition-differs',
+                    f'{shown}: metric {item["name"]} {item["verdict"]}: {item["detail"]}',
+                    shown,
+                )
+            )
+    return found
+
+
+PLATFORM_DEFINITION_DIFFERS = BuiltinCheck(
+    'a metric of a deployed semantic layer that conformed to the code and no longer does',
+    'Change the layer to what the code computes now, or the code back; `konstruct conform` shows the difference.',
+    _platform_definition_differs,
+)
+
 RULES = {
     'breaking': BREAKING.fix,
     'approved-definition-changed': APPROVED_DEFINITION_CHANGED.fix,
     'conflicting-definition': CONFLICTING_DEFINITION.fix,
     'data-law-broken': DATA_LAW_BROKEN.fix,
     'consumer-pin-changed': CONSUMER_PIN_CHANGED.fix,
+    'platform-definition-differs': PLATFORM_DEFINITION_DIFFERS.fix,
     'sensitive-flow': sensitivity.FLOW_FIX,
     'unmasked-copy': sensitivity.UNMASKED_FIX,
     'sensitivity-removed': sensitivity.REMOVED_FIX,

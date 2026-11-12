@@ -885,7 +885,8 @@ class Project:
             warehouse: Also read the layers the warehouses serve.
             views: Which views to read from the warehouse (every Snowflake semantic view by
                 default; Databricks metric views are read only when named).
-            write: Also write ``conform.json`` beside the graph, with the files it read.
+            write: Also write ``conform.json`` beside the graph, which ``konstruct gate`` reads
+                to hold the files read to the code (see the ``platform-definition-differs`` rule).
 
         Returns:
             A verdict for every metric (``conforms``, ``differs``, ``unbound``, ``unparsed``),
@@ -2217,7 +2218,7 @@ class Project:
                 for finding in result.findings:
                     print(finding.rule, finding.message, finding.fix)
         """
-        from konstruct.analysis.gate import gate
+        from konstruct.analysis.gate import gate, recorded_conform
         from konstruct.analysis.laws import recorded
         from konstruct.engine.config import plugins_at
         from konstruct.plugins.registry import Plugins
@@ -2232,7 +2233,15 @@ class Project:
             self.build(update=True, run_dbt=run_dbt, warehouses=warehouses, config=config)
         checks = self.plugins() if config.plugins == head else Plugins.for_config(config)
         laws, laws_from = recorded(self.root, self._laws_dir(), base)
-        return gate(self.graph, self.diff(base=base), plugins=checks, laws=laws, laws_from=laws_from)
+        return gate(
+            self.graph,
+            self.diff(base=base),
+            plugins=checks,
+            laws=laws,
+            laws_from=laws_from,
+            root=self.root,
+            conform=recorded_conform(self.root, self.out_dir, base),
+        )
 
     def query(self, question: str, depth: int = 1) -> query.QueryResult:
         """Answer a question in words with the nodes it is about and their connections.

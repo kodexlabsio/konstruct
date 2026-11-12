@@ -101,14 +101,14 @@ CPU time counts Konstruct's process and the worker processes the builds start; t
 
 ## Checking Semantic Layers
 
-`konstruct conform` on a Snowflake semantic view with a table, a primary key, two dimensions and a metric for each model of the generated projects (a `SUM` of one column per model, each model reading the one before): reading the statement, composing every metric through the graph and giving every verdict. The ontology is derived once and is not in the time.
+`konstruct conform` on a Snowflake semantic view with a table, a primary key, two dimensions and a metric for each model of the generated projects (a `SUM` of one column per model, each model reading the one before): reading the statement, composing every metric through the graph and giving every verdict. The ontology is derived once and is not in the time. The gate rule is `platform-definition-differs` on the `conform.json` of two such views, whose metrics each conform to the other's, so it reads both files and checks twice as many metrics again, deriving the ontology and the formulas afresh; it does this only when the recorded document lists a metric that conformed.
 
-| Models | Metrics checked | `konstruct conform` |
-|---:|---:|---:|
-| 500 | 500 | 0.33 s |
-| 2,000 | 2,000 | 1.6 s |
+| Models | Metrics checked | `konstruct conform` | Gate rule (2 views) |
+|---:|---:|---:|---:|
+| 500 | 500 | 0.33 s | 1.1 s |
+| 2,000 | 2,000 | 1.6 s | 4.6 s |
 
-These are medians of seven runs on 4 cores. `uv run .kodex/scripts/benchmark.py 2000` measures it with the rest, and `uv run .kodex/scripts/profile_conform.py 2000` shows where the time goes: reading each metric's expression and binding it to the graph, then the formulas, then the native judge. The conditions on the rows a metric reads are gathered only when something is held to them (a required filter, or another implementation of the same concept), and what the code computes is written out only for the metrics that differ.
+These are medians of seven runs on 4 cores. `uv run .kodex/scripts/benchmark.py 2000` measures both with the rest, and `uv run .kodex/scripts/profile_conform.py 2000` shows where the time of `konstruct conform` goes: reading each metric's expression and binding it to the graph, then the formulas, then the native judge. The conditions on the rows a metric reads are gathered only when something is held to them (a required filter, or another implementation of the same concept), and what the code computes is written out only for the metrics that differ.
 
 ## The Ontology's Questions
 

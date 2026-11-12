@@ -57,6 +57,7 @@ BUILTINS: dict[str, tuple[tuple[str, str], ...]] = {
         ('data-law-broken', 'konstruct.analysis.gate:DATA_LAW_BROKEN'),
         ('consumer-pin-changed', 'konstruct.analysis.gate:CONSUMER_PIN_CHANGED'),
         ('sensitive-flow', 'konstruct.analysis.gate:SENSITIVE_FLOW'),
+        ('platform-definition-differs', 'konstruct.analysis.gate:PLATFORM_DEFINITION_DIFFERS'),
     ),
     'packs': (('konstruct', 'konstruct.semantics.ontologies'),),
     'mcp_tools': (),

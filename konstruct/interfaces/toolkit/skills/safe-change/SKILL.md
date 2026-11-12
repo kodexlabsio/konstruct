@@ -62,6 +62,9 @@ and a `fix` line:
 - `data-law-broken`: a total that held on all the data no longer follows from a model's SQL (a
   join on a key no test covers, a new filter, another factor). Keep what the law relies on, or
   say in the pull request that the change means to alter it.
+- `platform-definition-differs`: a metric of a deployed semantic layer that conformed to the code no
+  longer does. Change the layer to what the code computes now, or the code back (`konstruct conform`
+  shows the difference).
 - `consumer-pin-changed`: another repository pins the changed column in its `konstruct.lock`.
   Keep what the column means, or tell that repository's owners, who accept it with the command
   the finding gives.

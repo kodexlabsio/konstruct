@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from konstruct.core.graph import Graph, Node
     from konstruct.interfaces.project import Project
 
-API_VERSION: tuple[int, int] = (1, 2)
+API_VERSION: tuple[int, int] = (1, 3)
 """The version of the plugin API this release of Konstruct runs, as ``(major, minor)``. The minor
 grows when the API gains something a plugin may use; the major only when a type or protocol
 here changes incompatibly. Konstruct runs a plugin that targets the same major and a minor no
@@ -690,6 +690,13 @@ class CheckContext:
     """The data laws as recorded before the change: the ``laws.json`` that ``konstruct verify
     --laws`` writes, as committed at the base, or, with no git base to read, as it is in the
     output directory; None when there is none. Since plugin API 1.2."""
+    root: Path | None = None
+    """The project's root, to read the files a check holds to the code at the head. Since plugin
+    API 1.3."""
+    conform: dict[str, Any] | None = None
+    """The ``conform.json`` that ``konstruct conform`` writes, as committed at the base, or, with no
+    git base to read, as it is in the output directory; None when there is none. Since plugin
+    API 1.3."""
 
 
 class CheckPlugin(Protocol):

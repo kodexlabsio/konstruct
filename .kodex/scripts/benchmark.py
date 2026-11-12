@@ -18,7 +18,9 @@ models through CTEs, with a manifest, a catalog and Airflow DAGs. For each size 
   search, a query, a path from the 11th model to the deepest and a describe of the deepest
   model, and one run of conflicts over every candidate column;
 * ``Project.conform`` on a Snowflake semantic view with a table, two dimensions and a metric for
-  each model: the read, the composition of every metric and the verdicts;
+  each model: the read, the composition of every metric and the verdicts; and the gate's
+  ``platform-definition-differs`` rule on the document recorded for two such views, whose metrics
+  each conform to the other's;
 * the formula identity test: translating every column's composed formula into the core's
   program, then fingerprinting all of them and grouping them by fingerprint;
 * how long graph.html takes to show its overview and to draw its full lineage graph in headless
@@ -212,10 +214,23 @@ def conform_times(project: Project, root: Path, models: int) -> dict[str, float]
     layer = root / 'bench_layer.sql'
     layer.write_text('\n'.join(lines))
     elapsed, result = timed(project.conform, [layer])
+    # The gate rule re-reads the files the recorded conform.json lists, which it holds a metric to
+    # only when it conformed: so a second view of the same metrics, which each agrees with.
+    from konstruct.analysis.gate import PLATFORM_DEFINITION_DIFFERS
+    from konstruct.core.formats import document
+    from konstruct.plugins.api import CheckContext
+
+    twin = root / 'bench_layer_twin.sql'
+    twin.write_text('\n'.join(lines).replace('SEMANTIC VIEW bench', 'SEMANTIC VIEW bench_twin', 1))
+    recorded = document(project.conform([layer, twin]))
+    context = CheckContext(graph=project.graph, diff=None, conflicts=None, root=root, conform=recorded)  # type: ignore[arg-type]
+    gate_elapsed, found = timed(PLATFORM_DEFINITION_DIFFERS.check, context)
+    assert not found and recorded['summary']['conforms'] == 2 * models, recorded['summary']
     return {
         'metrics': result.summary['metrics'],
         'findings': len(result.findings),
         's': round(elapsed, 2),
+        'gate_s': round(gate_elapsed, 2),
     }
 
 
@@ -767,11 +782,13 @@ def markdown(rows: list[dict[str, Any]]) -> str:
         )
     lines += [
         '',
-        '| Models | Metrics checked | `konstruct conform` |',
-        '|---:|---:|---:|',
+        '| Models | Metrics checked | `konstruct conform` | Gate rule (2 views) |',
+        '|---:|---:|---:|---:|',
     ]
     for r in rows:
-        lines.append(f'| {r["models"]:,} | {r["conform_metrics"]:,} | {r["conform_s"]} s |')
+        lines.append(
+            f'| {r["models"]:,} | {r["conform_metrics"]:,} | {r["conform_s"]} s | {r["conform_gate_s"]} s |'
+        )
     fresh = next((r for r in rows if 'meaning_cpu_ms' in r), None)
     if fresh:
         lines += [
