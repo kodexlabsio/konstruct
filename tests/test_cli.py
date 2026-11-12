@@ -526,7 +526,8 @@ def test_a_hook_that_finds_the_files_unchanged_loads_neither_the_sql_parser_nor_
     edit = json.dumps({'cwd': str(project), 'tool_input': {'file_path': str(staging)}})
     hook = 'from konstruct.interfaces.cli import main\nmain(["hook", "post-edit"])'
     first, loaded = loaded_by(hook, edit)
-    assert {'sqlglot', 'jinja2', 'konstruct.engine.build'} <= loaded and 'mcp' not in loaded
+    # The renderer is in the core, so jinja2 is never loaded, here or on the build path.
+    assert {'sqlglot', 'konstruct.engine.build'} <= loaded and loaded.isdisjoint({'mcp', 'jinja2'})
     again, loaded = loaded_by(hook, edit)
     assert again == first and 'Konstruct gate passed' in first[0]
     assert loaded.isdisjoint({'sqlglot', 'jinja2', 'mcp', 'konstruct.engine.build'})
