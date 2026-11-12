@@ -37,6 +37,12 @@ the best of three ``--update`` builds of a project of 400 SQL files with no ware
 statements that read one relation twice the same way, and both those and the chains also in CPU
 time, the least of 25 runs (10 for a chain), which other work on the machine does not inflate.
 
+For the dbt input it measures reading a manifest into a graph (``dbt.load``, with nothing rendered)
+on the scale project, and, on a generated dbt project that dbt has only parsed (``dbt parse``, so
+there is no compiled SQL and Konstruct renders the Jinja of every model itself), rendering every
+model with the Jinja2 renderer kept in ``tests/jinja_oracle.py`` and with the renderer of the
+core, and ``dbt.load`` with that rendering.
+
 It also measures start-up: the CPU time of ``konstruct --help``, of ``konstruct status`` and of
 ``konstruct impact`` on a column on the largest project, each in a fresh process, and in the same way ``konstruct search`` with and
 without ``--meaning``, which reads the saved vectors.bin.
@@ -83,8 +89,13 @@ from konstruct.analysis.identity import Formulas  # noqa: E402
 from konstruct.analysis.query import search  # noqa: E402
 from konstruct.core import jsonio  # noqa: E402
 from konstruct.core.graph import Graph  # noqa: E402
+from konstruct.inputs import dbt  # noqa: E402
+from konstruct.inputs.jinja import Renderer  # noqa: E402
 from konstruct.interfaces import hook  # noqa: E402
+from tests import jinja_oracle  # noqa: E402
+from tests.conftest import dbt_executable  # noqa: E402
 from tests.test_gate import git  # noqa: E402
+from tests.test_jinja import write_dbt_project  # noqa: E402
 from tests.test_scale import give_entities, make_measures, make_project  # noqa: E402
 
 COLUMNS = 20
@@ -227,6 +238,64 @@ def discover_everything(config: Any) -> None:
         discovery.discover_warehouses(config, projects)
 
 
+def load_manifest(root: Path) -> float:
+    """The median time of ``dbt.load`` on the project at ``root``, the nodes, columns and edges of
+    its manifest and catalog put in a graph, over three loads."""
+    project = dbt.find_projects(root)[0]
+    times = []
+    for _ in range(3):
+        graph = Graph()
+        graph.meta['root'] = str(root)
+        elapsed, loaded = timed(dbt.load, project, graph, dialect=None)
+        assert loaded is not None
+        times.append(elapsed)
+    return statistics.median(times)
+
+
+def measure_dbt_read(models: int) -> dict[str, Any]:
+    """Rendering and reading the manifest of a dbt project of ``models`` models that dbt has only
+    parsed: the Jinja2 renderer against the renderer of the core, and ``dbt.load`` with it."""
+    if dbt_executable() is None:
+        return {}
+    with tempfile.TemporaryDirectory(prefix='konstruct-bench-dbt-') as directory:
+        root = Path(directory)
+        write_dbt_project(root, models)
+        parse, _ = timed(
+            subprocess.run,
+            [dbt_executable() or 'dbt', 'parse', '--quiet', '--no-version-check'],
+            cwd=root,
+            env={**os.environ, 'DBT_PROFILES_DIR': str(root), 'DBT_SEND_ANONYMOUS_USAGE_STATS': 'false'},
+            check=True,
+        )
+        manifest = json.loads((root / 'target' / 'manifest.json').read_text())
+        raws = [
+            n['raw_code']
+            for n in manifest['nodes'].values()
+            if n.get('resource_type') == 'model' and n.get('raw_code')
+        ]
+        macros = [root / 'macros']
+
+        def jinja2_renders() -> list[str]:
+            renderer = jinja_oracle.Renderer(root, manifest, macro_paths=macros)
+            return [renderer.render(raw) for raw in raws]
+
+        def core_renders() -> list[str]:
+            renderer = Renderer(root, manifest, macro_paths=macros)
+            return [renderer.render(raw) for raw in raws]
+
+        old, expected = timed(jinja2_renders)
+        new = min(timed(core_renders)[0] for _ in range(5))
+        assert core_renders() == expected, 'the renderers differ'
+        return {
+            'dbt_models': models,
+            'dbt_parse_s': round(parse, 1),
+            'dbt_manifest_mb': round((root / 'target' / 'manifest.json').stat().st_size / 1e6, 1),
+            'jinja2_render_s': round(old, 3),
+            'core_render_s': round(new, 3),
+            'dbt_load_parsed_s': round(load_manifest(root), 3),
+        }
+
+
 def measure(models: int) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix='konstruct-bench-') as directory:
         root = Path(directory)
@@ -235,6 +304,7 @@ def measure(models: int) -> dict[str, Any]:
         cold, result = timed(project.build, run_dbt=False, warehouses=False)
         graph = result.graph
         unchanged, _ = timed(project.build, update=True, run_dbt=False, warehouses=False)
+        manifest_load = load_manifest(root)
         discovery = min(timed(discover_everything, project.config())[0] for _ in range(3))
         middle = root / 'models' / f'm{models // 2:03}.sql'
         middle.write_text(middle.read_text().replace('where b.c01 > 0', 'where b.c01 > 1'))
@@ -279,6 +349,7 @@ def measure(models: int) -> dict[str, Any]:
             'warnings': len(graph.warnings),
             'cold_build_s': round(cold, 2),
             'update_unchanged_s': round(unchanged, 2),
+            'dbt_load_s': round(manifest_load, 3),
             'discovery_ms': round(1000 * discovery),
             'update_one_model_s': round(one_edit, 2),
             'hook_unchanged_s': round(hook_unchanged, 2),
@@ -710,6 +781,7 @@ def main() -> int:
     chains, chains_cpu = measure_star_chains() if rows else ({}, {})
     joined, joined_cpu = measure_self_joins() if rows else ({}, {})
     sql_files = measure_sql_files() if rows else {}
+    dbt_read = measure_dbt_read(max(sizes)) if rows else {}
     machine = (
         f'{platform.machine()}, {platform.system()} {platform.release()}, Python {platform.python_version()}'
     )
@@ -740,6 +812,19 @@ def main() -> int:
             + '.'
         )
         print(
+            'Reading the manifest and catalog into a graph (`dbt.load`): '
+            + ', '.join(f'{r["models"]} models {r["dbt_load_s"]} s' for r in rows)
+            + '.'
+        )
+        if dbt_read:
+            print(
+                f'A dbt project of {dbt_read["dbt_models"]} models that dbt has only parsed '
+                f'(`dbt parse` {dbt_read["dbt_parse_s"]} s, manifest {dbt_read["dbt_manifest_mb"]} MB): '
+                f'rendering every model takes {dbt_read["jinja2_render_s"]} s with Jinja2 and '
+                f'{dbt_read["core_render_s"]} s in the core; `dbt.load`, rendering included, '
+                f'{dbt_read["dbt_load_parsed_s"]} s.'
+            )
+        print(
             f'{sql_files["sql_files"]} SQL files and no warehouse: cold build {sql_files["sql_cold_build_s"]} s, '
             f'`--update` {sql_files["sql_update_s"]} s.'
         )
@@ -768,6 +853,7 @@ def main() -> int:
             'results': rows,
             'tables': measured,
             'yaml': yaml_rows,
+            'dbt_read': dbt_read,
             'star_chains_ms': chains,
             'self_joins_ms': joined,
             'star_chains_cpu_ms': chains_cpu,
