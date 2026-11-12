@@ -63,9 +63,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # Every language is analysed from source, without a build. The built viewer is generated
-      # from viewer/src, which is analysed instead; the fixtures and the example project are
-      # inputs that Konstruct reads, not code it runs.
+      # Every language is analysed from source, without a build. The built viewer and views are
+      # generated from viewer/src, which is analysed instead; the fixtures and the example project
+      # are inputs that Konstruct reads, not code it runs.
       - name: Initialise CodeQL
         uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
@@ -75,6 +75,7 @@ jobs:
           config: |
             paths-ignore:
               - konstruct/outputs/viewer.html
+              - konstruct/outputs/views
               - tests/fixtures
               - examples
 

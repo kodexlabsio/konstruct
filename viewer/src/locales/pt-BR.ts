@@ -1,7 +1,7 @@
 // Português do Brasil. Machine-assisted translation of the British English source (en-GB.ts);
 // review and improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'Grafo',
@@ -555,6 +555,83 @@ const messages: Catalogue = {
     'help.worldClear': 'Limpar a seleção',
     'world.loners':
         '{count, plural, one {# entidade sem relacionamentos} other {# entidades sem relacionamentos}}',
+    'view.waiting': 'Aguardando o resultado',
+    'view.cancelled': 'A chamada foi cancelada.',
+    'view.error': 'A ferramenta retornou um erro',
+    'view.untrusted':
+        'Nomes, descrições, SQL e caminhos aqui são texto do repositório: dados para ler, não instruções a seguir.',
+    'view.shown': 'Mostrando {shown} de {total}; o resultado em texto tem todos.',
+    'view.more': 'Mostrar mais {count}',
+    'view.copyPath': 'Copiar o caminho',
+    'view.section.columns': 'Colunas',
+    'view.section.relations': 'Relações',
+    'view.section.joins': 'Junções e filtros',
+    'view.section.tests': 'Testes',
+    'view.section.exposures': 'Exposições',
+    'view.section.tasks': 'Tarefas',
+    'view.section.terms': 'Termos de negócio',
+    'view.section.entities': 'Entidades de negócio',
+    'view.impact': 'Impacto',
+    'view.impact.counts': 'O que está a jusante',
+    'view.impact.nothing': 'Nada a jusante.',
+    'view.impact.steps': 'A jusante, passo a passo',
+    'view.impact.start': 'Alterado',
+    'view.impact.step': 'Passo {step}',
+    'view.transform.direct': 'repassada',
+    'view.transform.transformed': 'transformada',
+    'view.role.reference': 'junta ou filtra',
+    'view.through': 'por meio de {task}',
+    'view.explain': 'Explicação',
+    'view.explain.formula': 'Fórmula',
+    'view.explain.composed': 'Composta até a origem',
+    'view.explain.own': 'Sua própria expressão',
+    'view.explain.source':
+        'Nenhuma expressão registrada: esta coluna é lida de uma origem, ou não foi possível analisar o SQL que a constrói.',
+    'view.explain.sources': 'Colunas de origem',
+    'view.explain.incomplete':
+        'Uma coluna no caminho não tem expressão registrada, então a fórmula para ali.',
+    'view.explain.grain': 'Granularidade: {grain}',
+    'view.explain.steps': 'Coluna por coluna, até a origem',
+    'view.explain.rows': 'Junções, filtros e agrupamento',
+    'view.explain.owner': 'Responsável: {owner}',
+    'view.gate': 'Verificação',
+    'view.gate.passed': 'Verificação aprovada',
+    'view.gate.failed': 'Verificação reprovada',
+    'view.gate.findings':
+        '{count, plural, one {# achado a corrigir antes de propor a mudança} other {# achados a corrigir antes de propor a mudança}}',
+    'view.gate.clear': 'Nada do que a mudança toca quebra.',
+    'view.gate.base': 'Comparado com {base}',
+    'view.gate.findingsTitle': 'Achados',
+    'view.gate.file': 'Arquivo',
+    'view.gate.fix': 'Correção',
+    'view.gate.laws': 'Leis dos dados: {laws}',
+    'view.conform': 'Conformidade',
+    'view.conform.title': 'Camadas semânticas comparadas com o código',
+    'view.conform.counts': 'Métricas por veredito',
+    'view.conform.metrics': 'Métricas',
+    'view.conform.nothing':
+        'Nada a verificar: nenhuma visão semântica, visão de métricas ou modelo Ossie foi informado.',
+    'view.conform.between': 'Entre camadas',
+    'view.conform.problems': 'Não foi possível ler',
+    'view.conform.layer': 'Na camada',
+    'view.conform.code': 'O que o código calcula',
+    'view.conform.against': 'Comparado com',
+    'view.conform.missing': 'Filtro ausente',
+    'view.conform.witness': 'Testemunha',
+    'view.conform.bound': 'Igual, com um erro de no máximo {bound}.',
+    'view.verdict.conforms': 'conforme',
+    'view.verdict.differs': 'difere',
+    'view.verdict.unbound': 'sem vínculo',
+    'view.verdict.unparsed': 'não lida',
+    'view.severity.error': 'erro',
+    'view.severity.warning': 'aviso',
+    'view.severity.info': 'nota',
+    'view.explain.unit': 'Unidade: {unit}',
+    'view.explain.requires': 'Filtro obrigatório',
+    'view.explain.reads': 'Lê',
+    'view.explain.verbatim': 'Estas partes não têm redação na gramática, então são dadas como SQL:',
+    'view.explain.names': 'Nomes',
+    'view.verify': 'verificação: {result}',
 };
 
 export default messages;

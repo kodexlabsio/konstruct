@@ -1,12 +1,19 @@
 <script lang="ts">
     import { t } from '../lib/i18n.svelte';
 
-    let { text, plain = false, label }: { text: string; plain?: boolean; label?: string } = $props();
+    let {
+        text,
+        plain = false,
+        label,
+        of,
+    }: { text: string; plain?: boolean; label?: string; of?: HTMLElement | undefined } = $props();
     let code: HTMLElement | undefined = $state();
     let copied = $state(false);
-    // Where the clipboard is out of reach (a file:// page), the hidden copy of the text is selected
-    // for the keyboard instead, so nothing else (a code block's line numbers) gets into the copy,
-    // and the button says so for as long as it shows that text.
+    // Where the clipboard is out of reach (a file:// page, a host's frame that does not grant it),
+    // the text is selected for the keyboard instead, and the button says so for as long as it
+    // shows that text. ``of`` is an element on the page that shows exactly the text, selected so
+    // the reader sees it; without one the hidden copy is, so nothing else (a code block's line
+    // numbers) gets into the copy.
     let selected = $state(false);
     $effect.pre(() => {
         void text;
@@ -14,10 +21,11 @@
     });
 
     function selectText(): void {
-        if (!code) return;
+        const target = of ?? code;
+        if (!target) return;
         selected = true;
         const range = document.createRange();
-        range.selectNodeContents(code);
+        range.selectNodeContents(target);
         const selection = window.getSelection();
         selection?.removeAllRanges();
         selection?.addRange(range);

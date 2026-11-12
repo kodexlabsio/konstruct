@@ -1,0 +1,434 @@
+@import '../fonts.css';
+@import '../base.css';
+@import '../code.css';
+
+/* The MCP App views: one tool's result in a host's frame, a column of sections that grows with
+   its content (the host sizes the frame to the page, so nothing here fills the window). */
+
+html,
+body,
+#root {
+    height: auto;
+}
+html {
+    background: var(--ground);
+}
+body {
+    background: var(--ground);
+}
+.view {
+    padding: 18px 20px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    max-inline-size: 1100px;
+}
+.view section {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.view h1,
+.view h2,
+.view h3,
+.view p {
+    margin: 0;
+}
+.view h1 {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.3;
+    overflow-wrap: anywhere;
+}
+.view h1 code {
+    font-size: 20px;
+}
+.view h2 {
+    font-size: 17px;
+    font-weight: 700;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+.view h3 {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-2);
+}
+.view-tool {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-2);
+}
+.view-tool span {
+    color: var(--accent);
+}
+.view-mark {
+    inline-size: 14px;
+    block-size: 14px;
+    border-radius: 4px;
+    background: var(--accent);
+}
+.view-head {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.view-state {
+    font-size: 17px;
+}
+.view-error {
+    margin: 0;
+    padding: 12px 14px;
+    border: 1px solid var(--warning);
+    border-radius: var(--radius-card);
+    background: var(--code);
+    color: var(--text);
+    font: 500 14px/1.6 var(--font-mono);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+.lead {
+    font-size: 16px;
+    color: var(--text-2);
+}
+.description,
+.message {
+    color: var(--text-2);
+    overflow-wrap: anywhere;
+}
+.path {
+    font: 500 14px var(--font-mono);
+    color: var(--text-3);
+    overflow-wrap: anywhere;
+}
+.label {
+    font-weight: 700;
+    color: var(--text-2);
+    margin-inline-end: 8px;
+}
+.item {
+    margin: 0;
+    line-height: 1.9;
+    overflow-wrap: anywhere;
+}
+.item > * + * {
+    margin-inline-start: 8px;
+}
+.item code.name {
+    word-break: break-all;
+}
+.item .icon {
+    color: var(--accent);
+    vertical-align: -3px;
+}
+.badge .note {
+    margin-inline-start: 6px;
+    font-weight: 500;
+}
+
+.verified {
+    margin-inline-start: 6px;
+}
+
+/* Text from the code (names, formulas, conditions, witnesses, paths) reads left to right in every
+   language, kept apart from the sentence around it. */
+code,
+pre,
+.path {
+    direction: ltr;
+    unicode-bidi: isolate;
+}
+
+/* Konstruct words these in English whatever the page's language (the plain-English sentence, the
+   wordings, the findings and their fixes), so they read left to right even when they start with a
+   name written right to left. */
+.sentence,
+.wording,
+.message,
+.fix-text {
+    direction: ltr;
+    unicode-bidi: isolate;
+}
+
+/* Descriptions are the repository's own text, in whatever language it was written. */
+.description {
+    unicode-bidi: plaintext;
+}
+
+/* Counts */
+
+.stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+.stats li {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 14px;
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-pill);
+    background: var(--card);
+}
+.stats b {
+    font-size: 17px;
+}
+.stats span {
+    color: var(--text-2);
+    font-size: 14px;
+}
+.stats .v-conforms b {
+    color: var(--ok);
+}
+.stats .v-differs b {
+    color: var(--warning);
+}
+
+/* Lists, a page at a time */
+
+.capped {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+}
+.capped.rows > li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 9px 2px;
+    border-block-end: 1px solid var(--rule);
+}
+.capped.rows > li:last-child {
+    border-block-end: 0;
+}
+.capped.cards,
+.capped.findings,
+.capped.steps {
+    gap: 8px;
+}
+.capped.cards > li {
+    overflow-wrap: anywhere;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 12px;
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-card);
+    background: var(--card);
+    font-size: 14px;
+}
+.more {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-block-start: 8px;
+}
+
+/* Impact: the walk downstream, a lane per step */
+
+.lanes {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 6px;
+    display: flex;
+    gap: 26px;
+    overflow-x: auto;
+    align-items: flex-start;
+}
+.lane {
+    flex: 1 0 210px;
+    min-inline-size: 0;
+    max-inline-size: 340px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    position: relative;
+}
+.lane + .lane::before {
+    content: '';
+    position: absolute;
+    inset-block-start: 9px;
+    inset-inline-start: -18px;
+    inline-size: 8px;
+    block-size: 8px;
+    border-block-start: 2px solid var(--edge);
+    border-inline-end: 2px solid var(--edge);
+    transform: rotate(45deg);
+}
+[dir='rtl'] .lane + .lane::before {
+    transform: rotate(-135deg);
+}
+.lane.start .capped.cards > li {
+    border-color: var(--accent);
+}
+.step-how {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.transform-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 700;
+}
+.transform-badge::before {
+    content: '';
+    inline-size: 18px;
+    block-size: 0;
+    border-block-start: 2px solid var(--t-direct);
+}
+.transform-badge.t-transformed::before {
+    border-block-start: 2px dashed var(--t-expression);
+}
+.transform-badge.t-direct {
+    color: var(--text-2);
+}
+.transform-badge.t-transformed {
+    color: var(--t-expression);
+}
+
+/* Explain */
+
+.step {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 14px;
+    border: 1px solid var(--card-border);
+    border-radius: var(--radius-card);
+    background: var(--card);
+}
+.step-number {
+    display: inline-grid;
+    place-items: center;
+    inline-size: 24px;
+    block-size: 24px;
+    border-radius: 50%;
+    background: var(--accent-soft);
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 700;
+}
+.formula-text {
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: 8px;
+    background: var(--code);
+    font: 500 14px/1.6 var(--font-mono);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+.conditions-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.conditions-list li {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-inline-start: 12px;
+    border-inline-start: 2px solid var(--t-reference);
+}
+.conditions-list code {
+    font-size: 14px;
+    overflow-wrap: anywhere;
+}
+.wording {
+    color: var(--text-2);
+    font-size: 14px;
+}
+
+/* Gate and conform: findings */
+
+.verdict h1 .icon {
+    color: var(--ok);
+}
+.verdict.failed h1 .icon {
+    color: var(--warning);
+}
+.finding {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--card-border);
+    border-inline-start: 4px solid var(--warning);
+    border-radius: var(--radius-card);
+    background: var(--card);
+}
+.finding.tone-ok {
+    border-inline-start-color: var(--ok);
+}
+.finding.tone-quiet {
+    border-inline-start-color: var(--edge);
+}
+.file .path {
+    flex: 1;
+}
+.fix {
+    overflow-wrap: anywhere;
+}
+.fix code {
+    overflow-wrap: anywhere;
+}
+.wrap {
+    align-items: baseline;
+}
+.formulas {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 10px;
+    margin: 0;
+}
+.formulas div {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-inline-size: 0;
+}
+.formulas dt {
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--text-2);
+}
+.formulas dd {
+    margin: 0;
+}
+
+/* The notice every view carries: what it draws is the repository's text. */
+
+.untrusted {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding-block-start: 12px;
+    border-block-start: 1px solid var(--rule);
+    color: var(--text-3);
+    font-size: 14px;
+}
+.untrusted .icon {
+    flex: none;
+    margin-block-start: 3px;
+}

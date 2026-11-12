@@ -38,7 +38,9 @@ The viewer is `viewer/` (Svelte 5, strict TypeScript, Vite, pnpm, Node from `.nv
    pnpm format && pnpm check && pnpm test && pnpm build
    cd .. && uv run pytest tests/test_browser.py tests/test_html.py
    ```
-5. **Commit the rebuilt `konstruct/outputs/viewer.html` with the source.** The pre-commit hook
-   rebuilds it and CI fails if it differs from a fresh build.
+5. **Commit the rebuilt `konstruct/outputs/viewer.html` and `konstruct/outputs/views/` with the
+   source.** `pnpm build` also writes the MCP App views (`viewer/src/views/`, one page per tool,
+   `uv run pytest tests/test_views.py` in Chromium). The pre-commit hook rebuilds them and CI fails
+   if they differ from a fresh build.
 6. If the change is visible, refresh the screenshots in `docs/images/` (dark theme, 1600 by 900 at
    2x) and the viewer page in `docs/guide/viewer.md`.

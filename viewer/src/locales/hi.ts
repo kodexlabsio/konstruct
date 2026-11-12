@@ -1,7 +1,7 @@
 // हिन्दी. Machine-assisted translation of the British English source (en-GB.ts); review and
 // improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'ग्राफ़',
@@ -544,6 +544,84 @@ const messages: Catalogue = {
     'help.worldShow': 'एंटिटी को मैप के बगल में दिखाएँ',
     'help.worldClear': 'चयन हटाएँ',
     'world.loners': 'बिना संबंध वाली {count, number} एंटिटी',
+    'view.waiting': 'परिणाम की प्रतीक्षा',
+    'view.cancelled': 'कॉल रद्द कर दी गई।',
+    'view.error': 'टूल ने त्रुटि लौटाई',
+    'view.untrusted':
+        'यहाँ के नाम, विवरण, SQL और पथ रिपॉज़िटरी का पाठ हैं: पढ़ने के लिए डेटा, पालन करने के निर्देश नहीं।',
+    'view.shown': '{total} में से {shown} दिखाए गए; पाठ परिणाम में सभी हैं।',
+    'view.more': '{count} और दिखाएँ',
+    'view.copyPath': 'पथ कॉपी करें',
+    'view.section.columns': 'कॉलम',
+    'view.section.relations': 'संबंध',
+    'view.section.joins': 'जॉइन और फ़िल्टर',
+    'view.section.tests': 'परीक्षण',
+    'view.section.exposures': 'एक्सपोज़र',
+    'view.section.tasks': 'कार्य',
+    'view.section.terms': 'व्यावसायिक शब्द',
+    'view.section.entities': 'व्यावसायिक इकाइयाँ',
+    'view.impact': 'प्रभाव',
+    'view.impact.counts': 'आगे क्या है',
+    'view.impact.nothing': 'आगे कुछ नहीं।',
+    'view.impact.steps': 'आगे, चरण दर चरण',
+    'view.impact.start': 'बदला गया',
+    'view.impact.step': 'चरण {step}',
+    'view.transform.direct': 'जैसा का तैसा',
+    'view.transform.transformed': 'रूपांतरित',
+    'view.role.reference': 'जोड़ता या छानता है',
+    'view.through': '{task} के माध्यम से',
+    'view.explain': 'व्याख्या',
+    'view.explain.formula': 'सूत्र',
+    'view.explain.composed': 'स्रोत तक संयोजित',
+    'view.explain.own': 'इसकी अपनी अभिव्यक्ति',
+    'view.explain.source':
+        'कोई अभिव्यक्ति दर्ज नहीं: यह कॉलम किसी स्रोत से पढ़ा जाता है, या इसे बनाने वाले SQL का विश्लेषण नहीं हो सका।',
+    'view.explain.sources': 'स्रोत कॉलम',
+    'view.explain.incomplete':
+        'रास्ते के एक कॉलम की कोई दर्ज अभिव्यक्ति नहीं है, इसलिए सूत्र वहीं रुक जाता है।',
+    'view.explain.grain': 'ग्रेन: {grain}',
+    'view.explain.steps': 'कॉलम दर कॉलम, स्रोत तक',
+    'view.explain.rows': 'जॉइन, फ़िल्टर और समूहन',
+    'view.explain.owner': 'स्वामी: {owner}',
+    'view.gate': 'गेट',
+    'view.gate.passed': 'गेट पास',
+    'view.gate.failed': 'गेट विफल',
+    'view.gate.findings':
+        '{count, plural, one {बदलाव प्रस्तावित करने से पहले सुधारने के लिए # निष्कर्ष} other {बदलाव प्रस्तावित करने से पहले सुधारने के लिए # निष्कर्ष}}',
+    'view.gate.clear': 'बदलाव जिसे छूता है, उसमें कुछ नहीं टूटता।',
+    'view.gate.base': '{base} से तुलना',
+    'view.gate.findingsTitle': 'निष्कर्ष',
+    'view.gate.file': 'फ़ाइल',
+    'view.gate.fix': 'सुधार',
+    'view.gate.laws': 'डेटा नियम: {laws}',
+    'view.conform': 'अनुरूपता',
+    'view.conform.title': 'कोड के सामने सिमेंटिक परतें',
+    'view.conform.counts': 'निर्णय के अनुसार मेट्रिक',
+    'view.conform.metrics': 'मेट्रिक',
+    'view.conform.nothing':
+        'जाँचने को कुछ नहीं: कोई सिमेंटिक व्यू, मेट्रिक व्यू या Ossie मॉडल नहीं दिया गया।',
+    'view.conform.between': 'परतों के बीच',
+    'view.conform.problems': 'पढ़ा नहीं जा सका',
+    'view.conform.layer': 'परत में',
+    'view.conform.code': 'कोड क्या गणना करता है',
+    'view.conform.against': 'तुलना की गई',
+    'view.conform.missing': 'छूटा हुआ फ़िल्टर',
+    'view.conform.witness': 'साक्षी',
+    'view.conform.bound': 'समान, अधिकतम {bound} की त्रुटि के साथ।',
+    'view.verdict.conforms': 'अनुरूप',
+    'view.verdict.differs': 'भिन्न',
+    'view.verdict.unbound': 'असंबद्ध',
+    'view.verdict.unparsed': 'अपठित',
+    'view.severity.error': 'त्रुटि',
+    'view.severity.warning': 'चेतावनी',
+    'view.severity.info': 'टिप्पणी',
+    'view.explain.unit': 'इकाई: {unit}',
+    'view.explain.requires': 'आवश्यक फ़िल्टर',
+    'view.explain.reads': 'पढ़ता है',
+    'view.explain.verbatim':
+        'इन हिस्सों का व्याकरण में कोई शब्दांकन नहीं है, इसलिए ये SQL के रूप में दिए गए हैं:',
+    'view.explain.names': 'नाम',
+    'view.verify': 'सत्यापन: {result}',
 };
 
 export default messages;

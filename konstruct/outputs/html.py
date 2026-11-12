@@ -69,6 +69,26 @@ def template() -> str:
     return page
 
 
+VIEWS = ('impact', 'explain', 'gate', 'conform')
+"""The MCP App views: each draws the result of the tool of its name inside an MCP host."""
+
+
+_VERSION_PLACEHOLDER = '__KONSTRUCT_VERSION__'
+
+
+@cache
+def view_html(name: str) -> str:
+    """The page of the view ``name``, as ``pnpm build`` wrote it into ``konstruct/outputs/views/``,
+    with Konstruct's version filled in (the view names itself to the host with it), as the MCP
+    server serves it. It holds no data: the host hands the view its result."""
+    from konstruct import __version__
+
+    page = resources.files('konstruct.outputs').joinpath('views', f'{name}.html').read_text(encoding='utf-8')
+    if _VERSION_PLACEHOLDER not in page:
+        raise RuntimeError(f'konstruct/outputs/views/{name}.html is not a view build; run `pnpm build`')
+    return page.replace(_VERSION_PLACEHOLDER, __version__, 1)
+
+
 def _embed_json(data: Any) -> str:
     # A pass of str.replace per character runs in C; str.translate with a mapping calls back
     # into Python for every character, over 1 s for a 2,000-model graph. No replacement holds a

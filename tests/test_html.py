@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 from konstruct.core.graph import Graph, Node, column_id
-from konstruct.outputs.html import VIEWER_SQL_LIMIT, write_html
+from konstruct.outputs.html import VIEWER_SQL_LIMIT, VIEWS, view_html, write_html
 
 HOSTILE = 'Ends here </script><script>alert(1)</script> and\u2028continues & <b>more</b>'
 SVG_NAMESPACE = 'http://www.w3.org/2000/svg'
@@ -64,7 +64,7 @@ def embedded_json(page: str) -> str:
 
 
 def inline_script(page: str) -> str:
-    match = re.search(r'<script type="module">(.*?)</script>', page, re.S)
+    match = re.search(r'<script type="module"[^>]*>(.*?)</script>', page, re.S)
     assert match is not None
     return match.group(1)
 
@@ -538,3 +538,63 @@ def test_conflicts_shown_list_the_formulas_as_graph_json_does(
     html.write_html(built, out / 'graph.html', data=page)
     html.show_conflicts(graph, out, graph_data, fingerprint)
     assert (out / 'explain.json').read_text() == expected
+
+
+# The MCP App views
+
+
+VIEW_BUDGET = 200_000
+"""The most bytes a view's page may have. Each is built whole, with its script, styles, fonts and
+messages, as an MCP host loads it in one resource read; the four measured between 185,684 and
+194,263 bytes when the budget was set (``wc -c konstruct/outputs/views/*.html`` after ``pnpm
+build``)."""
+
+
+def test_each_view_is_within_its_size_budget() -> None:
+
+    sizes = {view: len(view_html(view).encode('utf-8')) for view in VIEWS}
+    assert all(size <= VIEW_BUDGET for size in sizes.values()), sizes
+
+
+def test_each_view_is_offline_and_follows_the_design_rules() -> None:
+    """A view connects nowhere and loads nothing: its policy allows no connection and only the
+    page's own inline script and style, and nothing on it points off the page."""
+
+    for view in VIEWS:
+        page = view_html(view)
+        policy = page.split('http-equiv="Content-Security-Policy" content="', 1)[1].split('"', 1)[0]
+        directives = dict(d.strip().split(' ', 1) for d in policy.split(';'))
+        assert directives['default-src'] == "'none'" and directives['connect-src'] == "'none'", view
+        assert directives['img-src'] == 'data:' and directives['font-src'] == 'data:', view
+        assert directives['script-src'].startswith("'sha256-") and 'unsafe' not in policy, view
+        assert not re.findall(r"""\b(?:src|href)\s*=\s*["']([^"']+)["']""", page), view
+        assert all(u.startswith('data:') for u in re.findall(r'url\(([^)]*)\)', page)), view
+        sizes = [float(size) for size in re.findall(r'font-size:\s*(\d+(?:\.\d+)?)px', page)]
+        assert sizes and min(sizes) >= 14, view
+        assert '\u2014' not in page and '\u2013' not in page, view
+
+
+def test_the_views_insert_repository_text_only_as_text() -> None:
+    """The views draw names, SQL and paths anyone who can commit writes: never as markup."""
+    root = Path(__file__).resolve().parents[1] / 'viewer' / 'src'
+    sources = [
+        *(root / 'views').iterdir(),
+        *(root / 'components' / name for name in ('Code.svelte', 'Command.svelte', 'Icon.svelte')),
+    ]
+    for source in sources:
+        text = source.read_text(encoding='utf-8')
+        assert '{@html' not in text and 'innerHTML' not in text, source.name
+
+
+def test_the_views_are_the_same_four_everywhere_they_are_named() -> None:
+    """The server's list, the build's list, the build script's modes, the entry pages and their
+    scripts name the same views."""
+    root = Path(__file__).resolve().parents[1]
+    config = (root / 'vite.config.ts').read_text(encoding='utf-8')
+    built = re.findall(r"'(\w+)'", config.split('export const VIEWS = [', 1)[1].split(']', 1)[0])
+    script = json.loads((root / 'package.json').read_text(encoding='utf-8'))['scripts']['build']
+    modes = re.findall(r'--mode (\w+)', script)
+    pages = sorted(p.stem for p in (root / 'viewer' / 'views').glob('*.html'))
+    entries = sorted(p.stem for p in (root / 'viewer' / 'src' / 'views').glob('*.ts') if p.stem in pages)
+    assert list(VIEWS) == built == modes
+    assert sorted(VIEWS) == pages == entries
