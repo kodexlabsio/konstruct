@@ -1060,7 +1060,6 @@ CASES: dict[str, tuple[str, dict[str, str]]] = {
         "{{ target.get('type') }}{{ target.get('nope', 'dflt') }}{{ target.keys() | list | length }}{{ target['name'] }}",
         {},
     ),
-    'dbt_target_modify': ("{% do target.update({'x': 1}) %}{{ target.x }}", {}),
     'dbt_var_kw_default': ("{{ var('a', default='d') }}", {}),
     'dbt_var_no_args': ('{{ var() }}', {}),
     'dbt_var_is_defined': (
@@ -1106,5 +1105,118 @@ CASES: dict[str, tuple[str, dict[str, str]]] = {
         'select ' + ', '.join(f'{{{{ {n} }}}} as c{n}' for n in range(300)) + ' from t',
         {},
     ),
+    'recursive_for_tree': (
+        "{% set tree = [{'n': 'a', 'c': [{'n': 'b', 'c': []}, {'n': 'c', 'c': [{'n': 'd', 'c': []}]}]}] %}{% for x in tree recursive %}<{{ x.n }}{{ loop.depth }}{{ loop.depth0 }}{% if x.c %}{{ loop(x.c) }}{% endif %}>{% endfor %}",
+        {},
+    ),
+    'recursive_for_filter_and_else': (
+        '{% for x in [[1, 2], [3]] if x recursive %}{% if x is iterable %}[{{ loop(x) }}]{% else %}{{ x }}{% endif %}{% else %}none{% endfor %}',
+        {},
+    ),
+    'recursive_for_loop_vars': (
+        "{% for x in [1, [2, 3]] recursive %}{{ loop.index }}/{{ loop.length }}{{ '(' ~ loop(x) ~ ')' if x is not number }} {% endfor %}",
+        {},
+    ),
+    'recursive_for_not_called': ('{% for x in [1, 2] recursive %}{{ x }}{% endfor %}', {}),
+    'recursive_for_deep': (
+        '{% for x in [1] recursive %}{{ loop(x) if false }}{{ loop.depth }}{% endfor %}',
+        {},
+    ),
+    'loop_call_without_recursive': ('{% for x in [1] %}{{ loop([1]) }}{% endfor %}', {}),
+    'autoescape_on': ("{% autoescape true %}<b>{{ '<i>' }}</b>{{ 5 }}{{ none }}{% endautoescape %}", {}),
+    'autoescape_false_block': ("{% autoescape false %}{{ '<i>' }}{% endautoescape %}", {}),
+    'autoescape_nested': (
+        "{% autoescape true %}{{ '<' }}{% autoescape false %}{{ '<' }}{% endautoescape %}{{ '<' }}{% endautoescape %}{{ '<' }}",
+        {},
+    ),
+    'autoescape_safe_filter': ("{% autoescape true %}{{ '<b>' | safe }}{{ '<b>' }}{% endautoescape %}", {}),
+    'autoescape_escape_filter': (
+        "{% autoescape true %}{{ '<b>' | escape }}{{ '<b>' | e }}{{ ('<b>' | e) | e }}{{ '<b>' | forceescape }}{{ ('<b>' | e) | forceescape }}{% endautoescape %}",
+        {},
+    ),
+    'escape_outside_autoescape': ("{{ '<b>' | e }}{{ ('<b>' | e) ~ '<' }}{{ '<' ~ ('<b>' | safe) }}", {}),
+    'autoescape_concat': (
+        "{% autoescape true %}{{ '<a>' ~ ('<b>' | safe) }}{{ ('<a>' | safe) ~ '<b>' }}{{ '<a>' ~ '<b>' }}{{ ('<a>' | safe) + '<b>' }}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_join': (
+        "{% autoescape true %}{{ ['<a>', '<b>'] | join(', ') }}{{ ['<a>' | safe, '<b>'] | join('<>') }}{% endautoescape %}{{ ['<a>' | safe, '<b>'] | join('<>') }}",
+        {},
+    ),
+    'autoescape_macro_inside': (
+        "{% autoescape true %}{% macro m(x) %}<i>{{ x }}</i>{% endmacro %}{{ m('<b>') }}{{ m('<b>') | upper }}{{ m('<b>') | length }}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_macro_outside': (
+        "{% macro m(x) %}<i>{{ x }}</i>{% endmacro %}{% autoescape true %}{{ m('<b>') }}{{ '<' ~ m('x') }}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_macro_defined_inside_called_outside': (
+        "{% autoescape true %}{% macro m(x) %}<i>{{ x }}</i>{% endmacro %}{% endautoescape %}{{ m('<b>') }}",
+        {},
+    ),
+    'autoescape_call_block': (
+        "{% macro w() %}[{{ caller() }}]{% endmacro %}{% autoescape true %}{% call w() %}<x>{{ '<y>' }}{% endcall %}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_methods_on_markup': (
+        "{% autoescape true %}{{ ('<a>' | safe).upper() }}{{ ('<a>' | safe) | upper }}{{ ('<a>' | safe).replace('<', '&') }}{{ ('<a>' | safe) | length }}{{ ('<a>' | safe)[1:2] }}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_in_loop_and_if': (
+        "{% autoescape true %}{% for c in ['<', '&'] %}{% if loop.first %}{{ c }}{% else %}{{ c | safe }}{% endif %}{% endfor %}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_tojson': (
+        "{% autoescape true %}{{ {'a': '<b>'} | tojson }}{{ ['x'] | string }}{% endautoescape %}",
+        {},
+    ),
+    'autoescape_set_block': ('{% autoescape true %}{% set x %}<a>{% endset %}{{ x }}{% endautoescape %}', {}),
+    'autoescape_quotes': ('{% autoescape true %}{{ "it\'s " ~ \'"x"\' ~ " & y" }}{% endautoescape %}', {}),
+    'autoescape_non_const': ("{% autoescape x %}{{ '<' }}{% endautoescape %}", {}),
+    'autoescape_default': ("{{ '<a>' }}{{ ['<'] }}", {}),
+    'markup_repr_in_list': (
+        "{{ [('<a>' | safe)] }}{{ ('<a>' | safe) == '<a>' }}{{ ('<a>' | safe) in ['<a>'] }}",
+        {},
+    ),
+    'filter_wordwrap': (
+        "{{ 'The quick brown fox jumps over the lazy dog' | wordwrap(10) }}|{{ 'a-very-long-hyphenated-word and more text here' | wordwrap(12) }}|{{ 'abcdefghijklmnopqrstuvwxyz' | wordwrap(10) }}|{{ 'abcdefghijklmnopqrstuvwxyz' | wordwrap(10, false) }}",
+        {},
+    ),
+    'filter_wordwrap_options': (
+        "{{ 'one two three four five six' | wordwrap(9, true, '<br>') }}|{{ 'well-known state-of-the-art thing' | wordwrap(8, true, none, false) }}|{{ 'a\nb c d e f g h i j k l m n o' | wordwrap(5) }}|{{ '' | wordwrap(5) }}|{{ 'x' | wordwrap }}",
+        {},
+    ),
+    'filter_wordwrap_spaces': ("{{ '  leading   and   multiple   spaces  here ' | wordwrap(11) }}|", {}),
+    'filter_filesizeformat': (
+        '{{ 1 | filesizeformat }}|{{ 0 | filesizeformat }}|{{ 999 | filesizeformat }}|{{ 1000 | filesizeformat }}|{{ 1500 | filesizeformat }}|{{ 1000000 | filesizeformat }}|{{ 1024 | filesizeformat(true) }}|{{ 123456789 | filesizeformat }}',
+        {},
+    ),
+    'filter_filesizeformat_more': (
+        '{{ (10 ** 12) | filesizeformat(true) }}|{{ 1.5 | filesizeformat }}|{{ 999999 | filesizeformat }}|{{ -5 | filesizeformat }}',
+        {},
+    ),
+    'filter_filesizeformat_string': ("{{ '2048' | filesizeformat }}", {}),
+    'filter_filesizeformat_huge': ('{{ (10 ** 30) | filesizeformat }}', {}),
+    'filter_filesizeformat_error': ("{{ 'abc' | filesizeformat }}", {}),
+    'filter_xmlattr': (
+        "<a{{ {'href': 'x?a=1&b=2', 'class': 'a b', 'n': 5, 'skip': none, 'q': '\"<>' } | xmlattr }}>|{{ {} | xmlattr }}|{{ {'a': 1} | xmlattr(false) }}|{{ {'a': true} | xmlattr }}",
+        {},
+    ),
+    'filter_xmlattr_bad_key': ("{{ {'a b': 1} | xmlattr }}", {}),
+    'filter_xmlattr_not_dict': ('{{ [1] | xmlattr }}', {}),
+    'filter_urlize': (
+        "{{ 'Visit http://example.com/a?b=1&c=2, or www.example.org. Mail me@example.com or (https://x.io/y) <b>' | urlize }}",
+        {},
+    ),
+    'filter_urlize_options': (
+        "{{ 'see http://example.com/very/long/path/here and example.com' | urlize(20) }}|{{ 'http://a.com' | urlize(none, true) }}|{{ 'http://a.com' | urlize(none, false, '_blank') }}|{{ 'http://a.com' | urlize(none, true, none, 'noreferrer') }}",
+        {},
+    ),
+    'filter_urlize_plain': (
+        "{{ 'nothing to link here, a@b ftp://x.y/z foo@bar.baz.' | urlize }}|{{ '' | urlize }}|{{ 'a\nhttp://x.com\tb' | urlize }}",
+        {},
+    ),
+    'filter_urlize_escapes': ("{{ '<script>alert(1)</script> http://a.com/?x=<y>' | urlize }}", {}),
     'source_dynamic': ("{% for t in ['events'] %}select * from {{ source('app', t) }}{% endfor %}", {}),
 }

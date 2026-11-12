@@ -8,9 +8,12 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::eval::{Callable, Error, Function, Interp, Kwargs};
+use super::eval::{Callable, Error, Function, Interp, Kwargs, MAX_ALLOC};
 use super::parse::{Bin, Cmp};
 use super::value::{Dict, Number, Object, Value, float_repr, range_len};
+
+/// The most digits after the point a format or `round` may ask for.
+const MAX_PRECISION: usize = 10_000;
 
 /// The sandbox's limit on the length of a `range`.
 const MAX_RANGE: i128 = 100_000;
@@ -218,18 +221,28 @@ fn overflow() -> Error {
     type_error("the number is too large")
 }
 
-pub fn binary(op: Bin, left: &Value, right: &Value) -> Result<Value, Error> {
+fn binary_plain(interp: &mut Interp, op: Bin, left: &Value, right: &Value) -> Result<Value, Error> {
     if let (Some(a), Some(b)) = (left.as_number(), right.as_number()) {
         return arithmetic(op, a, b);
     }
     match (op, left, right) {
-        (Bin::Add, Value::Str(a), Value::Str(b)) => Ok(Value::from(format!("{a}{b}"))),
+        (Bin::Add, Value::Str(a), Value::Str(b)) => {
+            interp.reserve(a.len().saturating_add(b.len()))?;
+            Ok(Value::from(format!("{a}{b}")))
+        }
         (Bin::Add, Value::List(a), Value::List(b)) => {
+            interp.reserve(
+                a.borrow()
+                    .len()
+                    .saturating_add(b.borrow().len())
+                    .saturating_mul(16),
+            )?;
             let mut joined = a.borrow().clone();
             joined.extend(b.borrow().iter().cloned());
             Ok(Value::list(joined))
         }
         (Bin::Add, Value::Tuple(a), Value::Tuple(b)) => {
+            interp.reserve(a.len().saturating_add(b.len()).saturating_mul(16))?;
             let mut joined = a.as_ref().clone();
             joined.extend(b.iter().cloned());
             Ok(Value::tuple(joined))
@@ -238,9 +251,11 @@ pub fn binary(op: Bin, left: &Value, right: &Value) -> Result<Value, Error> {
             if count.as_number().is_some() =>
         {
             let times = as_int(count)?.max(0);
-            if times * (text.len() as i128) > 10_000_000 {
-                return Err(type_error("the string is too long"));
-            }
+            let size = usize::try_from(times)
+                .ok()
+                .and_then(|n| n.checked_mul(text.len()))
+                .ok_or_else(|| type_error("the string is too long"))?;
+            interp.reserve(size)?;
             Ok(Value::from(text.repeat(times as usize)))
         }
         (Bin::Mul, Value::List(items), count) | (Bin::Mul, count, Value::List(items))
@@ -248,16 +263,20 @@ pub fn binary(op: Bin, left: &Value, right: &Value) -> Result<Value, Error> {
         {
             let times = as_int(count)?.max(0);
             let items = items.borrow();
-            if times * (items.len() as i128) > 10_000_000 {
-                return Err(type_error("the list is too long"));
-            }
+            let size = usize::try_from(times)
+                .ok()
+                .and_then(|n| n.checked_mul(items.len()))
+                .ok_or_else(|| type_error("the list is too long"))?;
+            interp.reserve(size.saturating_mul(16))?;
             let mut repeated = Vec::new();
             for _ in 0..times {
                 repeated.extend(items.iter().cloned());
             }
             Ok(Value::list(repeated))
         }
-        (Bin::Mod, Value::Str(format), args) => Ok(Value::from(percent_format(format, args)?)),
+        (Bin::Mod, Value::Str(format), args) => {
+            Ok(Value::from(percent_format(interp, format, args)?))
+        }
         _ => Err(type_error(format!(
             "unsupported operand types: '{}' and '{}'",
             left.type_name(),
@@ -282,13 +301,19 @@ fn arithmetic(op: Bin, a: Number, b: Number) -> Result<Value, Error> {
                 if y == 0 {
                     return Err(type_error("integer division or modulo by zero"));
                 }
-                Value::Int(x.div_euclid(y) - i128::from(y < 0 && x.rem_euclid(y) != 0))
+                let quotient = x.checked_div(y).ok_or_else(overflow)?;
+                let remainder = x.checked_rem(y).ok_or_else(overflow)?;
+                Value::Int(if remainder != 0 && (remainder < 0) != (y < 0) {
+                    quotient - 1
+                } else {
+                    quotient
+                })
             }
             Bin::Mod => {
                 if y == 0 {
                     return Err(type_error("integer division or modulo by zero"));
                 }
-                let remainder = x % y;
+                let remainder = x.checked_rem(y).ok_or_else(overflow)?;
                 Value::Int(if remainder != 0 && (remainder < 0) != (y < 0) {
                     remainder + y
                 } else {
@@ -350,7 +375,7 @@ pub fn compare(op: Cmp, left: &Value, right: &Value) -> Result<bool, Error> {
     })
 }
 
-fn contains(container: &Value, item: &Value) -> Result<bool, Error> {
+fn contains_plain(container: &Value, item: &Value) -> Result<bool, Error> {
     match container {
         Value::Str(text) => match item {
             Value::Str(part) => Ok(text.contains(part.as_ref())),
@@ -361,6 +386,8 @@ fn contains(container: &Value, item: &Value) -> Result<bool, Error> {
         },
         Value::Dict(entries) => Ok(entries.borrow().get(item).is_some()),
         Value::Undefined => Ok(false),
+        Value::List(list) => Ok(list.borrow().iter().any(|candidate| candidate.equals(item))),
+        Value::Tuple(items) => Ok(items.iter().any(|candidate| candidate.equals(item))),
         other => Ok(items_of(other)?
             .iter()
             .any(|candidate| candidate.equals(item))),
@@ -431,7 +458,7 @@ fn has_method(value: &Value, name: &str) -> bool {
         Value::Dict(_) => DICT_METHODS,
         Value::List(_) => LIST_METHODS,
         Value::Tuple(_) => TUPLE_METHODS,
-        Value::Str(_) => STR_METHODS,
+        Value::Str(_) | Value::Safe(_) => STR_METHODS,
         _ => return false,
     };
     table.contains(&name)
@@ -480,7 +507,7 @@ fn index_of(length: usize, key: &Value) -> Result<Option<usize>, Error> {
     Ok(usize::try_from(at).ok().filter(|at| *at < length))
 }
 
-pub fn get_item(value: &Value, key: &Value) -> Result<Value, Error> {
+fn get_item_plain(value: &Value, key: &Value) -> Result<Value, Error> {
     Ok(match value {
         Value::Undefined => Value::Undefined,
         Value::Dict(entries) => match entries.borrow().get(key) {
@@ -498,9 +525,10 @@ pub fn get_item(value: &Value, key: &Value) -> Result<Value, Error> {
             index_of(items.len(), key)?.map_or(Value::Undefined, |at| items[at].clone())
         }
         Value::Str(text) if key.as_number().is_some() => {
-            let chars: Vec<char> = text.chars().collect();
-            index_of(chars.len(), key)?
-                .map_or(Value::Undefined, |at| Value::from(chars[at].to_string()))
+            let length = text.chars().count();
+            index_of(length, key)?.map_or(Value::Undefined, |at| {
+                Value::from(text.chars().nth(at).map(String::from).unwrap_or_default())
+            })
         }
         Value::Range(..) if key.as_number().is_some() => {
             let items = items_of(value)?;
@@ -525,7 +553,7 @@ pub fn get_item(value: &Value, key: &Value) -> Result<Value, Error> {
     })
 }
 
-pub fn slice(
+fn slice_plain(
     value: &Value,
     start: Option<&Value>,
     stop: Option<&Value>,
@@ -558,14 +586,19 @@ pub fn slice(
                 None | Some(Value::None) => default,
                 Some(at) => {
                     let at = as_int(at)?;
-                    (if at < 0 { at + length } else { at }).clamp(low, high)
+                    (if at < 0 {
+                        at.saturating_add(length)
+                    } else {
+                        at
+                    })
+                    .clamp(low, high)
                 }
             })
         };
     let picked: Vec<Value> = if step > 0 {
         let (from, to) = (bound(start, 0, 0, length)?, bound(stop, length, 0, length)?);
         (from..to)
-            .step_by(step as usize)
+            .step_by(usize::try_from(step).unwrap_or(usize::MAX))
             .map(|at| items[at as usize].clone())
             .collect()
     } else {
@@ -577,7 +610,10 @@ pub fn slice(
         let mut at = from;
         while at > to {
             taken.push(items[at as usize].clone());
-            at += step;
+            at = match at.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
         }
         taken
     };
@@ -589,12 +625,16 @@ pub fn slice(
 }
 
 fn sql_argument(value: &Value) -> String {
+    sql_argument_at(value, 0)
+}
+
+fn sql_argument_at(value: &Value, depth: usize) -> String {
     match value {
-        Value::List(_) | Value::Tuple(_) => value
+        Value::List(_) | Value::Tuple(_) if depth < 50 => value
             .items()
             .unwrap_or_default()
             .iter()
-            .map(sql_argument)
+            .map(|item| sql_argument_at(item, depth + 1))
             .collect::<Vec<_>>()
             .join(", "),
         other => {
@@ -623,7 +663,7 @@ pub fn lenient_call(args: &[Value], kwargs: &Kwargs) -> Value {
     }
 }
 
-pub fn call_method(
+fn call_method_plain(
     interp: &mut Interp,
     object: &Value,
     name: &str,
@@ -678,90 +718,124 @@ fn list_method(
     kwargs: &Kwargs,
 ) -> Option<Result<Value, Error>> {
     let given = Args::new(args, kwargs);
+    // The list is borrowed only for as long as a step takes: what compares or prints its
+    // elements may reach the list itself, when it holds itself.
     let run = || -> Result<Value, Error> {
-        let mut list = items.borrow_mut();
+        let length = || items.borrow().len();
         Ok(match name {
             "append" => {
-                list.push(given.need(0, "object")?.clone());
+                let value = given.need(0, "object")?.clone();
+                items.borrow_mut().push(value);
                 Value::None
             }
             "extend" => {
                 let more = items_of(given.need(0, "iterable")?)?;
-                list.extend(more);
+                items.borrow_mut().extend(more);
                 Value::None
             }
             "insert" => {
                 let at = as_int(given.need(0, "index")?)?;
+                let len = length() as i128;
                 let at = if at < 0 {
-                    (at + list.len() as i128).max(0)
+                    (at + len).max(0)
                 } else {
-                    at.min(list.len() as i128)
+                    at.min(len)
                 };
-                list.insert(at as usize, given.need(1, "object")?.clone());
+                let value = given.need(1, "object")?.clone();
+                items.borrow_mut().insert(at as usize, value);
                 Value::None
             }
             "pop" => {
-                if list.is_empty() {
+                let len = length();
+                if len == 0 {
                     return Err(type_error("pop from empty list"));
                 }
                 let at = match given.get(0, "index") {
-                    Some(at) => index_of(list.len(), at)?
-                        .ok_or_else(|| type_error("pop index out of range"))?,
-                    None => list.len() - 1,
+                    Some(at) => {
+                        index_of(len, at)?.ok_or_else(|| type_error("pop index out of range"))?
+                    }
+                    None => len - 1,
                 };
-                list.remove(at)
+                items.borrow_mut().remove(at)
             }
-            "remove" => {
+            "remove" | "index" | "count" => {
                 let wanted = given.need(0, "value")?;
-                let at = list
-                    .iter()
-                    .position(|item| item.equals(wanted))
-                    .ok_or_else(|| type_error("list.remove(x): x not in list"))?;
-                list.remove(at);
-                Value::None
-            }
-            "index" => {
-                let wanted = given.need(0, "value")?;
-                let at = list
-                    .iter()
-                    .position(|item| item.equals(wanted))
-                    .ok_or_else(|| type_error("value is not in list"))?;
-                Value::Int(at as i128)
-            }
-            "count" => {
-                let wanted = given.need(0, "value")?;
-                Value::Int(list.iter().filter(|item| item.equals(wanted)).count() as i128)
+                let snapshot = items.borrow().clone();
+                let found = snapshot.iter().position(|item| item.equals(wanted));
+                match name {
+                    "remove" => {
+                        let at =
+                            found.ok_or_else(|| type_error("list.remove(x): x not in list"))?;
+                        items.borrow_mut().remove(at);
+                        Value::None
+                    }
+                    "index" => {
+                        Value::Int(found.ok_or_else(|| type_error("value is not in list"))? as i128)
+                    }
+                    _ => Value::Int(
+                        snapshot.iter().filter(|item| item.equals(wanted)).count() as i128
+                    ),
+                }
             }
             "reverse" => {
-                list.reverse();
+                items.borrow_mut().reverse();
                 Value::None
             }
             "sort" => {
                 let reverse = given.flag(usize::MAX, "reverse", false);
-                let mut failure = None;
-                list.sort_by(|a, b| {
-                    a.compare(b).unwrap_or_else(|error| {
-                        failure = Some(error);
-                        Ordering::Equal
-                    })
-                });
-                if let Some(error) = failure {
-                    return Err(error);
-                }
-                if reverse {
-                    list.reverse();
-                }
+                let snapshot = items.borrow().clone();
+                let ordered = try_sort(&snapshot, &mut |a, b| {
+                    if reverse { b.compare(a) } else { a.compare(b) }
+                })?;
+                *items.borrow_mut() = ordered;
                 Value::None
             }
-            "copy" => Value::list(list.clone()),
+            "copy" => Value::list(items.borrow().clone()),
             "clear" => {
-                list.clear();
+                let old = std::mem::take(&mut *items.borrow_mut());
+                drop(old);
                 Value::None
             }
             _ => return Err(type_error("no such method")),
         })
     };
     LIST_METHODS.contains(&name).then(run)
+}
+
+/// A stable merge sort whose comparison may fail: it stops at the first pair that cannot be
+/// ordered, as Python's sort does, and never asks for an order that is not total.
+#[allow(clippy::needless_range_loop)]
+fn try_sort<T: Clone>(
+    items: &[T],
+    compare: &mut dyn FnMut(&T, &T) -> Result<Ordering, Error>,
+) -> Result<Vec<T>, Error> {
+    let mut from: Vec<T> = items.to_vec();
+    let length = from.len();
+    let mut into = from.clone();
+    let mut width = 1;
+    while width < length {
+        let mut start = 0;
+        while start < length {
+            let middle = (start + width).min(length);
+            let end = (start + 2 * width).min(length);
+            let (mut left, mut right) = (start, middle);
+            for slot in start..end {
+                let take_right = left >= middle
+                    || (right < end && compare(&from[right], &from[left])? == Ordering::Less);
+                if take_right {
+                    into[slot] = from[right].clone();
+                    right += 1;
+                } else {
+                    into[slot] = from[left].clone();
+                    left += 1;
+                }
+            }
+            start = end;
+        }
+        std::mem::swap(&mut from, &mut into);
+        width *= 2;
+    }
+    Ok(from)
 }
 
 fn dict_method(
@@ -1008,6 +1082,7 @@ fn str_method(
             "replace" => {
                 let (old, new) = (given.need(0, "old")?.text(), given.need(1, "new")?.text());
                 let count = given.int(2, "count", -1)?;
+                reserve_replace(interp, text, &old, &new, count)?;
                 Value::from(if count < 0 {
                     text.replace(&old, &new)
                 } else {
@@ -1068,7 +1143,7 @@ fn str_method(
             "join" => {
                 let mut parts = Vec::new();
                 for item in items_of(given.need(0, "iterable")?)? {
-                    match item {
+                    match &item {
                         Value::Str(part) => parts.push(part.to_string()),
                         other => {
                             return Err(type_error(format!(
@@ -1081,7 +1156,7 @@ fn str_method(
                 Value::from(parts.join(text))
             }
             "ljust" | "rjust" | "center" => {
-                let width = given.int(0, "width", 0)?.max(0) as usize;
+                let width = width_of(interp, given.int(0, "width", 0)?)?;
                 let fill = given.text(1, "fillchar", " ").chars().next().unwrap_or(' ');
                 let length = text.chars().count();
                 if width <= length {
@@ -1097,7 +1172,7 @@ fn str_method(
                 Value::from(format!("{}{}{}", make(left), text, make(pad - left)))
             }
             "zfill" => {
-                let width = given.int(0, "width", 0)?.max(0) as usize;
+                let width = width_of(interp, given.int(0, "width", 0)?)?;
                 let length = text.chars().count();
                 if width <= length {
                     return Ok(Value::Str(Rc::clone(text)));
@@ -1261,11 +1336,11 @@ fn format_field(
         Some("s") => Value::from(value.text()),
         _ => value,
     };
-    format_spec(&value, spec)
+    format_spec(interp, &value, spec)
 }
 
 /// The format-spec mini-language: fill, align, sign, `0`, width, `,`, precision and type.
-fn format_spec(value: &Value, spec: &str) -> Result<String, Error> {
+fn format_spec(interp: &mut Interp, value: &Value, spec: &str) -> Result<String, Error> {
     if spec.is_empty() {
         return Ok(value.text());
     }
@@ -1318,6 +1393,13 @@ fn format_spec(value: &Value, spec: &str) -> Result<String, Error> {
         None
     };
     let kind = chars.get(at).copied();
+    let too_wide = |found: Option<usize>, most: usize| found.is_some_and(|n| n > most);
+    if too_wide(width, MAX_ALLOC) || too_wide(precision, MAX_PRECISION) {
+        return Err(type_error(
+            "the width or precision of a format is too large",
+        ));
+    }
+    interp.reserve(width.unwrap_or(0))?;
     let (negative, body) = match (value.as_number(), kind) {
         (Some(Number::Int(number)), None | Some('d' | 'n')) => {
             (number < 0, number.unsigned_abs().to_string())
@@ -1439,7 +1521,7 @@ fn pad(text: &str, width: Option<usize>, fill: char, align: Option<char>) -> Str
 }
 
 /// printf-style `%`: `%s`, `%r`, `%d`, `%f`, `%x`, flags, width and precision, `%(name)s`.
-fn percent_format(format: &str, args: &Value) -> Result<String, Error> {
+fn percent_format(interp: &mut Interp, format: &str, args: &Value) -> Result<String, Error> {
     let positional: Vec<Value> = match args {
         Value::Tuple(items) => items.as_ref().clone(),
         other => vec![other.clone()],
@@ -1500,6 +1582,12 @@ fn percent_format(format: &str, args: &Value) -> Result<String, Error> {
             Some((w, p)) => (w.parse::<usize>().ok(), p.parse::<usize>().ok().or(Some(0))),
             None => (spec_text.parse::<usize>().ok(), None),
         };
+        if width.is_some_and(|n| n > MAX_ALLOC) || precision.is_some_and(|n| n > MAX_PRECISION) {
+            return Err(type_error(
+                "the width or precision of a format is too large",
+            ));
+        }
+        interp.reserve(width.unwrap_or(0))?;
         let piece = match kind {
             's' => {
                 let text = value.text();
@@ -1567,9 +1655,9 @@ fn sort_key(
         Some(path) => lookup_path(value, &path.text())?,
         None => value.clone(),
     };
-    Ok(match key {
+    Ok(match &key {
         Value::Str(text) if !case_sensitive => Value::from(text.to_lowercase()),
-        other => other,
+        _ => key,
     })
 }
 
@@ -1592,30 +1680,14 @@ fn lookup_path(value: &Value, path: &str) -> Result<Value, Error> {
 }
 
 fn sorted(items: Vec<Value>, keys: Vec<Value>, reverse: bool) -> Result<Vec<Value>, Error> {
-    let mut order: Vec<usize> = (0..items.len()).collect();
-    let mut failure = None;
-    order.sort_by(|a, b| {
-        keys[*a].compare(&keys[*b]).unwrap_or_else(|error| {
-            failure = Some(error);
-            Ordering::Equal
-        })
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
-    if reverse {
-        order.reverse();
-        // Python's reverse sort is stable: equal keys keep their order.
-        let mut at = 0;
-        while at < order.len() {
-            let mut end = at + 1;
-            while end < order.len() && keys[order[at]].equals(&keys[order[end]]) {
-                end += 1;
-            }
-            order[at..end].sort_unstable();
-            at = end;
+    let order: Vec<usize> = (0..items.len()).collect();
+    let order = try_sort(&order, &mut |a, b| {
+        if reverse {
+            keys[*b].compare(&keys[*a])
+        } else {
+            keys[*a].compare(&keys[*b])
         }
-    }
+    })?;
     Ok(order.into_iter().map(|at| items[at].clone()).collect())
 }
 
@@ -1631,7 +1703,7 @@ fn round_to(number: f64, precision: i128) -> f64 {
     }
 }
 
-fn html_escape(text: &str) -> String {
+pub(crate) fn html_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -1647,6 +1719,16 @@ fn html_escape(text: &str) -> String {
 }
 
 fn json_text(value: &Value, out: &mut String) -> Result<(), Error> {
+    json_text_at(value, out, 0)
+}
+
+/// How deep `tojson` goes: a value that holds itself is a circular reference, as in Python.
+const MAX_JSON_DEPTH: usize = 100;
+
+fn json_text_at(value: &Value, out: &mut String, depth: usize) -> Result<(), Error> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(type_error("Circular reference detected"));
+    }
     match value {
         Value::None | Value::Undefined => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
@@ -1660,7 +1742,7 @@ fn json_text(value: &Value, out: &mut String) -> Result<(), Error> {
                 if n > 0 {
                     out.push_str(", ");
                 }
-                json_text(item, out)?;
+                json_text_at(item, out, depth + 1)?;
             }
             out.push(']');
         }
@@ -1678,7 +1760,7 @@ fn json_text(value: &Value, out: &mut String) -> Result<(), Error> {
                 }
                 json_string(key, out);
                 out.push_str(": ");
-                json_text(item, out)?;
+                json_text_at(item, out, depth + 1)?;
             }
             out.push('}');
         }
@@ -1729,7 +1811,7 @@ fn url_quote(text: &str, for_query: bool, out: &mut String) {
     }
 }
 
-pub fn filter(
+fn filter_plain(
     interp: &mut Interp,
     name: &str,
     value: &Value,
@@ -1744,7 +1826,7 @@ pub fn filter(
     }
     Ok(match name {
         "abs" => match value.as_number() {
-            Some(Number::Int(number)) => Value::Int(number.abs()),
+            Some(Number::Int(number)) => Value::Int(number.checked_abs().ok_or_else(overflow)?),
             Some(Number::Float(number)) => Value::Float(number.abs()),
             None => return Err(type_error("bad operand type for abs()")),
         },
@@ -1757,7 +1839,7 @@ pub fn filter(
             }
         }
         "batch" => {
-            let size = as_index(given.need(0, "linecount")?)?.max(1);
+            let size = width_of(interp, as_int(given.need(0, "linecount")?)?)?.max(1);
             let fill = given.get(1, "fill_with");
             let mut rows: Vec<Vec<Value>> = items_of(value)?
                 .chunks(size)
@@ -1781,7 +1863,7 @@ pub fn filter(
         }
         "center" => {
             let text = value.text();
-            let width = given.int(0, "width", 80)?.max(0) as usize;
+            let width = width_of(interp, given.int(0, "width", 80)?)?;
             let length = text.chars().count();
             if width <= length {
                 Value::from(text)
@@ -1902,7 +1984,7 @@ pub fn filter(
                         .collect(),
                 )
             };
-            Value::from(percent_format(&source, &arguments)?)
+            Value::from(percent_format(interp, &source, &arguments)?)
         }
         "groupby" => {
             let attribute = given.need(0, "attribute")?.clone();
@@ -1945,8 +2027,12 @@ pub fn filter(
             let text = value.text();
             let indentation = match given.get(0, "width") {
                 Some(Value::Str(custom)) => custom.to_string(),
-                other => " ".repeat(other.map_or(Ok(4), as_int)?.max(0) as usize),
+                other => {
+                    let width = width_of(interp, other.map_or(Ok(4), as_int)?)?;
+                    " ".repeat(width)
+                }
             };
+            interp.reserve(indentation.len().saturating_mul(text.lines().count() + 1))?;
             let first = given.flag(1, "first", false);
             let blank = given.flag(2, "blank", false);
             let lines: Vec<&str> = text.lines().collect();
@@ -2076,6 +2162,11 @@ pub fn filter(
         "replace" => {
             let (old, new) = (given.need(0, "old")?.text(), given.need(1, "new")?.text());
             let text = value.text();
+            let count = match given.get(2, "count") {
+                Some(Value::None) | None => -1,
+                Some(count) => as_int(count)?,
+            };
+            reserve_replace(interp, &text, &old, &new, count)?;
             Value::from(match given.get(2, "count") {
                 Some(Value::None) | None => text.replace(&old, &new),
                 Some(count) => text.replacen(&old, &new, as_index(count)?),
@@ -2091,6 +2182,9 @@ pub fn filter(
         },
         "round" => {
             let precision = given.int(0, "precision", 0)?;
+            if precision.unsigned_abs() > MAX_PRECISION as u128 {
+                return Err(type_error("the precision is too large"));
+            }
             let method = given.text(1, "method", "common");
             match value.as_number() {
                 Some(Number::Int(number)) if precision >= 0 => Value::Int(number),
@@ -2100,9 +2194,15 @@ pub fn filter(
                         .ok_or_else(overflow)?;
                     let (quotient, remainder) =
                         (number.div_euclid(scale), number.rem_euclid(scale));
-                    let doubled = remainder * 2;
-                    let up = doubled > scale || (doubled == scale && quotient % 2 != 0);
-                    Value::Int((quotient + i128::from(up)) * scale)
+                    // Rounds half to even: up when the rest is over half of the scale, or exactly
+                    // half and the quotient is odd.
+                    let up = match remainder.cmp(&(scale - remainder)) {
+                        Ordering::Greater => true,
+                        Ordering::Equal => quotient % 2 != 0,
+                        Ordering::Less => false,
+                    };
+                    let rounded = quotient.checked_add(i128::from(up)).ok_or_else(overflow)?;
+                    Value::Int(rounded.checked_mul(scale).ok_or_else(overflow)?)
                 }
                 Some(number) => {
                     let number = number.as_f64();
@@ -2123,7 +2223,7 @@ pub fn filter(
         }
         "safe" => Value::from(value.text()),
         "slice" => {
-            let slices = as_index(given.need(0, "slices")?)?.max(1);
+            let slices = width_of(interp, as_int(given.need(0, "slices")?)?)?.max(1);
             let items = items_of(value)?;
             let fill = given.get(1, "fill_with");
             let (each, extra) = (items.len() / slices, items.len() % slices);
@@ -2174,7 +2274,7 @@ pub fn filter(
                     Some(path) => lookup_path(&item, &path.text())?,
                     None => item,
                 };
-                total = binary(Bin::Add, &total, &item)?;
+                total = binary(interp, Bin::Add, &total, &item)?;
             }
             total
         }
@@ -2233,12 +2333,12 @@ pub fn filter(
         }
         "truncate" => {
             let text = value.text();
-            let length = given.int(0, "length", 255)?.max(0) as usize;
+            let length = count_of(given.int(0, "length", 255)?);
             let killwords = given.flag(1, "killwords", false);
             let end = given.text(2, "end", "...");
-            let leeway = given.int(3, "leeway", 5)?.max(0) as usize;
+            let leeway = count_of(given.int(3, "leeway", 5)?);
             let count = text.chars().count();
-            if count <= length + leeway {
+            if count <= length.saturating_add(leeway) {
                 Value::from(text)
             } else {
                 let keep = length.saturating_sub(end.chars().count());
@@ -2301,7 +2401,7 @@ pub fn filter(
     })
 }
 
-pub fn test(
+fn test_plain(
     interp: &mut Interp,
     name: &str,
     value: &Value,
@@ -2319,7 +2419,9 @@ pub fn test(
         "undefined" => matches!(value, Value::Undefined),
         "divisibleby" => {
             let by = as_int(other()?)?;
-            by != 0 && as_int(value)? % by == 0
+            let number = as_int(value)?;
+            // Everything divides by one and minus one; `i128::MIN % -1` overflows in Rust.
+            by != 0 && (by == 1 || by == -1 || number % by == 0)
         }
         "eq" | "==" | "equalto" | "sameas" => value.equals(other()?),
         "ne" | "!=" => !value.equals(other()?),
@@ -2539,4 +2641,500 @@ pub fn globals() -> HashMap<String, Value> {
         Ok(Value::from("Lorem ipsum dolor sit amet"))
     });
     names
+}
+
+/// Markup is text with its own rules; everything else treats it as the text it holds.
+fn plain(value: &Value) -> Value {
+    match value {
+        Value::Safe(text) => Value::Str(Rc::clone(text)),
+        other => other.clone(),
+    }
+}
+
+fn markup(text: String) -> Value {
+    Value::Safe(text.into())
+}
+
+/// The text of `value` as part of Markup: escaped unless it is Markup already.
+pub(crate) fn escaped_text(value: &Value) -> String {
+    match value {
+        Value::Safe(text) => text.to_string(),
+        other => html_escape(&other.text()),
+    }
+}
+
+pub fn binary(interp: &mut Interp, op: Bin, left: &Value, right: &Value) -> Result<Value, Error> {
+    let either = matches!(left, Value::Safe(_)) || matches!(right, Value::Safe(_));
+    if either && op == Bin::Add && left.is_str() && right.is_str() {
+        let joined = format!("{}{}", escaped_text(left), escaped_text(right));
+        interp.reserve(joined.len())?;
+        return Ok(markup(joined));
+    }
+    binary_plain(interp, op, &plain(left), &plain(right))
+}
+
+fn contains(container: &Value, item: &Value) -> Result<bool, Error> {
+    contains_plain(&plain(container), &plain(item))
+}
+
+pub fn get_item(value: &Value, key: &Value) -> Result<Value, Error> {
+    let found = get_item_plain(&plain(value), &plain(key))?;
+    Ok(match (value, &found) {
+        (Value::Safe(_), Value::Str(text)) => Value::Safe(Rc::clone(text)),
+        _ => found,
+    })
+}
+
+pub fn slice(
+    value: &Value,
+    start: Option<&Value>,
+    stop: Option<&Value>,
+    step: Option<&Value>,
+) -> Result<Value, Error> {
+    let found = slice_plain(&plain(value), start, stop, step)?;
+    Ok(match (value, &found) {
+        (Value::Safe(_), Value::Str(text)) => Value::Safe(Rc::clone(text)),
+        _ => found,
+    })
+}
+
+pub fn call_method(
+    interp: &mut Interp,
+    object: &Value,
+    name: &str,
+    args: &[Value],
+    kwargs: &Kwargs,
+) -> Result<Value, Error> {
+    if let Value::Safe(text) = object {
+        // Markup's methods give Markup, and escape what they are given.
+        let escaped: Vec<Value> = args
+            .iter()
+            .enumerate()
+            .map(|(at, a)| {
+                // `replace` looks for its first argument as it is.
+                if a.is_str() && !(name == "replace" && at == 0) {
+                    Value::Str(escaped_text(a).into())
+                } else {
+                    a.clone()
+                }
+            })
+            .collect();
+        let found =
+            call_method_plain(interp, &Value::Str(Rc::clone(text)), name, &escaped, kwargs)?;
+        return Ok(match &found {
+            Value::Str(text) => Value::Safe(Rc::clone(text)),
+            _ => found,
+        });
+    }
+    interp.charge(1 + object.length().unwrap_or(0) / 8)?;
+    call_method_plain(interp, object, name, args, kwargs)
+}
+
+pub fn test(
+    interp: &mut Interp,
+    name: &str,
+    value: &Value,
+    pos: &[Value],
+    kw: &Kwargs,
+) -> Result<bool, Error> {
+    let pos: Vec<Value> = pos.iter().map(plain).collect();
+    test_plain(interp, name, &plain(value), &pos, kw)
+}
+
+/// The filters that give Markup back when they are given Markup.
+const KEEP_MARKUP: [&str; 9] = [
+    "upper",
+    "lower",
+    "capitalize",
+    "title",
+    "trim",
+    "center",
+    "indent",
+    "truncate",
+    "replace",
+];
+
+pub fn filter(
+    interp: &mut Interp,
+    name: &str,
+    value: &Value,
+    pos: &[Value],
+    kw: &Kwargs,
+) -> Result<Value, Error> {
+    // What a builtin costs follows the size of what it works on, and a filter that compares
+    // every element with every other costs more.
+    let size = value.length().unwrap_or(0);
+    interp.charge(1 + size / 8)?;
+    if name == "unique" {
+        interp.charge(size.saturating_mul(size) / 256)?;
+    }
+    match name {
+        "safe" => return Ok(markup(value.text())),
+        "e" | "escape" => {
+            return Ok(match value {
+                Value::Safe(_) => value.clone(),
+                other => markup(html_escape(&other.text())),
+            });
+        }
+        "forceescape" => return Ok(markup(html_escape(&value.text()))),
+        "tojson" => {
+            let found = filter_plain(interp, name, &plain(value), pos, kw)?;
+            return Ok(markup(found.text()));
+        }
+        "xmlattr" => return xmlattr(value, pos, kw),
+        "urlize" => return urlize(value, pos, kw),
+        "filesizeformat" => return filesizeformat(value, pos, kw),
+        "wordwrap" => return wordwrap(value, pos, kw),
+        "join" if interp.escape => {
+            let given = Args::new(pos, kw);
+            let separator = given
+                .get(0, "d")
+                .cloned()
+                .unwrap_or_else(|| Value::from(""));
+            let mut parts = Vec::new();
+            for item in items_of(value)? {
+                let item = match given.get(1, "attribute") {
+                    Some(path) => lookup_path(&item, &path.text())?,
+                    None => item,
+                };
+                parts.push(escaped_text(&item));
+            }
+            return Ok(markup(parts.join(&escaped_text(&separator))));
+        }
+        _ => {}
+    }
+    let pos: Vec<Value> = pos.iter().map(plain).collect();
+    let found = filter_plain(interp, name, &plain(value), &pos, kw)?;
+    Ok(match (value, &found) {
+        (Value::Safe(_), Value::Str(text)) if KEEP_MARKUP.contains(&name) => {
+            Value::Safe(Rc::clone(text))
+        }
+        _ => found,
+    })
+}
+
+/// `value|filesizeformat`: bytes as `1.0 kB` (or `1.0 KiB` with `binary`).
+fn filesizeformat(value: &Value, pos: &[Value], kw: &Kwargs) -> Result<Value, Error> {
+    let given = Args::new(pos, kw);
+    let bytes = value
+        .as_number()
+        .map(Number::as_f64)
+        .or_else(|| value.text().trim().parse::<f64>().ok())
+        .ok_or_else(|| type_error("could not convert to float"))?;
+    let binary = given.flag(0, "binary", false);
+    let base = if binary { 1024.0 } else { 1000.0 };
+    let prefixes: [&str; 8] = if binary {
+        ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"]
+    } else {
+        ["kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
+    };
+    if bytes == 1.0 {
+        return Ok(Value::from("1 Byte"));
+    }
+    if bytes < base {
+        return Ok(Value::from(format!("{} Bytes", bytes as i64)));
+    }
+    let mut shown = String::new();
+    for (at, prefix) in prefixes.iter().enumerate() {
+        let unit = base.powi(at as i32 + 2);
+        shown = format!("{:.1} {prefix}", base * bytes / unit);
+        if bytes < unit {
+            break;
+        }
+    }
+    Ok(Value::from(shown))
+}
+
+/// `d|xmlattr`: ` key="value"` for each item that is not None, escaped.
+fn xmlattr(value: &Value, pos: &[Value], kw: &Kwargs) -> Result<Value, Error> {
+    let given = Args::new(pos, kw);
+    let Value::Dict(entries) = value else {
+        return Err(type_error("xmlattr needs a dict"));
+    };
+    let mut parts = Vec::new();
+    for (key, item) in entries.borrow().iter() {
+        if matches!(item, Value::None | Value::Undefined) {
+            continue;
+        }
+        let name = key.text();
+        if name
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '>' | '='))
+        {
+            return Err(type_error("invalid character in attribute name"));
+        }
+        parts.push(format!(
+            "{}=\"{}\"",
+            html_escape(&name),
+            html_escape(&item.text())
+        ));
+    }
+    let mut joined = parts.join(" ");
+    if given.flag(0, "autospace", true) && !joined.is_empty() {
+        joined.insert(0, ' ');
+    }
+    Ok(markup(joined))
+}
+
+/// `text|urlize`: links for web addresses and email addresses, in Markup.
+fn urlize(value: &Value, pos: &[Value], kw: &Kwargs) -> Result<Value, Error> {
+    let given = Args::new(pos, kw);
+    let limit = match given.get(0, "trim_url_limit") {
+        None | Some(Value::None) => None,
+        Some(found) => Some(as_index(found)?),
+    };
+    let nofollow = given.flag(1, "nofollow", false);
+    let target = given
+        .get(2, "target")
+        .filter(|t| !matches!(t, Value::None))
+        .map(Value::text);
+    let rel = given
+        .get(3, "rel")
+        .filter(|t| !matches!(t, Value::None))
+        .map(Value::text);
+    let mut rel_parts: Vec<String> = rel
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if nofollow {
+        rel_parts.push("nofollow".to_string());
+    }
+    rel_parts.push("noopener".to_string());
+    rel_parts.sort();
+    rel_parts.dedup();
+    let rel_attr = format!(" rel=\"{}\"", rel_parts.join(" "));
+    let target_attr = target
+        .map(|t| format!(" target=\"{t}\""))
+        .unwrap_or_default();
+    let trim = |url: &str| -> String {
+        match limit {
+            Some(n) if url.chars().count() > n => {
+                format!("{}...", url.chars().take(n).collect::<String>())
+            }
+            _ => url.to_string(),
+        }
+    };
+    let text = escaped_text(value);
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() != in_space && !current.is_empty() {
+            words.push(std::mem::take(&mut current));
+        }
+        in_space = c.is_whitespace();
+        current.push(c);
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    for word in &mut words {
+        if word.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        // Punctuation that is not part of the address: leading and trailing, and brackets
+        // at the end only when the text has more of them closed than opened.
+        let (mut lead, mut middle, mut trail) = (String::new(), word.clone(), String::new());
+        let pairs = [("(", ")"), ("<", ">"), ("&lt;", "&gt;")];
+        loop {
+            let mut changed = false;
+            for (opening, closing) in pairs {
+                if let Some(rest) = middle.strip_prefix(opening) {
+                    lead.push_str(opening);
+                    middle = rest.to_string();
+                    changed = true;
+                }
+                if middle.ends_with(closing)
+                    && middle.matches(closing).count() == middle.matches(opening).count() + 1
+                {
+                    middle.truncate(middle.len() - closing.len());
+                    trail.insert_str(0, closing);
+                    changed = true;
+                }
+            }
+            for dot in [".", ",", "\n"] {
+                if middle.ends_with(dot) {
+                    middle.truncate(middle.len() - dot.len());
+                    trail.insert_str(0, dot);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let link = |href: &str, shown: &str| {
+            format!("<a href=\"{href}\"{rel_attr}{target_attr}>{shown}</a>")
+        };
+        if middle.starts_with("www.")
+            || (!middle.contains('@')
+                && !middle.starts_with("http://")
+                && !middle.starts_with("https://")
+                && middle
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric())
+                && (middle.ends_with(".org")
+                    || middle.ends_with(".net")
+                    || middle.ends_with(".com")))
+        {
+            middle = link(&format!("https://{middle}"), &trim(&middle));
+        } else if middle.starts_with("http://") || middle.starts_with("https://") {
+            middle = link(&middle, &trim(&middle));
+        } else if middle.contains('@')
+            && !middle.starts_with("www.")
+            && !middle.contains(':')
+            && simple_email(&middle)
+        {
+            middle = format!("<a href=\"mailto:{middle}\">{middle}</a>");
+        }
+        *word = format!("{lead}{middle}{trail}");
+    }
+    Ok(markup(words.concat()))
+}
+
+fn simple_email(text: &str) -> bool {
+    let Some((local, domain)) = text.rsplit_once('@') else {
+        return false;
+    };
+    let ok = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    !local.is_empty()
+        && !local.chars().any(char::is_whitespace)
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && domain.chars().all(ok)
+}
+
+/// `text|wordwrap`: lines of at most `width` characters, broken at spaces and after hyphens,
+/// as Python's `textwrap` breaks them.
+fn wordwrap(value: &Value, pos: &[Value], kw: &Kwargs) -> Result<Value, Error> {
+    let given = Args::new(pos, kw);
+    let width = given.int(0, "width", 79)?.max(1) as usize;
+    let break_long = given.flag(1, "break_long_words", true);
+    let wrapstring = match given.get(2, "wrapstring") {
+        None | Some(Value::None) => "\n".to_string(),
+        Some(found) => found.text(),
+    };
+    let on_hyphens = given.flag(3, "break_on_hyphens", true);
+    let text = value.text();
+    let mut lines = Vec::new();
+    for paragraph in text.lines() {
+        lines.extend(wrap_line(paragraph, width, break_long, on_hyphens));
+    }
+    Ok(Value::from(lines.join(&wrapstring)))
+}
+
+/// The chunks Python's `textwrap` makes: runs of white space, and words, cut after a hyphen that
+/// joins two words.
+fn wrap_chunks(text: &str, on_hyphens: bool) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut space = false;
+    for (at, &c) in chars.iter().enumerate() {
+        if c.is_whitespace() != space && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+        }
+        space = c.is_whitespace();
+        current.push(c);
+        let joins = on_hyphens
+            && c == '-'
+            && at > 0
+            && (chars[at - 1].is_alphabetic() || chars[at - 1] == '_')
+            && chars
+                .get(at + 1)
+                .is_some_and(|n| n.is_alphanumeric() || *n == '_');
+        if joins {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_line(text: &str, width: usize, break_long: bool, on_hyphens: bool) -> Vec<String> {
+    let mut chunks: std::collections::VecDeque<String> = wrap_chunks(text, on_hyphens).into();
+    let mut lines = Vec::new();
+    while !chunks.is_empty() {
+        let mut line: Vec<String> = Vec::new();
+        let mut length = 0;
+        if !lines.is_empty() && chunks.front().is_some_and(|c| c.trim().is_empty()) {
+            chunks.pop_front();
+        }
+        while let Some(chunk) = chunks.front() {
+            let size = chunk.chars().count();
+            if length + size <= width {
+                length += size;
+                line.push(chunks.pop_front().unwrap_or_default());
+            } else {
+                break;
+            }
+        }
+        if let Some(chunk) = chunks.front().cloned()
+            && chunk.chars().count() > width
+        {
+            {
+                let room = width.saturating_sub(length);
+                if break_long {
+                    if room > 0 || line.is_empty() {
+                        let take = if room == 0 { width } else { room };
+                        let head: String = chunk.chars().take(take).collect();
+                        let rest: String = chunk.chars().skip(take).collect();
+                        line.push(head);
+                        chunks.pop_front();
+                        if !rest.is_empty() {
+                            chunks.push_front(rest);
+                        }
+                    }
+                } else if line.is_empty() {
+                    line.push(chunks.pop_front().unwrap_or_default());
+                }
+            }
+        }
+        while line.last().is_some_and(|c| c.trim().is_empty()) {
+            line.pop();
+        }
+        if !line.is_empty() {
+            lines.push(line.concat());
+        }
+    }
+    lines
+}
+
+/// A width, a count of lines or a number of slices, which must be a size a string or list may
+/// have; it is charged to the render.
+fn width_of(interp: &mut Interp, wanted: i128) -> Result<usize, Error> {
+    let size = usize::try_from(wanted.max(0)).map_err(|_| type_error("the size is too large"))?;
+    interp.reserve(size)?;
+    Ok(size)
+}
+
+/// A count that may be any size, as a `usize`.
+fn count_of(wanted: i128) -> usize {
+    usize::try_from(wanted.max(0)).unwrap_or(usize::MAX)
+}
+
+/// Charges `text.replace(old, new)`: an empty `old` puts `new` between every character.
+fn reserve_replace(
+    interp: &mut Interp,
+    text: &str,
+    old: &str,
+    new: &str,
+    count: i128,
+) -> Result<(), Error> {
+    let found = if old.is_empty() {
+        text.chars().count() + 1
+    } else {
+        text.matches(old).count()
+    };
+    let found = if count < 0 {
+        found
+    } else {
+        found.min(count_of(count))
+    };
+    interp.reserve(text.len().saturating_add(found.saturating_mul(new.len())))
 }

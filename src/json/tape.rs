@@ -72,6 +72,17 @@ impl Tape {
     ///
     /// The first problem in the document, by position.
     pub fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_as(bytes, false)
+    }
+
+    /// Like [`Tape::parse`], but reads what Python's `json.loads` reads and orjson does not: `NaN`,
+    /// `Infinity` and `-Infinity`, and numbers too large for a float, which are infinite. dbt writes
+    /// its artefacts with Python's `json`, which writes them.
+    pub fn parse_python(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse_as(bytes, true)
+    }
+
+    fn parse_as(bytes: &[u8], python: bool) -> Result<Self, Error> {
         if bytes.len() > MAX_LEN {
             return Err(Error {
                 message: "the document is larger than 2 GiB",
@@ -85,6 +96,7 @@ impl Tape {
             next: 0,
             entries: Vec::with_capacity(found.positions.len()),
             open: Vec::new(),
+            python,
         };
         let mut first = parser.document().err();
         let mut consider = |error: Error| {
@@ -160,7 +172,12 @@ impl<'a> Doc<'a> {
 
     /// The (key, value) tape indexes of an object's members, in order.
     pub fn members(self, object: usize) -> impl Iterator<Item = (usize, usize)> + 'a {
-        let end = self.entries[object].aux as usize;
+        // A value of another kind has no members, whatever its entry holds.
+        let end = if self.kind(object) == Kind::Object {
+            self.entries[object].aux as usize
+        } else {
+            object + 1
+        };
         let mut at = object + 1;
         std::iter::from_fn(move || {
             (at < end).then(|| {
@@ -173,7 +190,11 @@ impl<'a> Doc<'a> {
 
     /// The tape indexes of an array's items, in order.
     pub fn items(self, array: usize) -> impl Iterator<Item = usize> + 'a {
-        let end = self.entries[array].aux as usize;
+        let end = if self.kind(array) == Kind::Array {
+            self.entries[array].aux as usize
+        } else {
+            array + 1
+        };
         let mut at = array + 1;
         std::iter::from_fn(move || {
             (at < end).then(|| {
@@ -217,6 +238,15 @@ impl<'a> Doc<'a> {
         } else {
             self.raw(value) == expected.as_bytes()
         }
+    }
+
+    /// A number's text, and whether it is an integer as written (no fraction or exponent), which
+    /// may be larger than 64 bits.
+    pub fn number_text(self, number: usize) -> (&'a str, bool) {
+        let entry = self.entries[number];
+        let end = (entry.aux & !FLAG) as usize;
+        let text = std::str::from_utf8(&self.bytes[entry.at as usize..end]).expect("ASCII digits");
+        (text, entry.aux & FLAG == 0)
     }
 
     pub fn number(self, number: usize) -> Number {
@@ -309,6 +339,8 @@ struct Parser<'a> {
     entries: Vec<Entry>,
     /// The tape indexes of the objects and arrays not yet closed, innermost last.
     open: Vec<usize>,
+    /// Python's `json` dialect: `NaN`, `Infinity`, `-Infinity` and numbers beyond a float.
+    python: bool,
 }
 
 /// What the grammar expects next.
@@ -376,6 +408,7 @@ impl Parser<'_> {
                             self.number(at)?;
                             Expect::AfterValue
                         }
+                        b'N' | b'I' if self.python => self.constant(at)?,
                         b't' => self.literal(at, b"true")?,
                         b'f' => self.literal(at, b"false")?,
                         b'n' => self.literal(at, b"null")?,
@@ -491,7 +524,29 @@ impl Parser<'_> {
         Ok(Expect::AfterValue)
     }
 
+    /// `NaN`, `Infinity` or `-Infinity`, as a number.
+    fn constant(&mut self, at: usize) -> Result<Expect, Error> {
+        let rest = &self.bytes[at..];
+        let word = [&b"NaN"[..], b"Infinity", b"-Infinity"]
+            .into_iter()
+            .find(|word| rest.starts_with(word));
+        match word {
+            Some(word) if delimits(self.bytes, at + word.len()) => {
+                self.push(at, (at + word.len()) | FLAG as usize);
+                self.next += 1;
+                Ok(Expect::AfterValue)
+            }
+            _ => Err(Error {
+                message: "expected a value",
+                at,
+            }),
+        }
+    }
+
     fn number(&mut self, at: usize) -> Result<(), Error> {
+        if self.python && self.bytes[at..].starts_with(b"-Infinity") {
+            return self.constant(at).map(|_| ());
+        }
         let bytes = self.bytes;
         let digit = |p: usize| bytes.get(p).is_some_and(u8::is_ascii_digit);
         let digits = |mut p: usize| -> Result<usize, Error> {
@@ -532,7 +587,7 @@ impl Parser<'_> {
         }
         let text = std::str::from_utf8(&bytes[at..p]).expect("ASCII digits");
         let integer = !fraction && (text.parse::<i64>().is_ok() || text.parse::<u64>().is_ok());
-        if !integer && text.parse::<f64>().is_ok_and(f64::is_infinite) {
+        if !self.python && !integer && text.parse::<f64>().is_ok_and(f64::is_infinite) {
             return Err(Error {
                 message: "number out of range",
                 at,
@@ -597,6 +652,45 @@ mod tests {
             tape.doc(text.as_bytes()).text(0),
             "\u{1f600} \"\\/\u{8}\u{c}\n\r\t"
         );
+    }
+
+    #[test]
+    fn members_and_items_of_a_value_of_another_kind_are_none() {
+        let text = br#"{"a": "model", "b": [1], "c": {"d": 1}, "e": 5}"#;
+        let tape = Tape::parse(text).unwrap();
+        let doc = tape.doc(text);
+        let values: Vec<usize> = doc.members(0).map(|(_, v)| v).collect();
+        for value in &values {
+            let kind = doc.kind(*value);
+            assert_eq!(
+                doc.items(*value).count(),
+                if kind == Kind::Array { 1 } else { 0 }
+            );
+            assert_eq!(
+                doc.members(*value).count(),
+                if kind == Kind::Object { 1 } else { 0 }
+            );
+        }
+        assert_eq!(doc.items(0).count(), 0);
+        assert_eq!(doc.number_text(values[3]), ("5", true));
+    }
+
+    #[test]
+    fn python_reads_nan_infinity_and_numbers_beyond_a_float() {
+        let text = br#"[NaN, Infinity, -Infinity, 1e999, -1e999, 2]"#;
+        assert!(Tape::parse(text).is_err());
+        let tape = Tape::parse_python(text).unwrap();
+        let doc = tape.doc(text);
+        let numbers: Vec<Number> = doc.items(0).map(|i| doc.number(i)).collect();
+        assert!(matches!(numbers[0], Number::Float(n) if n.is_nan()));
+        assert_eq!(numbers[1], Number::Float(f64::INFINITY));
+        assert_eq!(numbers[2], Number::Float(f64::NEG_INFINITY));
+        assert_eq!(numbers[3], Number::Float(f64::INFINITY));
+        assert_eq!(numbers[4], Number::Float(f64::NEG_INFINITY));
+        assert_eq!(numbers[5], Number::Int(2));
+        for bad in ["NaNx", "Infinit", "-Inf", "nan", "[NaN NaN]"] {
+            assert!(Tape::parse_python(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]

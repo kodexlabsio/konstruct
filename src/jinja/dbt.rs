@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::builtins;
-use super::eval::{Callable, Error, Function, Host, Interp, Kwargs, Scope};
+use super::eval::{Budget, Callable, Error, Function, Host, Interp, Kwargs, Scope};
 use super::parse::parse;
 use super::value::{Object, Value};
 
@@ -34,6 +34,13 @@ pub struct Macros {
 
 pub struct Renderer {
     host: Rc<Host>,
+    /// What macros of the project and its packages were loaded with; kept so that the scopes
+    /// their macros point to (weakly) live as long as the renderer.
+    #[allow(dead_code)]
+    base: Rc<Host>,
+    #[allow(dead_code)]
+    modules: Vec<Rc<Scope>>,
+    budget: Rc<Budget>,
 }
 
 fn type_error(message: impl Into<String>) -> Error {
@@ -105,6 +112,88 @@ impl Object for Config {
 
     fn call(&self, _: &mut dyn Callable, _: &[Value], _: &Kwargs) -> Option<Result<Value, Error>> {
         Some(Ok(Value::from("")))
+    }
+}
+
+/// `target`: what a model reads of the profile's target, which no model may change, so that one
+/// model's `target.update(...)` is not another's.
+struct Target {
+    kind: String,
+}
+
+impl Target {
+    fn entries(&self) -> [(&'static str, Value); 4] {
+        [
+            ("type", Value::from(self.kind.as_str())),
+            ("name", Value::from("dev")),
+            ("schema", Value::from("")),
+            ("database", Value::from("")),
+        ]
+    }
+}
+
+impl Object for Target {
+    fn type_name(&self) -> &'static str {
+        "dict"
+    }
+
+    fn attr(&self, name: &str) -> Option<Value> {
+        self.entries()
+            .into_iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+    }
+
+    fn items(&self) -> Option<Vec<Value>> {
+        Some(
+            self.entries()
+                .into_iter()
+                .map(|(key, _)| Value::from(key))
+                .collect(),
+        )
+    }
+
+    fn method(
+        &self,
+        _: &mut dyn Callable,
+        name: &str,
+        args: &[Value],
+        kwargs: &Kwargs,
+    ) -> Option<Result<Value, Error>> {
+        Some(match name {
+            "get" => bind("get", &["key", "default"], 1, args, kwargs).map(|bound| {
+                let found = bound[0]
+                    .and_then(Value::as_str)
+                    .and_then(|key| self.attr(key));
+                found.or_else(|| bound[1].cloned()).unwrap_or(Value::None)
+            }),
+            "keys" => Ok(Value::list(self.items().unwrap_or_default())),
+            "values" => Ok(Value::list(
+                self.entries().into_iter().map(|(_, v)| v).collect(),
+            )),
+            "items" => Ok(Value::list(
+                self.entries()
+                    .into_iter()
+                    .map(|(k, v)| Value::tuple(vec![Value::from(k), v]))
+                    .collect(),
+            )),
+            "copy" => Ok(Value::dict(
+                self.entries()
+                    .into_iter()
+                    .map(|(k, v)| (Value::from(k), v))
+                    .collect(),
+            )),
+            _ => return None,
+        })
+    }
+
+    fn text(&self) -> String {
+        let inner: Vec<String> = self
+            .entries()
+            .iter()
+            .map(|(k, v)| format!("'{k}': {}", v.repr()))
+            .collect();
+        format!("{{{}}}", inner.join(", "))
     }
 }
 
@@ -260,7 +349,12 @@ impl Object for DbtBuiltins {
 
 /// The names of the macros a text defines, run once with dbt's inert context, or none when it does
 /// not parse or fails as it runs.
-fn load(text: &str, host: &Rc<Host>) -> HashMap<String, Value> {
+fn load(
+    text: &str,
+    host: &Rc<Host>,
+    budget: &Rc<Budget>,
+    modules: &mut Vec<Rc<Scope>>,
+) -> HashMap<String, Value> {
     if text.trim().is_empty() {
         return HashMap::new();
     }
@@ -268,10 +362,11 @@ fn load(text: &str, host: &Rc<Host>) -> HashMap<String, Value> {
         return HashMap::new();
     };
     let scope = Scope::root();
-    let mut interp = Interp::new(Rc::clone(host));
+    let mut interp = Interp::new(Rc::clone(host), Rc::clone(budget));
     if interp.run(&body, &scope).is_err() {
         return HashMap::new();
     }
+    modules.push(Rc::clone(&scope));
     scope
         .locals()
         .into_iter()
@@ -361,12 +456,9 @@ impl Renderer {
         );
         add(
             "target",
-            Value::dict(vec![
-                (Value::from("type"), Value::from(adapter_type)),
-                (Value::from("name"), Value::from("dev")),
-                (Value::from("schema"), Value::from("")),
-                (Value::from("database"), Value::from("")),
-            ]),
+            Value::Object(Rc::new(Target {
+                kind: adapter_type.to_string(),
+            })),
         );
         add("execute", Value::Bool(false));
         add(
@@ -390,6 +482,8 @@ impl Renderer {
         for undefined in ["exceptions", "this", "modules"] {
             add(undefined, Value::Undefined);
         }
+        let budget = Rc::new(Budget::default());
+        let mut modules = Vec::new();
         let base = Rc::new(Host {
             names: names.clone(),
         });
@@ -400,7 +494,7 @@ impl Renderer {
         let mut packages: HashMap<String, Value> = HashMap::new();
         let mut macro_names: HashMap<String, Value> = HashMap::new();
         for (name, text) in &macros.packages {
-            let defined = load(text, &base);
+            let defined = load(text, &base, &budget, &mut modules);
             for (macro_name, value) in &defined {
                 macro_names
                     .entry(macro_name.clone())
@@ -408,7 +502,7 @@ impl Renderer {
             }
             packages.insert(name.clone(), Value::Object(Rc::new(Package(defined))));
         }
-        let own = load(&macros.own, &base);
+        let own = load(&macros.own, &base, &budget, &mut modules);
         macro_names.extend(
             own.iter()
                 .map(|(name, value)| (name.clone(), value.clone())),
@@ -421,12 +515,15 @@ impl Renderer {
         context.extend(packages);
         Renderer {
             host: Rc::new(Host { names: context }),
+            base,
+            modules,
+            budget,
         }
     }
 
     pub fn render(&self, sql: &str) -> Result<String, Error> {
         let body = parse(sql)?;
         let scope = Scope::root();
-        Interp::new(Rc::clone(&self.host)).run(&body, &scope)
+        Interp::new(Rc::clone(&self.host), Rc::clone(&self.budget)).run(&body, &scope)
     }
 }

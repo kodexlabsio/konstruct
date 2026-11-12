@@ -4,6 +4,7 @@
 //! file here and fails when it runs.
 
 use super::eval::Error;
+use super::stack::deeper;
 use super::value::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -331,6 +332,37 @@ fn lex_number(text: &str, from: usize, integer_only: bool) -> Result<(Tok, usize
     }
 }
 
+impl Expr {
+    /// Whether the value is known from the template alone, which Jinja2 works out as it compiles.
+    pub fn is_const(&self) -> bool {
+        match self {
+            Expr::Const(_) => true,
+            Expr::Tuple(items) | Expr::List(items) | Expr::Concat(items, _) => {
+                items.iter().all(Expr::is_const)
+            }
+            Expr::Dict(pairs) => pairs.iter().all(|(k, v)| k.is_const() && v.is_const()),
+            Expr::Neg(e) | Expr::Pos(e) | Expr::Not(e) => e.is_const(),
+            Expr::And(a, b) | Expr::Or(a, b) | Expr::Bin(_, a, b) => a.is_const() && b.is_const(),
+            Expr::Compare(first, rest) => {
+                first.is_const() && rest.iter().all(|(_, e)| e.is_const())
+            }
+            Expr::Cond(test, then, otherwise) => {
+                test.is_const()
+                    && then.is_const()
+                    && otherwise.as_ref().is_none_or(|e| e.is_const())
+            }
+            Expr::Filter(Some(subject), _, args) => {
+                subject.is_const()
+                    && args.iter().all(|a| match a {
+                        Arg::Pos(e) | Arg::Named(_, e) => e.is_const(),
+                        _ => false,
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Arg {
     Pos(Expr),
@@ -376,7 +408,9 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Bin(Bin, Box<Expr>, Box<Expr>),
     Compare(Box<Expr>, Vec<(Cmp, Expr)>),
-    Concat(Vec<Expr>),
+    /// `a ~ b`; the flag says every part is a constant, which Jinja2 joins as plain text before
+    /// anything is escaped.
+    Concat(Vec<Expr>, bool),
     Cond(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     Attr(Box<Expr>, String),
     Item(Box<Expr>, Box<Expr>),
@@ -400,18 +434,24 @@ pub struct Param {
     pub default: Option<Expr>,
 }
 
+/// Whether an output is escaped: known where it is written, or decided as it runs when the
+/// `autoescape` that governs it is not a constant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Esc {
+    Off,
+    On,
+    Dynamic,
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Text(String),
-    Output(Expr),
+    /// An expression's output, escaped when written inside `{% autoescape true %}`.
+    Output(Expr, Esc),
+    /// `{% autoescape %}`: its value, which the filters that escape see while the body runs.
+    Autoescape(Expr, Vec<Stmt>),
     If(Vec<(Expr, Vec<Stmt>)>, Vec<Stmt>),
-    For {
-        target: Target,
-        iter: Expr,
-        filter: Option<Expr>,
-        body: Vec<Stmt>,
-        otherwise: Vec<Stmt>,
-    },
+    For(std::rc::Rc<ForDef>),
     Set(Target, Expr),
     SetBlock(Target, Option<Expr>, Vec<Stmt>),
     Macro(std::rc::Rc<MacroDef>),
@@ -425,7 +465,20 @@ pub enum Stmt {
 }
 
 #[derive(Debug)]
+pub struct ForDef {
+    pub target: Target,
+    pub iter: Expr,
+    pub filter: Option<Expr>,
+    pub body: Vec<Stmt>,
+    pub otherwise: Vec<Stmt>,
+    /// `loop(children)` runs the body again over `children`.
+    pub recursive: bool,
+}
+
+#[derive(Debug)]
 pub struct MacroDef {
+    /// Whether it was written inside `{% autoescape true %}`: its text is then Markup.
+    pub escape: Esc,
     pub name: String,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
@@ -434,6 +487,7 @@ pub struct MacroDef {
 pub fn parse(source: &str) -> Result<Vec<Stmt>, Error> {
     let tokens = tokenize(source)?;
     let mut parser = Parser {
+        escape: Esc::Off,
         tokens,
         at: 0,
         depth: 0,
@@ -449,9 +503,13 @@ struct Parser {
     tokens: Vec<Tok>,
     at: usize,
     depth: usize,
+    /// Whether the text being parsed is inside `{% autoescape true %}`.
+    escape: Esc,
 }
 
-const MAX_DEPTH: usize = 80;
+/// How deep an expression or a block may nest, counting each link of a chain (`a + b + c`, `a.b.c`,
+/// `x|f|g`) as a level, since a chain is a tree as deep as it is long.
+const MAX_DEPTH: usize = 200;
 
 impl Parser {
     fn peek(&self) -> &Tok {
@@ -518,7 +576,7 @@ impl Parser {
     /// the rest of its block), or to the end of the template when `ends` is empty.
     fn statements(&mut self, ends: &[&str]) -> Result<(Vec<Stmt>, Option<String>), Error> {
         self.enter()?;
-        let found = self.statements_in(ends);
+        let found = deeper(|| self.statements_in(ends));
         self.depth -= 1;
         found
     }
@@ -540,7 +598,7 @@ impl Parser {
                     if self.next() != Tok::VarEnd {
                         return Err(lex_error("expected '}}'"));
                     }
-                    body.push(Stmt::Output(expr));
+                    body.push(Stmt::Output(expr, self.escape));
                 }
                 Tok::BlockBegin => {
                     let tag = self.name()?;
@@ -566,6 +624,7 @@ impl Parser {
                 let (body, _) = self.statements(&["endmacro"])?;
                 self.skip_name_then_end()?;
                 Ok(Stmt::Macro(std::rc::Rc::new(MacroDef {
+                    escape: self.escape,
                     name,
                     params,
                     body,
@@ -582,6 +641,7 @@ impl Parser {
                 let (body, _) = self.statements(&["endcall"])?;
                 self.block_end()?;
                 let def = MacroDef {
+                    escape: self.escape,
                     name: "caller".into(),
                     params,
                     body,
@@ -618,7 +678,7 @@ impl Parser {
             "print" => {
                 let expr = self.expression()?;
                 self.block_end()?;
-                Ok(Stmt::Output(expr))
+                Ok(Stmt::Output(expr, self.escape))
             }
             "block" => {
                 self.name()?;
@@ -631,11 +691,19 @@ impl Parser {
                 Ok(Stmt::Block(body))
             }
             "autoescape" => {
-                self.expression()?;
+                let flag = self.expression()?;
+                let mode = match &flag {
+                    Expr::Const(value) if value.truthy() => Esc::On,
+                    Expr::Const(_) => Esc::Off,
+                    _ => Esc::Dynamic,
+                };
                 self.block_end()?;
-                let (body, _) = self.statements(&["endautoescape"])?;
+                let saved = std::mem::replace(&mut self.escape, mode);
+                let found = self.statements(&["endautoescape"]);
+                self.escape = saved;
+                let (body, _) = found?;
                 self.block_end()?;
-                Ok(Stmt::Block(body))
+                Ok(Stmt::Autoescape(flag, body))
             }
             "include" | "import" | "from" | "extends" => {
                 while !matches!(self.peek(), Tok::BlockEnd | Tok::Eof) {
@@ -688,9 +756,7 @@ impl Parser {
         } else {
             None
         };
-        if self.is_name("recursive") {
-            return Err(lex_error("recursive loops are not supported"));
-        }
+        let recursive = self.skip_name("recursive");
         self.block_end()?;
         let (body, end) = self.statements(&["endfor", "else"])?;
         let mut otherwise = Vec::new();
@@ -699,13 +765,14 @@ impl Parser {
             otherwise = self.statements(&["endfor"])?.0;
         }
         self.block_end()?;
-        Ok(Stmt::For {
+        Ok(Stmt::For(std::rc::Rc::new(ForDef {
             target,
             iter,
             filter,
             body,
             otherwise,
-        })
+            recursive,
+        })))
     }
 
     fn set_statement(&mut self) -> Result<Stmt, Error> {
@@ -780,6 +847,13 @@ impl Parser {
     }
 
     fn single_target(&mut self) -> Result<Target, Error> {
+        self.enter()?;
+        let found = deeper(|| self.single_target_in());
+        self.depth -= 1;
+        found
+    }
+
+    fn single_target_in(&mut self) -> Result<Target, Error> {
         if self.skip_op("(") {
             let mut items = Vec::new();
             while !self.is_op(")") {
@@ -818,6 +892,11 @@ impl Parser {
         Ok(Expr::Tuple(items))
     }
 
+    /// One more link in a chain of operators, attributes or filters.
+    fn link(&mut self) -> Result<(), Error> {
+        self.enter()
+    }
+
     fn enter(&mut self) -> Result<(), Error> {
         self.depth += 1;
         if self.depth > MAX_DEPTH {
@@ -827,9 +906,15 @@ impl Parser {
     }
 
     pub fn expression(&mut self) -> Result<Expr, Error> {
+        deeper(|| self.expression_in())
+    }
+
+    fn expression_in(&mut self) -> Result<Expr, Error> {
         self.enter()?;
+        let base = self.depth;
         let mut expr = self.or_expression()?;
         while self.skip_name("if") {
+            self.link()?;
             let test = self.or_expression()?;
             let otherwise = if self.skip_name("else") {
                 Some(Box::new(self.expression()?))
@@ -838,31 +923,38 @@ impl Parser {
             };
             expr = Expr::Cond(Box::new(test), Box::new(expr), otherwise);
         }
-        self.depth -= 1;
+        self.depth = base - 1;
         Ok(expr)
     }
 
     fn or_expression(&mut self) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut left = self.and_expression()?;
         while self.skip_name("or") {
+            self.link()?;
             left = Expr::Or(Box::new(left), Box::new(self.and_expression()?));
         }
+        self.depth = base;
         Ok(left)
     }
 
     fn and_expression(&mut self) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut left = self.not_expression()?;
         while self.skip_name("and") {
+            self.link()?;
             left = Expr::And(Box::new(left), Box::new(self.not_expression()?));
         }
+        self.depth = base;
         Ok(left)
     }
 
     fn not_expression(&mut self) -> Result<Expr, Error> {
         if self.skip_name("not") {
             self.enter()?;
-            let inner = self.not_expression()?;
+            let inner = deeper(|| self.not_expression());
             self.depth -= 1;
+            let inner = inner?;
             return Ok(Expr::Not(Box::new(inner)));
         }
         self.compare()
@@ -899,6 +991,7 @@ impl Parser {
     }
 
     fn sum(&mut self) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut left = self.concat()?;
         loop {
             let op = if self.is_op("+") {
@@ -906,8 +999,10 @@ impl Parser {
             } else if self.is_op("-") {
                 Bin::Sub
             } else {
+                self.depth = base;
                 return Ok(left);
             };
+            self.link()?;
             self.at += 1;
             left = Expr::Bin(op, Box::new(left), Box::new(self.concat()?));
         }
@@ -921,11 +1016,13 @@ impl Parser {
         Ok(if parts.len() == 1 {
             parts.remove(0)
         } else {
-            Expr::Concat(parts)
+            let constant = parts.iter().all(Expr::is_const);
+            Expr::Concat(parts, constant)
         })
     }
 
     fn product(&mut self) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut left = self.power()?;
         loop {
             let op = match self.peek() {
@@ -933,23 +1030,35 @@ impl Parser {
                 Tok::Op("/") => Bin::Div,
                 Tok::Op("//") => Bin::FloorDiv,
                 Tok::Op("%") => Bin::Mod,
-                _ => return Ok(left),
+                _ => {
+                    self.depth = base;
+                    return Ok(left);
+                }
             };
+            self.link()?;
             self.at += 1;
             left = Expr::Bin(op, Box::new(left), Box::new(self.power()?));
         }
     }
 
     fn power(&mut self) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut left = self.unary(true)?;
         while self.skip_op("**") {
+            self.link()?;
             left = Expr::Bin(Bin::Pow, Box::new(left), Box::new(self.unary(true)?));
         }
+        self.depth = base;
         Ok(left)
     }
 
     fn unary(&mut self, with_filter: bool) -> Result<Expr, Error> {
+        deeper(|| self.unary_in(with_filter))
+    }
+
+    fn unary_in(&mut self, with_filter: bool) -> Result<Expr, Error> {
         self.enter()?;
+        let base = self.depth;
         let mut node = if self.skip_op("-") {
             Expr::Neg(Box::new(self.unary(false)?))
         } else if self.skip_op("+") {
@@ -961,11 +1070,15 @@ impl Parser {
         if with_filter {
             node = self.filter_chain(Some(node))?;
         }
-        self.depth -= 1;
+        self.depth = base - 1;
         Ok(node)
     }
 
     fn primary(&mut self) -> Result<Expr, Error> {
+        deeper(|| self.primary_in())
+    }
+
+    fn primary_in(&mut self) -> Result<Expr, Error> {
         match self.next() {
             Tok::Name(name) => Ok(match name.as_str() {
                 "true" | "True" => Expr::Const(Value::Bool(true)),
@@ -1037,7 +1150,11 @@ impl Parser {
     }
 
     fn postfix(&mut self, mut node: Expr) -> Result<Expr, Error> {
+        let base = self.depth;
         loop {
+            if self.is_op(".") || self.is_op("[") || self.is_op("(") {
+                self.link()?;
+            }
             if self.skip_op(".") {
                 match self.next() {
                     Tok::Name(name) => node = Expr::Attr(Box::new(node), name),
@@ -1055,6 +1172,7 @@ impl Parser {
                 let args = self.call_args()?;
                 node = Expr::Call(Box::new(node), args);
             } else {
+                self.depth = base;
                 return Ok(node);
             }
         }
@@ -1128,9 +1246,13 @@ impl Parser {
     /// Filters (`| name(args)`) and tests (`is [not] name arg`) after an expression; with `None`
     /// the chain is the one of a `{% filter %}` block and starts at the filter's name.
     fn filter_chain(&mut self, start: Option<Expr>) -> Result<Expr, Error> {
+        let base = self.depth;
         let mut node = start;
         let mut first = node.is_none();
         loop {
+            if first || self.is_op("|") || self.is_name("is") {
+                self.link()?;
+            }
             if first || self.is_op("|") {
                 if !first {
                     self.at += 1;
@@ -1181,6 +1303,7 @@ impl Parser {
                 let callee = node.take().ok_or_else(|| lex_error("nothing to call"))?;
                 node = Some(Expr::Call(Box::new(callee), args));
             } else {
+                self.depth = base;
                 return node.ok_or_else(|| lex_error("expected a filter"));
             }
         }

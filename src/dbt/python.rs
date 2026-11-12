@@ -5,13 +5,15 @@
 //! same order, with the same attributes, so graph.json is byte for byte what it was.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::{Component, Path, PathBuf};
 
-use pyo3::exceptions::PyKeyError;
+use pyo3::exceptions::{PyKeyError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString};
 
-use crate::jinja::python::{macro_text, variables_of};
+use crate::jinja::python::{guarded, macro_text, variables_of};
 use crate::jinja::{Macros, Renderer, Tables};
 use crate::json::tape::{Doc, Kind, Number, Tape};
 use crate::model::{Graph, Node};
@@ -42,7 +44,8 @@ impl Artefact {
 #[pyfunction]
 pub fn read_artefact(path: PathBuf) -> Option<Artefact> {
     let bytes = std::fs::read(path).ok()?;
-    let tape = Tape::parse(&bytes).ok()?;
+    // dbt writes its artefacts with Python's json, which writes NaN and Infinity.
+    let tape = Tape::parse_python(&bytes).ok()?;
     (tape.doc(&bytes).kind(0) == Kind::Object).then_some(Artefact { bytes, tape })
 }
 
@@ -59,9 +62,58 @@ fn get(doc: Doc<'_>, object: usize, key: &str) -> Option<usize> {
     if doc.kind(object) != Kind::Object {
         return None;
     }
+    // A key that is repeated has its last value, as `json.loads` has it.
     doc.members(object)
-        .find(|(name, _)| doc.is(*name, key))
+        .filter(|(name, _)| doc.is(*name, key))
         .map(|(_, value)| value)
+        .last()
+}
+
+/// The members of an object as `json.loads` makes its dict: a key repeated keeps its first place
+/// and its last value.
+fn unique_members(doc: Doc<'_>, object: usize) -> Vec<(usize, usize)> {
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut places: HashMap<Cow<'_, str>, usize> = HashMap::new();
+    for (name, value) in doc.members(object) {
+        match places.entry(doc.text(name)) {
+            Entry::Occupied(place) => found[*place.get()].1 = value,
+            Entry::Vacant(place) => {
+                place.insert(found.len());
+                found.push((name, value));
+            }
+        }
+    }
+    found
+}
+
+/// A catalog, with its nodes and sources by id so that each model finds its entry at once.
+struct CatalogView<'a> {
+    doc: Doc<'a>,
+    /// Python's truth of the whole catalog: an empty one lists nothing.
+    content: bool,
+    nodes: HashMap<Cow<'a, str>, usize>,
+    sources: HashMap<Cow<'a, str>, usize>,
+}
+
+impl<'a> CatalogView<'a> {
+    fn new(doc: Doc<'a>) -> Self {
+        let group = |name: &str| -> HashMap<Cow<'a, str>, usize> {
+            get(doc, 0, name)
+                .map(|g| {
+                    unique_members(doc, g)
+                        .into_iter()
+                        .map(|(key, value)| (doc.text(key), value))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        CatalogView {
+            doc,
+            content: truthy(doc, 0),
+            nodes: group("nodes"),
+            sources: group("sources"),
+        }
+    }
 }
 
 /// `get`, but a null is as good as a missing member, as `dict.get(key) or default` has it.
@@ -116,7 +168,15 @@ fn to_py<'py>(py: Python<'py>, doc: Doc<'_>, value: usize) -> PyResult<Bound<'py
         Kind::Number => match doc.number(value) {
             Number::Int(n) => PyInt::new(py, n).into_any(),
             Number::UInt(n) => PyInt::new(py, n).into_any(),
-            Number::Float(n) => PyFloat::new(py, n).into_any(),
+            Number::Float(n) => {
+                let (text, integer) = doc.number_text(value);
+                if integer {
+                    // An integer too large for 64 bits is still an integer, as in Python.
+                    py.get_type::<PyInt>().call1((text,))?
+                } else {
+                    PyFloat::new(py, n).into_any()
+                }
+            }
         },
         Kind::Array => {
             let list = PyList::empty(py);
@@ -133,6 +193,15 @@ fn to_py<'py>(py: Python<'py>, doc: Doc<'_>, value: usize) -> PyResult<Bound<'py
             dict.into_any()
         }
     })
+}
+
+/// A node's id, which must be text.
+fn node_id<'py>(py: Python<'py>, doc: Doc<'_>, item: usize) -> PyResult<Bound<'py, PyAny>> {
+    match get(doc, item, "unique_id") {
+        Some(id) if doc.kind(id) == Kind::String => to_py(py, doc, id),
+        Some(_) => Err(PyTypeError::new_err("a node's unique_id is not text")),
+        None => Err(PyKeyError::new_err("unique_id")),
+    }
 }
 
 /// `str(value)` of a JSON value.
@@ -368,14 +437,15 @@ fn primary_key(py: Python<'_>, doc: Doc<'_>, item: usize) -> PyResult<Vec<String
 /// The columns the catalog lists for `unique_id`, in the order of their index: name, type and
 /// comment.
 fn catalog_columns<'a>(
-    catalog: Option<Doc<'a>>,
+    catalog: Option<&CatalogView<'a>>,
     unique_id: &str,
 ) -> Vec<(Cow<'a, str>, Option<usize>, Option<String>)> {
-    let Some(doc) = catalog else {
+    let Some(catalog) = catalog else {
         return Vec::new();
     };
-    let entry = ["nodes", "sources"].iter().find_map(|group| {
-        let found = get(doc, 0, group).and_then(|g| get(doc, g, unique_id))?;
+    let doc = catalog.doc;
+    let entry = [&catalog.nodes, &catalog.sources].iter().find_map(|group| {
+        let found = *group.get(unique_id)?;
         truthy(doc, found).then_some(found)
     });
     let Some(columns) = entry
@@ -384,8 +454,8 @@ fn catalog_columns<'a>(
     else {
         return Vec::new();
     };
-    let mut listed: Vec<usize> = doc
-        .members(columns)
+    let mut listed: Vec<usize> = unique_members(doc, columns)
+        .into_iter()
         .map(|(_, column)| column)
         .filter(|c| doc.kind(*c) == Kind::Object)
         .collect();
@@ -418,9 +488,9 @@ fn add_columns<'py>(
     parent: &Bound<'py, Node>,
     doc: Doc<'_>,
     item: usize,
-    catalog: Option<Doc<'_>>,
-    catalog_has_content: bool,
+    catalog: Option<&CatalogView<'_>>,
 ) -> PyResult<bool> {
+    let catalog_has_content = catalog.is_some_and(|c| c.content);
     let py = graph.py();
     let keys = primary_key(py, doc, item)?;
     if !keys.is_empty() {
@@ -438,29 +508,30 @@ fn add_columns<'py>(
     }
     // The documented columns by lower-case name, the first of a name keeping its place.
     let mut documented: Vec<(String, usize)> = Vec::new();
+    let mut place: HashMap<String, usize> = HashMap::new();
     if let Some(columns) = present(doc, item, "columns").filter(|c| doc.kind(*c) == Kind::Object) {
-        for (name, column) in doc.members(columns) {
+        for (name, column) in unique_members(doc, columns) {
             if doc.kind(column) != Kind::Object {
                 continue;
             }
             let lower = doc.text(name).to_lowercase();
-            match documented.iter_mut().find(|(known, _)| *known == lower) {
-                Some(slot) => slot.1 = column,
-                None => documented.push((lower, column)),
+            match place.entry(lower.clone()) {
+                Entry::Occupied(slot) => documented[*slot.get()].1 = column,
+                Entry::Vacant(slot) => {
+                    slot.insert(documented.len());
+                    documented.push((lower, column));
+                }
             }
         }
     }
     let unique_id = text(doc, item, "unique_id").unwrap_or_default();
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, data_type, comment) in catalog_columns(catalog, &unique_id) {
         let lower = name.to_lowercase();
-        let doc_column = documented
-            .iter()
-            .find(|(known, _)| *known == lower)
-            .map(|(_, column)| *column);
+        let doc_column = place.get(&lower).map(|at| documented[*at].1);
         // The type is a value of the catalog; the documentation's is the manifest's.
         let from_catalog =
-            catalog.and_then(|c| data_type.filter(|t| truthy(c, *t)).map(|t| (c, t)));
+            catalog.and_then(|c| data_type.filter(|t| truthy(c.doc, *t)).map(|t| (c.doc, t)));
         let data_type = match from_catalog {
             Some((c, found)) => Some(to_py(py, c, found)?),
             None => match doc_column.and_then(|c| get(doc, c, "data_type")) {
@@ -480,7 +551,7 @@ fn add_columns<'py>(
             Some(PyString::new(py, "dbt").into_any().unbind()),
             None,
         )?;
-        seen.push(lower);
+        seen.insert(lower);
     }
     for (lower, column) in &documented {
         if seen.contains(lower) {
@@ -608,7 +679,7 @@ fn add_test<'py>(
     }
     let created = node(
         py,
-        member(py, doc, item, "unique_id")?,
+        node_id(py, doc, item)?,
         "test",
         member(py, doc, item, "name")?,
         None,
@@ -683,7 +754,7 @@ impl Artefact {
         nonempty(doc, metadata, "project_name").map(Cow::into_owned)
     }
 
-    /// The packages the manifest's macros come from, one per macro.
+    /// The packages the manifest's macros come from.
     fn macro_packages(&self) -> Vec<String> {
         let doc = self.doc();
         let Some(macros) = get(doc, 0, "macros").filter(|m| doc.kind(*m) == Kind::Object) else {
@@ -692,8 +763,8 @@ impl Artefact {
         doc.members(macros)
             .filter(|(_, m)| doc.kind(*m) == Kind::Object)
             .map(|(_, m)| match get(doc, m, "package_name") {
-                Some(name) if doc.kind(name) == Kind::String => doc.text(name).into_owned(),
-                _ => "None".to_string(),
+                Some(name) => str_of_plain(doc, name),
+                None => "None".to_string(),
             })
             .collect()
     }
@@ -734,249 +805,287 @@ impl Artefact {
         keep: Option<Bound<'py, PyAny>>,
         variables: Option<Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let _ = project_name;
-        let doc = self.doc();
-        let catalog_doc = catalog.map(Artefact::doc);
-        let catalog_has_content = catalog_doc.is_some_and(|c| truthy(c, 0));
-        let ctx = Context {
-            root: &root,
-            graph_root: &graph_root,
-            dialect: dialect.as_deref(),
-        };
-        let edit = Edit {
-            graph,
-            exact: Graph::is_exact(graph),
-            origin: {
-                let origin = PyDict::new(py);
-                origin.set_item("origin", "dbt")?;
-                origin
-            },
-        };
-        let nodes = get(doc, 0, "nodes").filter(|n| doc.kind(*n) == Kind::Object);
-        let members: Vec<usize> = nodes
-            .map(|n| doc.members(n).map(|(_, v)| v).collect())
-            .unwrap_or_default();
+        guarded(|| {
+            let _ = project_name;
+            let doc = self.doc();
+            let view = catalog.map(|c| CatalogView::new(c.doc()));
+            let view = view.as_ref();
+            let ctx = Context {
+                root: &root,
+                graph_root: &graph_root,
+                dialect: dialect.as_deref(),
+            };
+            let edit = Edit {
+                graph,
+                exact: Graph::is_exact(graph),
+                origin: {
+                    let origin = PyDict::new(py);
+                    origin.set_item("origin", "dbt")?;
+                    origin
+                },
+            };
+            let nodes = get(doc, 0, "nodes").filter(|n| doc.kind(*n) == Kind::Object);
+            let members: Vec<usize> = nodes
+                .map(|n| {
+                    unique_members(doc, n)
+                        .into_iter()
+                        .map(|(_, v)| v)
+                        .filter(|v| doc.kind(*v) == Kind::Object)
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        let mut models: Vec<Model<'py>> = Vec::new();
-        let mut renderer: Option<Renderer> = None;
-        let mut catalogued: Vec<Bound<'py, PyAny>> = Vec::new();
-        let mut schemas: Vec<(SchemaKey, usize)> = Vec::new();
-        let mut unrendered: Vec<usize> = Vec::new();
-        let mut raws: Vec<(usize, String)> = Vec::new();
-        for &item in &members {
-            let resource = text(doc, item, "resource_type").unwrap_or_default();
-            let kind = match resource.as_ref() {
-                "model" => "model",
-                "seed" => "seed",
-                "snapshot" => "snapshot",
-                _ => continue,
-            };
-            let relation = ctx.relation(doc, item);
-            let config = present(doc, item, "config");
-            let name = match get(doc, item, "alias").filter(|a| truthy(doc, *a)) {
-                Some(alias) => to_py(py, doc, alias)?,
-                None => to_py(
-                    py,
-                    doc,
-                    get(doc, item, "name").ok_or_else(|| PyKeyError::new_err("name"))?,
-                )?,
-            };
-            let id = get(doc, item, "unique_id").ok_or_else(|| PyKeyError::new_err("unique_id"))?;
-            let created = node(
-                py,
-                to_py(py, doc, id)?,
-                kind,
-                name,
-                relation.clone(),
-                description(doc, item, "description"),
-                ctx.path(doc, item),
-                relation_attrs(py, doc, item, config)?,
-            )?;
-            let created = edit.node(&created)?;
-            let node_id = created.borrow().id.bind(py).clone();
-            if add_columns(graph, &created, doc, item, catalog_doc, catalog_has_content)? {
-                catalogued.push(node_id.clone());
-            }
-            let upstream: Vec<String> =
-                match get(doc, item, "depends_on").and_then(|d| get(doc, d, "nodes")) {
-                    Some(listed) => doc
-                        .items(listed)
-                        .filter_map(|n| string(doc, n))
-                        .filter(|n| !n.starts_with("macro."))
-                        .map(Cow::into_owned)
-                        .collect(),
-                    None => Vec::new(),
+            let mut models: Vec<Model<'py>> = Vec::new();
+            let mut renderer: Option<Renderer> = None;
+            let mut catalogued: Vec<Bound<'py, PyAny>> = Vec::new();
+            let mut schemas: Vec<(SchemaKey, usize)> = Vec::new();
+            let mut unrendered: Vec<usize> = Vec::new();
+            let mut raws: Vec<(usize, String)> = Vec::new();
+            for &item in &members {
+                let resource = text(doc, item, "resource_type").unwrap_or_default();
+                let kind = match resource.as_ref() {
+                    "model" => "model",
+                    "seed" => "seed",
+                    "snapshot" => "snapshot",
+                    _ => continue,
                 };
-            for parent in &upstream {
-                edit.feeds(PyString::new(py, parent).as_any(), &node_id)?;
-            }
-            let key = (
-                nonempty_or_none(doc, item, "database"),
-                nonempty_or_none(doc, item, "schema"),
-            );
-            match schemas.iter_mut().find(|(known, _)| *known == key) {
-                Some(slot) => slot.1 += 1,
-                None => schemas.push((key, 1)),
-            }
-            let Some(relation) = relation.filter(|r| kind != "seed" && !r.is_empty()) else {
-                continue;
-            };
-            if let Some(compiled) = get(doc, item, "compiled_code").filter(|c| truthy(doc, *c)) {
-                let sql = string(doc, compiled).map_or_else(String::new, Cow::into_owned);
-                models.push((node_id, relation, Some(sql), true, upstream));
-            } else if let Some(raw) = nonempty(doc, item, "raw_code") {
-                let is_sql = get(doc, item, "language").is_none_or(|l| doc.is(l, "sql"));
-                if !is_sql {
-                    continue;
-                }
-                if renderer.is_none() {
-                    renderer = Some(self.renderer(
+                let relation = ctx.relation(doc, item);
+                let config = present(doc, item, "config");
+                let name = match get(doc, item, "alias").filter(|a| truthy(doc, *a)) {
+                    Some(alias) => to_py(py, doc, alias)?,
+                    None => to_py(
                         py,
-                        &ctx,
-                        &root,
-                        macro_paths.as_deref(),
-                        keep.as_ref(),
-                        variables.as_ref(),
-                    )?);
+                        doc,
+                        get(doc, item, "name").ok_or_else(|| PyKeyError::new_err("name"))?,
+                    )?,
+                };
+                let id =
+                    get(doc, item, "unique_id").ok_or_else(|| PyKeyError::new_err("unique_id"))?;
+                if doc.kind(id) != Kind::String {
+                    return Err(PyTypeError::new_err("a node's unique_id is not text"));
                 }
-                let rendered = renderer.as_ref().and_then(|r| r.render(&raw).ok());
-                if rendered.is_none() {
-                    unrendered.push(models.len());
-                    raws.push((models.len(), raw.into_owned()));
-                }
-                models.push((node_id, relation, rendered, false, upstream));
-            }
-        }
-
-        let sources = get(doc, 0, "sources").filter(|s| doc.kind(*s) == Kind::Object);
-        for item in sources.iter().flat_map(|s| doc.members(*s).map(|(_, v)| v)) {
-            let attrs = PyDict::new(py);
-            attrs.set_item("source_name", member(py, doc, item, "source_name")?)?;
-            attrs.set_item("package", member(py, doc, item, "package_name")?)?;
-            // What the project says lands the table (`loader:` in sources.yml).
-            if let Some(loader) = get(doc, item, "loader").filter(|l| truthy(doc, *l)) {
-                attrs.set_item("declared_loader", to_py(py, doc, loader)?)?;
-            }
-            let name = match get(doc, item, "identifier").filter(|i| truthy(doc, *i)) {
-                Some(identifier) => to_py(py, doc, identifier)?,
-                None => to_py(
+                let created = node(
                     py,
-                    doc,
-                    get(doc, item, "name").ok_or_else(|| PyKeyError::new_err("name"))?,
-                )?,
-            };
-            let created = node(
-                py,
-                member(py, doc, item, "unique_id")?,
-                "source",
-                name,
-                ctx.relation(doc, item),
-                description(doc, item, "description")
-                    .or_else(|| description(doc, item, "source_description")),
-                ctx.path(doc, item),
-                attrs,
-            )?;
-            let created = edit.node(&created)?;
-            if add_columns(graph, &created, doc, item, catalog_doc, catalog_has_content)? {
-                catalogued.push(created.borrow().id.bind(py).clone());
-            }
-        }
-
-        let exposures = get(doc, 0, "exposures").filter(|s| doc.kind(*s) == Kind::Object);
-        for item in exposures
-            .iter()
-            .flat_map(|s| doc.members(*s).map(|(_, v)| v))
-        {
-            let owner = present(doc, item, "owner");
-            let attrs = PyDict::new(py);
-            for (key, value) in [
-                ("type", get(doc, item, "type")),
-                ("label", get(doc, item, "label")),
-                ("maturity", get(doc, item, "maturity")),
-                ("owner", owner.and_then(|o| get(doc, o, "name"))),
-                ("url", get(doc, item, "url")),
-            ] {
-                if let Some(value) = value.filter(|v| truthy(doc, *v)) {
-                    attrs.set_item(key, to_py(py, doc, value)?)?;
+                    to_py(py, doc, id)?,
+                    kind,
+                    name,
+                    relation.clone(),
+                    description(doc, item, "description"),
+                    ctx.path(doc, item),
+                    relation_attrs(py, doc, item, config)?,
+                )?;
+                let created = edit.node(&created)?;
+                let node_id = created.borrow().id.bind(py).clone();
+                if add_columns(graph, &created, doc, item, view)? {
+                    catalogued.push(node_id.clone());
+                }
+                let upstream: Vec<String> =
+                    match get(doc, item, "depends_on").and_then(|d| get(doc, d, "nodes")) {
+                        Some(listed) => doc
+                            .items(listed)
+                            .filter_map(|n| string(doc, n))
+                            .filter(|n| !n.starts_with("macro."))
+                            .map(Cow::into_owned)
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                for parent in &upstream {
+                    edit.feeds(PyString::new(py, parent).as_any(), &node_id)?;
+                }
+                let key = (
+                    nonempty_or_none(doc, item, "database"),
+                    nonempty_or_none(doc, item, "schema"),
+                );
+                match schemas.iter_mut().find(|(known, _)| *known == key) {
+                    Some(slot) => slot.1 += 1,
+                    None => schemas.push((key, 1)),
+                }
+                let Some(relation) = relation.filter(|r| kind != "seed" && !r.is_empty()) else {
+                    continue;
+                };
+                if let Some(compiled) = get(doc, item, "compiled_code").filter(|c| truthy(doc, *c))
+                {
+                    let sql = string(doc, compiled).map_or_else(String::new, Cow::into_owned);
+                    models.push((node_id, relation, Some(sql), true, upstream));
+                } else if let Some(raw) = nonempty(doc, item, "raw_code") {
+                    let is_sql = get(doc, item, "language").is_none_or(|l| doc.is(l, "sql"));
+                    if !is_sql {
+                        continue;
+                    }
+                    if renderer.is_none() {
+                        renderer = Some(self.renderer(
+                            py,
+                            &ctx,
+                            &root,
+                            macro_paths.as_deref(),
+                            keep.as_ref(),
+                            variables.as_ref(),
+                        )?);
+                    }
+                    let rendered = renderer.as_ref().and_then(|r| r.render(&raw).ok());
+                    if rendered.is_none() {
+                        unrendered.push(models.len());
+                        raws.push((models.len(), raw.into_owned()));
+                    }
+                    models.push((node_id, relation, rendered, false, upstream));
                 }
             }
-            let created = node(
-                py,
-                member(py, doc, item, "unique_id")?,
-                "exposure",
-                member(py, doc, item, "name")?,
-                None,
-                description(doc, item, "description"),
-                ctx.path(doc, item),
-                attrs,
-            )?;
-            let created = edit.node(&created)?;
-            let id = created.borrow().id.bind(py).clone();
-            if let Some(listed) = get(doc, item, "depends_on").and_then(|d| get(doc, d, "nodes")) {
-                for parent in doc.items(listed) {
-                    edit.feeds(&to_py(py, doc, parent)?, &id)?;
+
+            let sources = get(doc, 0, "sources").filter(|s| doc.kind(*s) == Kind::Object);
+            for item in sources
+                .iter()
+                .flat_map(|s| unique_members(doc, *s).into_iter().map(|(_, v)| v))
+                .filter(|v| doc.kind(*v) == Kind::Object)
+            {
+                let attrs = PyDict::new(py);
+                attrs.set_item("source_name", member(py, doc, item, "source_name")?)?;
+                attrs.set_item("package", member(py, doc, item, "package_name")?)?;
+                // What the project says lands the table (`loader:` in sources.yml).
+                if let Some(loader) = get(doc, item, "loader").filter(|l| truthy(doc, *l)) {
+                    attrs.set_item("declared_loader", to_py(py, doc, loader)?)?;
+                }
+                let name = match get(doc, item, "identifier").filter(|i| truthy(doc, *i)) {
+                    Some(identifier) => to_py(py, doc, identifier)?,
+                    None => to_py(
+                        py,
+                        doc,
+                        get(doc, item, "name").ok_or_else(|| PyKeyError::new_err("name"))?,
+                    )?,
+                };
+                let created = node(
+                    py,
+                    node_id(py, doc, item)?,
+                    "source",
+                    name,
+                    ctx.relation(doc, item),
+                    description(doc, item, "description")
+                        .or_else(|| description(doc, item, "source_description")),
+                    ctx.path(doc, item),
+                    attrs,
+                )?;
+                let created = edit.node(&created)?;
+                if add_columns(graph, &created, doc, item, view)? {
+                    catalogued.push(created.borrow().id.bind(py).clone());
                 }
             }
-        }
 
-        for &item in &members {
-            if text(doc, item, "resource_type").as_deref() == Some("test") {
-                add_test(&edit, doc, item, &ctx)?;
+            let exposures = get(doc, 0, "exposures").filter(|s| doc.kind(*s) == Kind::Object);
+            for item in exposures
+                .iter()
+                .flat_map(|s| unique_members(doc, *s).into_iter().map(|(_, v)| v))
+                .filter(|v| doc.kind(*v) == Kind::Object)
+            {
+                let owner = present(doc, item, "owner");
+                let attrs = PyDict::new(py);
+                for (key, value) in [
+                    ("type", get(doc, item, "type")),
+                    ("label", get(doc, item, "label")),
+                    ("maturity", get(doc, item, "maturity")),
+                    ("owner", owner.and_then(|o| get(doc, o, "name"))),
+                    ("url", get(doc, item, "url")),
+                ] {
+                    if let Some(value) = value.filter(|v| truthy(doc, *v)) {
+                        attrs.set_item(key, to_py(py, doc, value)?)?;
+                    }
+                }
+                let created = node(
+                    py,
+                    node_id(py, doc, item)?,
+                    "exposure",
+                    member(py, doc, item, "name")?,
+                    None,
+                    description(doc, item, "description"),
+                    ctx.path(doc, item),
+                    attrs,
+                )?;
+                let created = edit.node(&created)?;
+                let id = created.borrow().id.bind(py).clone();
+                if let Some(listed) =
+                    get(doc, item, "depends_on").and_then(|d| get(doc, d, "nodes"))
+                {
+                    for parent in doc.items(listed) {
+                        edit.feeds(&to_py(py, doc, parent)?, &id)?;
+                    }
+                }
             }
-        }
 
-        let result = PyDict::new(py);
-        let rows = PyList::empty(py);
-        for (id, relation, sql, compiled, upstream) in models {
-            rows.append((id, relation, sql, compiled, upstream))?;
-        }
-        result.set_item("models", rows)?;
-        let failed = PyDict::new(py);
-        for (at, raw) in raws {
-            failed.set_item(at, raw)?;
-        }
-        result.set_item("unrendered", failed)?;
-        if !unrendered.is_empty() {
-            result.set_item("tables", self.tables(py, doc)?)?;
-        }
-        result.set_item("catalogued", PySet::new(py, catalogued)?)?;
-        let best = schemas
-            .iter()
-            .enumerate()
-            .fold(None::<usize>, |best, (at, (_, count))| match best {
-                Some(held) if schemas[held].1 >= *count => Some(held),
-                _ => Some(at),
-            });
-        let (catalog_name, schema_name) = best.map_or((None, None), |at| schemas[at].0.clone());
-        result.set_item("default_catalog", catalog_name)?;
-        result.set_item("default_schema", schema_name)?;
-        result.set_item(
-            "manifest_checksum",
-            present(doc, 0, "metadata")
-                .and_then(|m| get(doc, m, "invocation_id"))
-                .map(|v| to_py(py, doc, v))
-                .transpose()?,
-        )?;
-        let counts = PyDict::new(py);
-        for (kind, group) in [
-            ("model", "nodes"),
-            ("seed", "nodes"),
-            ("snapshot", "nodes"),
-            ("test", "nodes"),
-            ("source", "sources"),
-            ("exposure", "exposures"),
-        ] {
-            let count = get(doc, 0, group)
-                .filter(|g| doc.kind(*g) == Kind::Object)
-                .map_or(0, |g| {
-                    doc.members(g)
-                        .filter(|(_, v)| text(doc, *v, "resource_type").as_deref() == Some(kind))
-                        .count()
+            for &item in &members {
+                if text(doc, item, "resource_type").as_deref() == Some("test") {
+                    add_test(&edit, doc, item, &ctx)?;
+                }
+            }
+
+            let result = PyDict::new(py);
+            let rows = PyList::empty(py);
+            for (id, relation, sql, compiled, upstream) in models {
+                rows.append((id, relation, sql, compiled, upstream))?;
+            }
+            result.set_item("models", rows)?;
+            let failed = PyDict::new(py);
+            for (at, raw) in raws {
+                failed.set_item(at, raw)?;
+            }
+            result.set_item("unrendered", failed)?;
+            if !unrendered.is_empty() {
+                result.set_item("tables", self.tables(py, doc)?)?;
+            }
+            result.set_item("catalogued", PySet::new(py, catalogued)?)?;
+            let best = schemas
+                .iter()
+                .enumerate()
+                .fold(None::<usize>, |best, (at, (_, count))| match best {
+                    Some(held) if schemas[held].1 >= *count => Some(held),
+                    _ => Some(at),
                 });
-            counts.set_item(kind, count)?;
-        }
-        result.set_item("counts", counts)?;
-        Ok(result)
+            let (catalog_name, schema_name) = best.map_or((None, None), |at| schemas[at].0.clone());
+            result.set_item("default_catalog", catalog_name)?;
+            result.set_item("default_schema", schema_name)?;
+            result.set_item(
+                "manifest_checksum",
+                present(doc, 0, "metadata")
+                    .and_then(|m| get(doc, m, "invocation_id"))
+                    .map(|v| to_py(py, doc, v))
+                    .transpose()?,
+            )?;
+            let counts = PyDict::new(py);
+            for (kind, group) in [
+                ("model", "nodes"),
+                ("seed", "nodes"),
+                ("snapshot", "nodes"),
+                ("test", "nodes"),
+                ("source", "sources"),
+                ("exposure", "exposures"),
+            ] {
+                let count = get(doc, 0, group)
+                    .filter(|g| doc.kind(*g) == Kind::Object)
+                    .map_or(0, |g| {
+                        doc.members(g)
+                            .filter(|(_, v)| {
+                                text(doc, *v, "resource_type").as_deref() == Some(kind)
+                            })
+                            .count()
+                    });
+                counts.set_item(kind, count)?;
+            }
+            result.set_item("counts", counts)?;
+            Ok(result)
+        })
+    }
+}
+
+/// `str()` of a JSON scalar as Python writes it (a package name is text; null is `None`).
+fn str_of_plain(doc: Doc<'_>, value: usize) -> String {
+    match doc.kind(value) {
+        Kind::String => doc.text(value).into_owned(),
+        Kind::Null => "None".to_string(),
+        Kind::True => "True".to_string(),
+        Kind::False => "False".to_string(),
+        Kind::Number => match doc.number(value) {
+            Number::Int(n) => n.to_string(),
+            Number::UInt(n) => n.to_string(),
+            Number::Float(n) => crate::jinja::value::float_repr(n),
+        },
+        Kind::Array | Kind::Object => String::new(),
     }
 }
 
@@ -1023,13 +1132,13 @@ impl Artefact {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                packages.push((name, macro_text(py, &[package.join("macros")], keep)?));
+                packages.push((name, macro_text(py, root, &[package.join("macros")], keep)?));
             }
         }
         let bases = macro_paths.map_or_else(|| vec![root.join("macros")], <[PathBuf]>::to_vec);
         let macros = Macros {
             packages,
-            own: macro_text(py, &bases, keep)?,
+            own: macro_text(py, root, &bases, keep)?,
             project_name: from_metadata("project_name"),
             variables: variables_of(variables)?,
         };
@@ -1068,7 +1177,7 @@ impl Artefact {
         }
         for (_, item) in get(doc, 0, "sources")
             .into_iter()
-            .flat_map(|s| doc.members(s))
+            .flat_map(|s| unique_members(doc, s))
         {
             if let (Some(relation), Some(group), Some(name)) = (
                 nonempty(doc, item, "relation_name"),
