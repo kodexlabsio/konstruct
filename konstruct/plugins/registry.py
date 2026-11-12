@@ -48,6 +48,7 @@ BUILTINS: dict[str, tuple[tuple[str, str], ...]] = {
         ('owl', 'konstruct.outputs.export:OWL'),
         ('semantic-view', 'konstruct.outputs.export:SEMANTIC_VIEW'),
         ('metric-view', 'konstruct.outputs.export:METRIC_VIEW'),
+        ('odcs', 'konstruct.outputs.export:ODCS'),
     ),
     'checks': (
         ('breaking', 'konstruct.analysis.gate:BREAKING'),

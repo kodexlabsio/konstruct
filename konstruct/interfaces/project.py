@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from konstruct.analysis.checksql import HistoryCheck, SqlCheck
     from konstruct.analysis.compile import Compiled
     from konstruct.analysis.conflicts import Conflicts
+    from konstruct.analysis.contract import ContractCheck
     from konstruct.analysis.diff import Diff
     from konstruct.analysis.english import English
     from konstruct.analysis.erasure import ErasureMap
@@ -1006,8 +1007,9 @@ class Project:
                 lineage facets), ``mermaid``, ``dot``, ``csv`` (one row per column edge), or the
                 ontology as ``ossie`` (an Apache Ossie semantic model), ``owl`` (OWL 2 in Turtle),
                 ``semantic-view`` (a Snowflake ``CREATE SEMANTIC VIEW`` statement) or
-                ``metric-view`` (Databricks metric views), or a format a plugin the project enables
-                adds.
+                ``metric-view`` (Databricks metric views), ``odcs`` (ODCS 3.2 data contracts, one YAML
+                document per model that holds an entity or a measure), or a format a plugin the
+                project enables adds.
             select: Only the lineage, both directions, of this table or column (not for the
                 ontology formats).
             columns: For ``mermaid`` and ``dot``, draw columns and column lineage.
@@ -1035,6 +1037,37 @@ class Project:
         return export(
             self.graph, fmt, select=node, columns=columns, namespace=namespace, plugins=self.plugins()
         )
+
+    def check_contract(self, contract: str | Path) -> ContractCheck:
+        """Test the claims of an ODCS data contract against the graph.
+
+        The contract's columns and their types, its keys, the columns that never hold a null, its
+        relationships and its measures are each checked against what the graph knows, without
+        reading the warehouse. A claim is ``contradicted`` when the graph holds the opposite (or is
+        in the wrong shape) and ``unsupported`` when nothing in it says so. Konstruct runs no quality
+        rule: each is listed in :attr:`~konstruct.analysis.contract.ContractCheck.not_run`.
+
+        Args:
+            contract: The contract's text (one YAML document, or several), or a ``Path`` to read it from.
+
+        Returns:
+            The claims tested, the findings and the quality rules that were not run.
+
+        Raises:
+            konstruct.QueryError: The file cannot be read, or is not YAML or not a data contract.
+
+        Example::
+
+            result = project.check_contract(Path('contracts/orders.yml'))
+            assert result.ok, str(result)
+        """
+        from konstruct.analysis.contract import check_contract
+
+        try:
+            text = contract.read_text(encoding='utf-8') if isinstance(contract, Path) else contract
+            return check_contract(self.graph, text, self.ontology())
+        except (OSError, ValueError) as error:
+            raise query.QueryError(str(error)) from error
 
     def list(self, kinds: list[str] | None = None) -> query.Listing:
         """Every node of the given kinds.

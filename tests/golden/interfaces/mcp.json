@@ -14,6 +14,8 @@
  "mcp compile_metric where": "array of string|null = None",
  "mcp conflicts": "tool",
  "mcp conflicts limit": "integer = 20",
+ "mcp contract_check": "tool",
+ "mcp contract_check contract": "string, required",
  "mcp define": "tool",
  "mcp define ref": "string, required",
  "mcp definition_effect": "tool",

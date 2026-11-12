@@ -7,6 +7,7 @@ from __future__ import annotations
 import codecs
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -219,3 +220,99 @@ def test_the_hook_says_the_file_is_not_valid_yaml(tmp_path: Path, content: bytes
     assert hook.is_data_file(tmp_path / 'models' / 'schema.yml', tmp_path)
     (problem,) = hook._unreadable(tmp_path / 'dbt_project.yml', [])
     assert problem.startswith('dbt_project.yml is not valid YAML: ')
+
+
+# load_all: a stream of documents, read as load reads one
+
+
+@pytest.mark.parametrize('depth', [yamlio.LOAD_ALL_DEPTH + 1, 1_000, 50_000])
+def test_deep_nesting_is_refused_not_composed(depth: int) -> None:
+    text = 'a: ' + '[' * depth + ']' * depth + '\n'
+    with pytest.raises(yaml.YAMLError, match='nested too deeply'):
+        yamlio.load_all(text)
+
+
+def test_nesting_to_the_limit_is_read() -> None:
+    depth = yamlio.LOAD_ALL_DEPTH - 1
+    [value] = yamlio.load_all('[' * depth + ']' * depth)
+    assert isinstance(value, list)
+
+
+def test_a_value_pyyaml_cannot_construct_is_a_yaml_error_with_its_place() -> None:
+    with pytest.raises(yaml.YAMLError, match=r'2026-13-01|month') as caught:
+        yamlio.load_all('name: x\n---\nname: x\napproved: 2026-13-01\n')
+    mark = getattr(caught.value, 'problem_mark', None)
+    assert mark is not None
+    assert mark.line >= 2
+
+
+def test_aliases_that_stand_for_millions_of_values_are_refused() -> None:
+    with pytest.raises(yaml.YAMLError, match='aliases'):
+        yamlio.load_all(f'name: x\n---\n{ALIASES}')
+
+
+def test_a_few_aliases_are_read_and_empty_documents_left_out() -> None:
+    text = 'a: &x [1, 2]\nb: *x\n---\n---\nc: 3\n'
+    assert yamlio.load_all(text) == [{'a': [1, 2], 'b': [1, 2]}, {'c': 3}]
+
+
+def test_a_character_past_the_basic_plane_is_read_written_or_escaped() -> None:
+    assert yamlio.load_all('a: "\U0001f600"\nb: "\\ud83d\\ude00"\n') == [
+        {'a': '\U0001f600', 'b': '\U0001f600'}
+    ]
+
+
+def test_a_lone_surrogate_and_a_huge_sexagesimal_are_refused_at_once() -> None:
+    with pytest.raises(yaml.YAMLError, match='surrogate'):
+        yamlio.load_all('a: "\\ud800"\n')
+    started = time.perf_counter()
+    with pytest.raises(yaml.YAMLError, match='digits'):
+        yamlio.load_all('a: 1' + ':59' * 20_000 + '\n')
+    assert time.perf_counter() - started < 2
+
+
+def test_the_aliases_of_each_document_are_counted_on_their_own() -> None:
+    ok = 'a: &x [1, 2]\nb: *x\n'
+    assert yamlio.load_all(f'{ok}---\n{ok}---\nc: 1\n')[-1] == {'c': 1}
+    with pytest.raises(yaml.YAMLError, match='aliases'):
+        yamlio.load_all(f'c: 1\n---\n{ALIASES}---\nc: 2\n')
+
+
+def _bomb_stream(copies: int) -> str:
+    """A six level alias bomb of 268 bytes that stands for about 531,000 values, ``copies`` times."""
+    levels = ''.join(
+        f'{level}: &{level} [' + ', '.join([f'*{chr(ord(level) - 1)}' if level > 'a' else 'x'] * 9) + ']\n'
+        for level in 'abcdef'
+    )
+    return '---\n'.join([levels] * copies)
+
+
+def test_the_alias_budget_is_one_for_the_whole_stream() -> None:
+    # One copy is under a million values; ten are five million, which the stream must not expand.
+    assert len(yamlio.load_all(_bomb_stream(1))) == 1
+    started = time.perf_counter()
+    with pytest.raises(yaml.YAMLError, match='aliases'):
+        yamlio.load_all(_bomb_stream(10))
+    assert time.perf_counter() - started < 2
+    # Documents with a few aliases each are as many as a stream likes.
+    small = 'a: &x [1, 2]\nb: *x\n'
+    assert len(yamlio.load_all('---\n'.join([small] * 500))) == 500
+
+
+def _alias_chain(links: int, depth: int) -> str:
+    """A list ``depth`` deep, anchored, and ``links`` anchored lists that each hold the one before:
+    every line is shallow, and the last stands for ``depth + links`` levels."""
+    lines = [f'z0: &a0 {"[" * depth}{"]" * depth}']
+    lines += [f'z{i}: &a{i} [*a{i - 1}]' for i in range(1, links + 1)]
+    return '\n'.join(lines) + '\n'
+
+
+def test_nesting_through_aliases_counts_toward_the_depth_limit() -> None:
+    with pytest.raises(yaml.YAMLError, match='nested too deeply'):
+        yamlio.load_all(_alias_chain(900, 90))
+    with pytest.raises(yaml.YAMLError, match='nested too deeply'):
+        yamlio.load_all(_alias_chain(20, 90))
+    assert yamlio.load_all(_alias_chain(5, 20))
+    # An anchor that holds itself is nesting without end.
+    with pytest.raises(yaml.YAMLError, match=r'nested too deeply|aliases'):
+        yamlio.load_all('a: &a [*a]\n')

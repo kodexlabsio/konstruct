@@ -1,6 +1,6 @@
 """Export the graph for other tools: OpenLineage, Mermaid, Graphviz DOT and CSV, and the ontology
 for semantic platforms: Apache Ossie, OWL in Turtle, Snowflake semantic views and Databricks metric
-views.
+views, and as ODCS data contracts.
 
 * ``openlineage``: one OpenLineage ``JobEvent`` per relation that something builds (a dbt model,
   a SQL file, an Airflow or Dagster task's SQL), as JSON lines. Each lists its input datasets and
@@ -19,6 +19,8 @@ views.
 * ``semantic-view``: the ontology as a Snowflake semantic view (see
   :mod:`konstruct.outputs.semantic_view`).
 * ``metric-view``: the ontology as Databricks metric views (see :mod:`konstruct.outputs.metric_view`).
+* ``odcs``: the ontology as ODCS 3.2 data contracts, one YAML document per model (see
+  :mod:`konstruct.outputs.odcs`).
 
 ``select`` restricts the graph formats to the lineage of one node, upstream and downstream; the
 ontology formats are always the whole ontology.
@@ -139,7 +141,7 @@ def _ontology_format(fmt: str) -> Callable[[Graph, ExportRequest], str]:
     """The writer of an ontology format: the whole ontology, named after the project."""
 
     def write(graph: Graph, request: ExportRequest) -> str:
-        from konstruct.outputs import metric_view, owl, semantic_view
+        from konstruct.outputs import metric_view, odcs, owl, semantic_view
         from konstruct.semantics import ossie
         from konstruct.semantics.ontology import derive
 
@@ -150,6 +152,11 @@ def _ontology_format(fmt: str) -> Callable[[Graph, ExportRequest], str]:
         ontology = derive(graph)
         if fmt == 'owl':
             return owl.export(graph, ontology, name=name, iri=request.namespace)
+        if fmt == 'odcs':
+            try:
+                return odcs.export(graph, ontology, name)
+            except ValueError as error:
+                raise ExportError(str(error)) from error
         writers = {
             'ossie': ossie.export,
             'semantic-view': semantic_view.export,
@@ -184,6 +191,7 @@ OSSIE = BuiltinFormat('the ontology as an Apache Ossie semantic model', _ontolog
 OWL = BuiltinFormat('the ontology as OWL 2 in Turtle', _ontology_format('owl'))
 SEMANTIC_VIEW = BuiltinFormat('the ontology as a Snowflake semantic view', _ontology_format('semantic-view'))
 METRIC_VIEW = BuiltinFormat('the ontology as Databricks metric views', _ontology_format('metric-view'))
+ODCS = BuiltinFormat('the ontology as ODCS 3.2 data contracts', _ontology_format('odcs'))
 
 
 def _selection(graph: Graph, node: Node) -> set[str]:

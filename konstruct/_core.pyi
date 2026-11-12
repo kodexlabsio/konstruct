@@ -1,5 +1,5 @@
 """Konstruct's native core (the Rust crate in src/): graph traversal, name resolution, search,
-search by meaning, formula identity, topic routing, the readers of Airflow and Dagster files and
+search by meaning, formula identity, topic routing, ODCS data contracts, the readers of Airflow and Dagster files and
 the server. ``konstruct.core.graph``, ``konstruct.analysis.query``,
 ``konstruct.analysis.semantic`` and ``konstruct.analysis.identity`` are the callers of the
 indexes; nodes, edges and relations are passed in, and come back, as ordinals into the lists
@@ -846,3 +846,13 @@ def yaml_load_all(
     """The value of each document of the stream ``source``, an empty document left out, each read
     as :func:`yaml_load` reads one. The values aliases add are one budget of ``max_values`` for
     the whole stream."""
+
+def odcs_export(facts: str) -> str:
+    """ODCS 3.2 data contracts, as a stream of YAML documents, from the facts (a JSON document) that
+    ``konstruct.outputs.odcs.facts`` gathers. Raises ``ValueError`` when the facts are malformed (a lone
+    surrogate in a name is refused) or hold no model with an entity or a measure."""
+
+def odcs_check(facts: str, contracts: str) -> str:
+    """The result, as JSON, of testing the claims of the ODCS contracts (a JSON array of the parsed
+    documents) against the facts. Raises ``ValueError`` when either is not JSON (a lone surrogate
+    is refused) or a document is not a data contract."""
