@@ -827,6 +827,7 @@
  "json graph.json .meta.integrity.keys": "object",
  "json graph.json .meta.integrity.keys{}": "object",
  "json graph.json .meta.integrity.keys{}.detail": "str",
+ "json graph.json .meta.integrity.keys{}.nulls": "int",
  "json graph.json .meta.integrity.keys{}.state": "str",
  "json graph.json .meta.integrity.links": "object",
  "json graph.json .meta.integrity.links{}": "object",

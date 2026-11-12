@@ -186,9 +186,11 @@ def annotate(
     name = _warehouse_name(warehouse)
 
     def record(item: KeyCheck | LinkCheck) -> dict[str, Any]:
-        found = {'state': item.state, 'detail': f'{item.detail} ({name})'}
+        found: dict[str, Any] = {'state': item.state, 'detail': f'{item.detail} ({name})'}
         if isinstance(item, LinkCheck) and item.one_to_one in ('confirmed', 'failed'):
             found['one_to_one'] = item.one_to_one
+        if isinstance(item, KeyCheck):
+            found['nulls'] = item.nulls
         return found
 
     earlier = graph.meta.get('integrity') if partial else None

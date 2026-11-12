@@ -95,6 +95,16 @@ def test_duplicates_and_nulls_fail_the_key_and_its_relationships(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize('nulls', [0, 1, 3])
+def test_the_graph_records_how_many_nulls_a_key_holds(tmp_path: Path, nulls: int) -> None:
+    project = shop(tmp_path, nulls=nulls)
+    project.verify(warehouse=tmp_path / 'shop.duckdb')
+    keys = Project(tmp_path).graph.meta['integrity']['keys']
+    [record] = [v for k, v in keys.items() if k.endswith('customers#customer_id')]
+    assert record['nulls'] == nulls and type(record['nulls']) is int
+    assert record['state'] == ('failed' if nulls else 'confirmed')
+
+
 def test_verify_marks_the_ontology_verified_only_where_the_data_agrees(tmp_path: Path) -> None:
     good = tmp_path / 'good'
     good.mkdir()
