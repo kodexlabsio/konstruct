@@ -410,19 +410,48 @@ def test_select_nodes_ignores_non_dbt_nodes() -> None:
     assert dbt.select_nodes(graph, [], []) == []
 
 
-def test_primary_key_constraints() -> None:
-    model = {
-        'constraints': [
-            {'type': 'not_null', 'columns': ['a']},
-            {'type': 'primary_key', 'columns': ['a', 'b']},
-        ]
+def test_primary_key_constraints(tmp_path: Path) -> None:
+    models: dict[str, dict[str, Any]] = {
+        'declared': {
+            'constraints': [
+                {'type': 'not_null', 'columns': ['a']},
+                {'type': 'primary_key', 'columns': ['a', 'b']},
+            ]
+        },
+        'on_a_column': {'columns': {'id': {'name': 'ID', 'constraints': [{'type': 'primary_key'}]}}},
+        'unique_only': {'columns': {'id': {'constraints': [{'type': 'unique'}]}}},
+        'composite': {
+            'columns': {c: {'constraints': [{'type': 'primary_key'}]} for c in ('order_id', 'line')},
+            'config': {'contract': {'enforced': True}},
+        },
     }
-    assert dbt._primary_key(model) == ['a', 'b']
-    column = {'columns': {'id': {'name': 'ID', 'constraints': [{'type': 'primary_key'}]}}}
-    assert dbt._primary_key(column) == ['ID']
-    assert dbt._primary_key({'columns': {'id': {'constraints': [{'type': 'unique'}]}}}) == []
-    both = {'columns': {c: {'constraints': [{'type': 'primary_key'}]} for c in ('order_id', 'line')}}
-    assert dbt._primary_key(both) == ['order_id', 'line']
+    nodes = {
+        f'model.p.{name}': {
+            'resource_type': 'model',
+            'unique_id': f'model.p.{name}',
+            'name': name,
+            'package_name': 'p',
+            'relation_name': f'"db"."main"."{name}"',
+            **item,
+        }
+        for name, item in models.items()
+    }
+    (tmp_path / 'target').mkdir()
+    (tmp_path / 'target' / 'manifest.json').write_text(
+        json.dumps({'metadata': {'adapter_type': 'duckdb'}, 'nodes': nodes})
+    )
+    (tmp_path / 'dbt_project.yml').write_text('name: p\n')
+    graph = Graph()
+    dbt.load(dbt.find_projects(tmp_path)[0], graph, dialect=None)
+    keys = {name: graph.nodes[f'model.p.{name}'].attrs.get('primary_key') for name in models}
+    assert keys == {
+        'declared': ['a', 'b'],
+        'on_a_column': ['ID'],
+        'unique_only': None,
+        'composite': ['order_id', 'line'],
+    }
+    assert graph.nodes['model.p.composite'].attrs['primary_key_enforced'] is True
+    assert 'primary_key_enforced' not in graph.nodes['model.p.declared'].attrs
 
 
 def test_dbt_runs_with_its_usage_statistics_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

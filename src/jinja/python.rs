@@ -41,7 +41,7 @@ fn read_text(path: &Path) -> String {
 }
 
 /// The macros of the folders in `bases`, one text, as the files in sorted order joined by newlines.
-fn macro_text(
+pub(crate) fn macro_text(
     py: Python<'_>,
     bases: &[PathBuf],
     keep: Option<&Bound<'_, PyAny>>,

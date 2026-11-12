@@ -591,6 +591,8 @@ mod core_module {
         parse_dagster_file, parse_dagster_source,
     };
     #[pymodule_export]
+    use crate::dbt::python::{Artefact, read_artefact, relation_name};
+    #[pymodule_export]
     use crate::discover::python::{
         Tree, file_digest, file_identity, files_under, folder_digest, folder_files, name_accepts,
     };
