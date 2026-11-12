@@ -194,6 +194,7 @@ Check each when updating packages, and remove it once it is no longer needed.
   need a newer Rust than 1.95, our `rust-version`: raise it deliberately, with the Rust tests,
   `tests/test_airflow.py`, `tests/test_dagster.py` and `.kodex/scripts/orchestrator_benchmark.py`
   before and after, and move `rust-version` with it.
+- **stacker `0.1`** (a direct dependency, already in the tree through ruff_python_parser, with `psm`): `src/jinja/stack.rs` asks it for room before a render descends into an expression, a block, a macro or a value, so a template that nests deeply continues on heap-allocated stack segments instead of overflowing a small thread stack. How deep a template may nest is bounded by counters (`src/jinja/parse.rs`, `src/jinja/eval.rs`), so what it costs in memory is bounded too. Remove it with the parser pin if both are ever dropped.
 - **jinja2** is a dev dependency only: `tests/jinja_oracle.py` is the Jinja2 renderer Konstruct used before the Rust one, and `tests/test_jinja.py` renders every model of its projects with both and compares them. The package no longer imports it. Remove it, the oracle and the differential tests once the recorded corpus in `tests/golden/jinja_corpus.json` is enough.
 - **maturin `>=1.16,<2`** in `[build-system]`: the build backend; a major can change how
   `[tool.maturin]` is read and what the wheel holds. Raise it with `uv build` and the wheels job.
