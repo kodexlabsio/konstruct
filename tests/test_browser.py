@@ -82,8 +82,11 @@ def axe_violations(page: Any) -> list[str]:
     spec = importlib.util.find_spec('axe_playwright_python')
     if spec is None or spec.origin is None:
         pytest.skip('axe-playwright-python is not installed')
-    script = Path(spec.origin).parent / 'axe.min.js'
-    page.add_script_tag(path=str(script))
+    script = (Path(spec.origin).parent / 'axe.min.js').read_text(encoding='utf-8')
+    # Evaluated through the browser's debugging protocol rather than added as a script element, so
+    # the page's Content-Security-Policy stays in force while axe runs: an MCP App view's frame
+    # refuses inline scripts, and Chrome does not lift that for a sandboxed frame on bypass_csp.
+    page.evaluate(f'() => {{ {script}\n}}')
     result = page.evaluate('tags => axe.run(document, {runOnly: {type: "tag", values: tags}})', WCAG)
     return [
         f'{v["id"]}: {", ".join(" ".join(n["target"]) for n in v["nodes"][:3])}' for v in result['violations']

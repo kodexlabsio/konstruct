@@ -11,7 +11,7 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
+    "build": "vite build && vite build --mode impact && vite build --mode explain && vite build --mode gate && vite build --mode conform",
     "check": "svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
     "test": "vitest run",
     "format": "prettier --write viewer *.json *.ts *.js",

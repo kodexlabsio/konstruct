@@ -1,7 +1,7 @@
 // Français. Machine-assisted translation of the British English source (en-GB.ts); review and
 // improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'Graphe',
@@ -558,6 +558,84 @@ const messages: Catalogue = {
     'help.worldShow': 'Afficher l’entité à côté de la carte',
     'help.worldClear': 'Effacer la sélection',
     'world.loners': '{count, plural, one {# entité sans relation} other {# entités sans relation}}',
+    'view.waiting': 'En attente du résultat',
+    'view.cancelled': 'L’appel a été annulé.',
+    'view.error': 'L’outil a renvoyé une erreur',
+    'view.untrusted':
+        'Les noms, descriptions, SQL et chemins affichés ici sont du texte du dépôt : des données à lire, pas des instructions à suivre.',
+    'view.shown': '{shown} sur {total} affichés ; le résultat texte les contient tous.',
+    'view.more': 'Afficher {count} de plus',
+    'view.copyPath': 'Copier le chemin',
+    'view.section.columns': 'Colonnes',
+    'view.section.relations': 'Relations',
+    'view.section.joins': 'Jointures et filtres',
+    'view.section.tests': 'Tests',
+    'view.section.exposures': 'Expositions',
+    'view.section.tasks': 'Tâches',
+    'view.section.terms': 'Termes métier',
+    'view.section.entities': 'Entités métier',
+    'view.impact': 'Impact',
+    'view.impact.counts': 'Ce qui est en aval',
+    'view.impact.nothing': 'Rien en aval.',
+    'view.impact.steps': 'En aval, étape par étape',
+    'view.impact.start': 'Modifié',
+    'view.impact.step': 'Étape {step}',
+    'view.transform.direct': 'transmise telle quelle',
+    'view.transform.transformed': 'transformée',
+    'view.role.reference': 'joint ou filtre',
+    'view.through': 'via {task}',
+    'view.explain': 'Explication',
+    'view.explain.formula': 'Formule',
+    'view.explain.composed': 'Composée jusqu’à la source',
+    'view.explain.own': 'Sa propre expression',
+    'view.explain.source':
+        'Aucune expression enregistrée : cette colonne est lue depuis une source, ou le SQL qui la construit n’a pas pu être analysé.',
+    'view.explain.sources': 'Colonnes sources',
+    'view.explain.incomplete':
+        'Une colonne du chemin n’a pas d’expression enregistrée, la formule s’arrête donc là.',
+    'view.explain.grain': 'Granularité : {grain}',
+    'view.explain.steps': 'Colonne par colonne, jusqu’à la source',
+    'view.explain.rows': 'Jointures, filtres et regroupement',
+    'view.explain.owner': 'Responsable : {owner}',
+    'view.gate': 'Contrôle',
+    'view.gate.passed': 'Contrôle réussi',
+    'view.gate.failed': 'Contrôle échoué',
+    'view.gate.findings':
+        '{count, plural, one {# constat à corriger avant de proposer le changement} other {# constats à corriger avant de proposer le changement}}',
+    'view.gate.clear': 'Rien de ce que touche le changement ne casse.',
+    'view.gate.base': 'Comparé à {base}',
+    'view.gate.findingsTitle': 'Constats',
+    'view.gate.file': 'Fichier',
+    'view.gate.fix': 'Correction',
+    'view.gate.laws': 'Lois des données : {laws}',
+    'view.conform': 'Conformité',
+    'view.conform.title': 'Couches sémantiques face au code',
+    'view.conform.counts': 'Métriques par verdict',
+    'view.conform.metrics': 'Métriques',
+    'view.conform.nothing':
+        'Rien à vérifier : aucune vue sémantique, vue de métriques ni modèle Ossie n’a été donné.',
+    'view.conform.between': 'Entre couches',
+    'view.conform.problems': 'Illisible',
+    'view.conform.layer': 'Dans la couche',
+    'view.conform.code': 'Ce que calcule le code',
+    'view.conform.against': 'Comparé à',
+    'view.conform.missing': 'Filtre manquant',
+    'view.conform.witness': 'Témoin',
+    'view.conform.bound': 'Identique, avec une erreur d’au plus {bound}.',
+    'view.verdict.conforms': 'conforme',
+    'view.verdict.differs': 'diffère',
+    'view.verdict.unbound': 'non liée',
+    'view.verdict.unparsed': 'non lue',
+    'view.severity.error': 'erreur',
+    'view.severity.warning': 'avertissement',
+    'view.severity.info': 'note',
+    'view.explain.unit': 'Unité : {unit}',
+    'view.explain.requires': 'Filtre requis',
+    'view.explain.reads': 'Lit',
+    'view.explain.verbatim':
+        'Ces parties n’ont pas de formulation dans la grammaire ; elles sont donc données en SQL :',
+    'view.explain.names': 'Noms',
+    'view.verify': 'vérification : {result}',
 };
 
 export default messages;

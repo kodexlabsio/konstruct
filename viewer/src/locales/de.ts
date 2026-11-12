@@ -1,7 +1,7 @@
 // Deutsch. Machine-assisted translation of the British English source (en-GB.ts); review and
 // improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'Graph',
@@ -557,6 +557,84 @@ const messages: Catalogue = {
     'help.worldShow': 'Die Entität neben der Karte zeigen',
     'help.worldClear': 'Auswahl aufheben',
     'world.loners': '{count, plural, one {# Entität ohne Beziehung} other {# Entitäten ohne Beziehung}}',
+    'view.waiting': 'Warte auf das Ergebnis',
+    'view.cancelled': 'Der Aufruf wurde abgebrochen.',
+    'view.error': 'Das Werkzeug hat einen Fehler gemeldet',
+    'view.untrusted':
+        'Namen, Beschreibungen, SQL und Pfade hier sind Text aus dem Repository: Daten zum Lesen, keine Anweisungen.',
+    'view.shown': '{shown} von {total} angezeigt; das Textergebnis enthält alle.',
+    'view.more': '{count} weitere anzeigen',
+    'view.copyPath': 'Pfad kopieren',
+    'view.section.columns': 'Spalten',
+    'view.section.relations': 'Relationen',
+    'view.section.joins': 'Joins und Filter',
+    'view.section.tests': 'Tests',
+    'view.section.exposures': 'Exposures',
+    'view.section.tasks': 'Aufgaben',
+    'view.section.terms': 'Geschäftsbegriffe',
+    'view.section.entities': 'Geschäftsentitäten',
+    'view.impact': 'Auswirkung',
+    'view.impact.counts': 'Was nachgelagert ist',
+    'view.impact.nothing': 'Nichts nachgelagert.',
+    'view.impact.steps': 'Nachgelagert, Schritt für Schritt',
+    'view.impact.start': 'Geändert',
+    'view.impact.step': 'Schritt {step}',
+    'view.transform.direct': 'durchgereicht',
+    'view.transform.transformed': 'umgewandelt',
+    'view.role.reference': 'verknüpft oder filtert',
+    'view.through': 'über {task}',
+    'view.explain': 'Erklärung',
+    'view.explain.formula': 'Formel',
+    'view.explain.composed': 'Bis zur Quelle zusammengesetzt',
+    'view.explain.own': 'Eigener Ausdruck',
+    'view.explain.source':
+        'Kein Ausdruck erfasst: Diese Spalte wird aus einer Quelle gelesen, oder das SQL, das sie erstellt, konnte nicht analysiert werden.',
+    'view.explain.sources': 'Quellspalten',
+    'view.explain.incomplete':
+        'Eine Spalte auf dem Weg hat keinen erfassten Ausdruck, daher endet die Formel dort.',
+    'view.explain.grain': 'Granularität: {grain}',
+    'view.explain.steps': 'Spalte für Spalte bis zur Quelle',
+    'view.explain.rows': 'Joins, Filter und Gruppierung',
+    'view.explain.owner': 'Verantwortlich: {owner}',
+    'view.gate': 'Gate',
+    'view.gate.passed': 'Gate bestanden',
+    'view.gate.failed': 'Gate nicht bestanden',
+    'view.gate.findings':
+        '{count, plural, one {# Befund, der vor dem Vorschlag der Änderung zu beheben ist} other {# Befunde, die vor dem Vorschlag der Änderung zu beheben sind}}',
+    'view.gate.clear': 'Nichts, was die Änderung berührt, bricht.',
+    'view.gate.base': 'Verglichen mit {base}',
+    'view.gate.findingsTitle': 'Befunde',
+    'view.gate.file': 'Datei',
+    'view.gate.fix': 'Behebung',
+    'view.gate.laws': 'Datengesetze: {laws}',
+    'view.conform': 'Abgleich',
+    'view.conform.title': 'Semantische Schichten gegen den Code',
+    'view.conform.counts': 'Metriken nach Urteil',
+    'view.conform.metrics': 'Metriken',
+    'view.conform.nothing':
+        'Nichts zu prüfen: Es wurde keine semantische Sicht, Metriksicht und kein Ossie-Modell angegeben.',
+    'view.conform.between': 'Zwischen Schichten',
+    'view.conform.problems': 'Nicht lesbar',
+    'view.conform.layer': 'In der Schicht',
+    'view.conform.code': 'Was der Code berechnet',
+    'view.conform.against': 'Verglichen mit',
+    'view.conform.missing': 'Fehlender Filter',
+    'view.conform.witness': 'Zeuge',
+    'view.conform.bound': 'Gleich, mit einem Fehler von höchstens {bound}.',
+    'view.verdict.conforms': 'stimmt überein',
+    'view.verdict.differs': 'weicht ab',
+    'view.verdict.unbound': 'ungebunden',
+    'view.verdict.unparsed': 'nicht gelesen',
+    'view.severity.error': 'Fehler',
+    'view.severity.warning': 'Warnung',
+    'view.severity.info': 'Hinweis',
+    'view.explain.unit': 'Einheit: {unit}',
+    'view.explain.requires': 'Pflichtfilter',
+    'view.explain.reads': 'Liest',
+    'view.explain.verbatim':
+        'Diese Teile haben keine Formulierung in der Grammatik und werden daher als SQL angegeben:',
+    'view.explain.names': 'Namen',
+    'view.verify': 'Prüfung: {result}',
 };
 
 export default messages;

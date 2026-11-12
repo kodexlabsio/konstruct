@@ -1,7 +1,7 @@
 // Nederlands. Machine-assisted translation of the British English source (en-GB.ts); review and
 // improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'Graaf',
@@ -553,6 +553,84 @@ const messages: Catalogue = {
     'help.worldShow': 'De entiteit naast de kaart tonen',
     'help.worldClear': 'De selectie wissen',
     'world.loners': '{count, plural, one {# entiteit zonder relatie} other {# entiteiten zonder relatie}}',
+    'view.waiting': 'Wachten op het resultaat',
+    'view.cancelled': 'De aanroep is geannuleerd.',
+    'view.error': 'Het hulpmiddel gaf een fout',
+    'view.untrusted':
+        'Namen, beschrijvingen, SQL en paden hier zijn tekst uit de repository: gegevens om te lezen, geen instructies om op te volgen.',
+    'view.shown': '{shown} van {total} getoond; het tekstresultaat bevat ze allemaal.',
+    'view.more': 'Nog {count} tonen',
+    'view.copyPath': 'Pad kopiëren',
+    'view.section.columns': 'Kolommen',
+    'view.section.relations': 'Relaties',
+    'view.section.joins': 'Joins en filters',
+    'view.section.tests': 'Tests',
+    'view.section.exposures': 'Exposures',
+    'view.section.tasks': 'Taken',
+    'view.section.terms': 'Bedrijfstermen',
+    'view.section.entities': 'Bedrijfsentiteiten',
+    'view.impact': 'Impact',
+    'view.impact.counts': 'Wat stroomafwaarts ligt',
+    'view.impact.nothing': 'Niets stroomafwaarts.',
+    'view.impact.steps': 'Stroomafwaarts, stap voor stap',
+    'view.impact.start': 'Gewijzigd',
+    'view.impact.step': 'Stap {step}',
+    'view.transform.direct': 'doorgegeven',
+    'view.transform.transformed': 'getransformeerd',
+    'view.role.reference': 'koppelt of filtert',
+    'view.through': 'via {task}',
+    'view.explain': 'Uitleg',
+    'view.explain.formula': 'Formule',
+    'view.explain.composed': 'Samengesteld tot de bron',
+    'view.explain.own': 'Eigen expressie',
+    'view.explain.source':
+        'Geen expressie vastgelegd: deze kolom wordt uit een bron gelezen, of de SQL die hem bouwt kon niet worden geanalyseerd.',
+    'view.explain.sources': 'Bronkolommen',
+    'view.explain.incomplete':
+        'Een kolom onderweg heeft geen vastgelegde expressie, dus de formule stopt daar.',
+    'view.explain.grain': 'Granulariteit: {grain}',
+    'view.explain.steps': 'Kolom voor kolom, tot de bron',
+    'view.explain.rows': 'Joins, filters en groepering',
+    'view.explain.owner': 'Eigenaar: {owner}',
+    'view.gate': 'Poort',
+    'view.gate.passed': 'Poort geslaagd',
+    'view.gate.failed': 'Poort gezakt',
+    'view.gate.findings':
+        '{count, plural, one {# bevinding om op te lossen voordat je de wijziging voorstelt} other {# bevindingen om op te lossen voordat je de wijziging voorstelt}}',
+    'view.gate.clear': 'Niets wat de wijziging raakt, breekt.',
+    'view.gate.base': 'Vergeleken met {base}',
+    'view.gate.findingsTitle': 'Bevindingen',
+    'view.gate.file': 'Bestand',
+    'view.gate.fix': 'Oplossing',
+    'view.gate.laws': 'Datawetten: {laws}',
+    'view.conform': 'Conformiteit',
+    'view.conform.title': 'Semantische lagen tegenover de code',
+    'view.conform.counts': 'Metrieken per oordeel',
+    'view.conform.metrics': 'Metrieken',
+    'view.conform.nothing':
+        'Niets te controleren: er is geen semantische view, metriekview of Ossie-model opgegeven.',
+    'view.conform.between': 'Tussen lagen',
+    'view.conform.problems': 'Kon niet lezen',
+    'view.conform.layer': 'In de laag',
+    'view.conform.code': 'Wat de code berekent',
+    'view.conform.against': 'Vergeleken met',
+    'view.conform.missing': 'Ontbrekend filter',
+    'view.conform.witness': 'Getuige',
+    'view.conform.bound': 'Hetzelfde, met een fout van hoogstens {bound}.',
+    'view.verdict.conforms': 'klopt',
+    'view.verdict.differs': 'wijkt af',
+    'view.verdict.unbound': 'ongebonden',
+    'view.verdict.unparsed': 'niet gelezen',
+    'view.severity.error': 'fout',
+    'view.severity.warning': 'waarschuwing',
+    'view.severity.info': 'opmerking',
+    'view.explain.unit': 'Eenheid: {unit}',
+    'view.explain.requires': 'Verplicht filter',
+    'view.explain.reads': 'Leest',
+    'view.explain.verbatim':
+        'Deze delen hebben geen formulering in de grammatica en worden daarom als SQL gegeven:',
+    'view.explain.names': 'Namen',
+    'view.verify': 'verificatie: {result}',
 };
 
 export default messages;

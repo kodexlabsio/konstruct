@@ -1,7 +1,7 @@
 // Italiano. Machine-assisted translation of the British English source (en-GB.ts); review and
 // improvements by native speakers are welcome (see CONTRIBUTING.md).
 
-import type { Catalogue } from './en-GB';
+import type { Catalogue } from './en-GB.ts';
 
 const messages: Catalogue = {
     'app.graph': 'Grafo',
@@ -552,6 +552,84 @@ const messages: Catalogue = {
     'help.worldShow': 'Mostra l’entità accanto alla mappa',
     'help.worldClear': 'Togli la selezione',
     'world.loners': '{count, plural, one {# entità senza relazioni} other {# entità senza relazioni}}',
+    'view.waiting': 'In attesa del risultato',
+    'view.cancelled': 'La chiamata è stata annullata.',
+    'view.error': 'Lo strumento ha restituito un errore',
+    'view.untrusted':
+        'Nomi, descrizioni, SQL e percorsi qui sono testo del repository: dati da leggere, non istruzioni da seguire.',
+    'view.shown': 'Mostrati {shown} di {total}; il risultato testuale li contiene tutti.',
+    'view.more': 'Mostra altri {count}',
+    'view.copyPath': 'Copia il percorso',
+    'view.section.columns': 'Colonne',
+    'view.section.relations': 'Relazioni',
+    'view.section.joins': 'Join e filtri',
+    'view.section.tests': 'Test',
+    'view.section.exposures': 'Esposizioni',
+    'view.section.tasks': 'Attività',
+    'view.section.terms': 'Termini di business',
+    'view.section.entities': 'Entità di business',
+    'view.impact': 'Impatto',
+    'view.impact.counts': 'Cosa c’è a valle',
+    'view.impact.nothing': 'Niente a valle.',
+    'view.impact.steps': 'A valle, passo per passo',
+    'view.impact.start': 'Modificato',
+    'view.impact.step': 'Passo {step}',
+    'view.transform.direct': 'passata così com’è',
+    'view.transform.transformed': 'trasformata',
+    'view.role.reference': 'unisce o filtra',
+    'view.through': 'tramite {task}',
+    'view.explain': 'Spiegazione',
+    'view.explain.formula': 'Formula',
+    'view.explain.composed': 'Composta fino alla sorgente',
+    'view.explain.own': 'La sua espressione',
+    'view.explain.source':
+        'Nessuna espressione registrata: questa colonna è letta da una sorgente, oppure non è stato possibile analizzare l’SQL che la costruisce.',
+    'view.explain.sources': 'Colonne sorgente',
+    'view.explain.incomplete':
+        'Una colonna lungo il percorso non ha un’espressione registrata, quindi la formula si ferma lì.',
+    'view.explain.grain': 'Granularità: {grain}',
+    'view.explain.steps': 'Colonna per colonna, fino alla sorgente',
+    'view.explain.rows': 'Join, filtri e raggruppamento',
+    'view.explain.owner': 'Responsabile: {owner}',
+    'view.gate': 'Controllo',
+    'view.gate.passed': 'Controllo superato',
+    'view.gate.failed': 'Controllo non superato',
+    'view.gate.findings':
+        '{count, plural, one {# rilievo da correggere prima di proporre la modifica} other {# rilievi da correggere prima di proporre la modifica}}',
+    'view.gate.clear': 'Niente di ciò che la modifica tocca si rompe.',
+    'view.gate.base': 'Confrontato con {base}',
+    'view.gate.findingsTitle': 'Rilievi',
+    'view.gate.file': 'File',
+    'view.gate.fix': 'Correzione',
+    'view.gate.laws': 'Leggi dei dati: {laws}',
+    'view.conform': 'Conformità',
+    'view.conform.title': 'Livelli semantici rispetto al codice',
+    'view.conform.counts': 'Metriche per verdetto',
+    'view.conform.metrics': 'Metriche',
+    'view.conform.nothing':
+        'Niente da controllare: non è stata data nessuna vista semantica, vista di metriche o modello Ossie.',
+    'view.conform.between': 'Tra livelli',
+    'view.conform.problems': 'Impossibile leggere',
+    'view.conform.layer': 'Nel livello',
+    'view.conform.code': 'Cosa calcola il codice',
+    'view.conform.against': 'Confrontato con',
+    'view.conform.missing': 'Filtro mancante',
+    'view.conform.witness': 'Testimone',
+    'view.conform.bound': 'Uguale, con un errore di al più {bound}.',
+    'view.verdict.conforms': 'conforme',
+    'view.verdict.differs': 'differisce',
+    'view.verdict.unbound': 'non collegata',
+    'view.verdict.unparsed': 'non letta',
+    'view.severity.error': 'errore',
+    'view.severity.warning': 'avviso',
+    'view.severity.info': 'nota',
+    'view.explain.unit': 'Unità: {unit}',
+    'view.explain.requires': 'Filtro obbligatorio',
+    'view.explain.reads': 'Legge',
+    'view.explain.verbatim':
+        'Queste parti non hanno una formulazione nella grammatica, quindi sono date in SQL:',
+    'view.explain.names': 'Nomi',
+    'view.verify': 'verifica: {result}',
 };
 
 export default messages;

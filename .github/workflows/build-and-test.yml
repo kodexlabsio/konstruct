@@ -704,9 +704,11 @@ jobs:
       - name: Build
         run: pnpm build
 
-      # konstruct ships the built page so installing it needs no Node.js; it must match the source.
+      # konstruct ships the built pages so installing it needs no Node.js; they must match the source.
       - name: The committed build is up to date
-        run: git diff --exit-code -- konstruct/outputs/viewer.html
+        run: |
+          git diff --exit-code -- konstruct/outputs/viewer.html konstruct/outputs/views
+          test -z "$(git ls-files --others --exclude-standard -- konstruct/outputs/views)"
 
   dagster-parity:
     name: Dagster parser against Dagster
