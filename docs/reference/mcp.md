@@ -62,5 +62,21 @@ Each prompt is the workflow of one of the [skills](../guide/agents.md#the-skills
 | konstruct://report | `text/markdown` | `REPORT.md`: inputs and counts, the most used columns, business terms, orphans, untested models, columns with no lineage and warnings |
 | konstruct://ontology | `application/yaml` | The ontology as `ontology.yml`: entities and keys, measures with their formulas composed to source, relationships and broken rules |
 | konstruct://summary | `application/json` | What the graph holds: its inputs, nodes and edges by kind, lineage coverage and warnings, as `konstruct build --json` reports them, and the inputs changed since the build |
+| ui://konstruct/impact | `text/html;profile=mcp-app` | The view of the `impact` tool's result (see [Views](#views)) |
+| ui://konstruct/explain | `text/html;profile=mcp-app` | The view of the `explain` tool's result |
+| ui://konstruct/gate | `text/html;profile=mcp-app` | The view of the `gate` tool's result |
 
-Each resource opens with the same `untrusted_content` notice as the tools' results: a `> untrusted_content: ...` line before the report, a `# untrusted_content: ...` comment before the ontology and an `untrusted_content` key in the summary. A resource read before there is a graph fails with an error that says to run `konstruct build`. Paths in the resources and in error messages are relative to the project, with the home directory as `~`. `konstruct mcp --no-prompts` serves the tools and resources only.
+Each `konstruct://` resource opens with the same `untrusted_content` notice as the tools' results: a `> untrusted_content: ...` line before the report, a `# untrusted_content: ...` comment before the ontology and an `untrusted_content` key in the summary. A resource read before there is a graph fails with an error that says to run `konstruct build`. Paths in the resources and in error messages are relative to the project, with the home directory as `~`. `konstruct mcp --no-prompts` serves the tools and resources only.
+
+## Views
+
+In a host that supports the [MCP Apps](https://modelcontextprotocol.io/extensions/apps/overview) extension (`io.modelcontextprotocol/ui`), the results of `impact`, `explain` and `gate` are also drawn in the conversation. Each of these tools names its view in `_meta.ui.resourceUri`, and the host renders that `ui://konstruct/<tool>` resource in a sandboxed frame and hands it the tool's result. A host without the extension shows the result as before: the text result is the same for every host and holds the whole answer.
+
+| View | What it draws |
+|------|---------------|
+| `impact` | The walk downstream, step by step, with each column's transform (passed through or transformed), what `konstruct verify` found for the edge that reached it, and the task that produced it, then the relations, joins and filters, tests, exposures, tasks, business terms and entities reached, with their descriptions |
+| `explain` | The formula composed to source and the column's own expression, whether the formula is partial, the plain-English sentence and the parts quoted as SQL when `english` is set, each column on the way down with the columns it reads, what `konstruct verify` found for its edges, and the joins, filters and grouping on its rows, worded in plain English when given, and the bound business terms with their owner, unit, grain and required filters |
+| `gate` | Passed or failed, and each finding with its rule, the file to change and the fix |
+
+A list longer than 100 items is drawn 100 at a time, with a button for the next 100; the text result always holds all of them. Each view is one HTML page of under 200 KB with its script, styles and fonts inlined. It asks the host to let it reach nothing (an empty `_meta.ui.csp`) and only to write to the clipboard for its copy buttons (`_meta.ui.permissions`; where the host refuses, a copy button selects the text instead), its own Content-Security-Policy allows no connection, and it draws the repository's names, SQL and paths only as text, under the same notice as the results. The views follow the host's light or dark theme and its language, in the locales of the [viewer](../guide/viewer.md).
+

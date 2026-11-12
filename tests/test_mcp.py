@@ -15,10 +15,11 @@ import pytest
 import yaml
 from mcp import Client, MCPError, StdioServerParameters
 
-from konstruct import Project
+from konstruct import Project, __version__
 from konstruct.core.graph import Graph
 from konstruct.interfaces import toolkit
 from konstruct.interfaces.mcp_server import INSTRUCTIONS, UNTRUSTED_CONTENT, build_server
+from konstruct.outputs.html import VIEWS, view_html
 
 pytestmark = pytest.mark.dbt
 
@@ -198,6 +199,9 @@ async def _prompts_and_resources(client: Client) -> None:
         'konstruct://report': 'text/markdown',
         'konstruct://ontology': 'application/yaml',
         'konstruct://summary': 'application/json',
+        'ui://konstruct/impact': 'text/html;profile=mcp-app',
+        'ui://konstruct/explain': 'text/html;profile=mcp-app',
+        'ui://konstruct/gate': 'text/html;profile=mcp-app',
     }
     report = (await client.read_resource('konstruct://report')).contents[0]
     # Each resource is marked as repository text, as the tools' results are.
@@ -219,6 +223,132 @@ def test_in_process(jaffle_built_graph: Path) -> None:
             await _exercise(client)
 
     anyio.run(main)
+
+
+def test_a_host_with_mcp_apps_is_offered_a_view_of_each_drawn_tool(jaffle_built_graph: Path) -> None:
+    """impact, explain and gate point at their views through `_meta.ui.resourceUri`, each view is a
+    `ui://` resource of the Apps MIME type that asks the host to let it reach nothing, and a view is
+    served only for a tool the server has (conform's, once the server has a conform tool)."""
+
+    async def main() -> None:
+        async with Client(build_server(jaffle_built_graph)) as client:
+            tools = (await client.list_tools()).tools
+            bound = {t.name: t.meta['ui']['resourceUri'] for t in tools if t.meta and 'ui' in t.meta}
+            assert bound == {name: f'ui://konstruct/{name}' for name in ('impact', 'explain', 'gate')}
+            assert set(bound) <= set(VIEWS)
+            assert all(not t.meta or set(t.meta) == {'ui'} for t in tools)
+            listed = {str(r.uri): r for r in (await client.list_resources()).resources}
+            views = {uri for uri in listed if uri.startswith('ui://')}
+            assert views == set(bound.values())
+            assert ('ui://konstruct/conform' in views) == ('conform' in {t.name for t in tools})
+            nowhere: dict[str, list[str]] = {
+                'connectDomains': [],
+                'resourceDomains': [],
+                'frameDomains': [],
+                'baseUriDomains': [],
+            }
+            for name, uri in bound.items():
+                assert listed[uri].meta == {
+                    'ui': {'csp': nowhere, 'permissions': {'clipboardWrite': {}}, 'prefersBorder': True}
+                }
+                assert listed[uri].title == f'{name.capitalize()} view' and listed[uri].description
+                [page] = (await client.read_resource(uri)).contents
+                assert page.mime_type == 'text/html;profile=mcp-app'
+                assert page.text == view_html(name)  # type: ignore[union-attr]
+                # The view names itself to the host with Konstruct's version.
+                assert f'content="{__version__}"' in page.text  # type: ignore[union-attr]
+                assert page.meta == {
+                    'ui': {'csp': nowhere, 'permissions': {'clipboardWrite': {}}, 'prefersBorder': True}
+                }
+
+    anyio.run(main)
+
+
+def test_the_drawn_tools_text_results_are_what_they_were(jaffle_built_graph: Path) -> None:
+    """The view is an addition for hosts that draw it: every host still gets the same text, the
+    JSON of the result the Python API gives, and the same structured copy of it."""
+    from konstruct.core.formats import document
+
+    project = Project(jaffle_built_graph)
+    expected = {
+        'impact': ({'ref': 'stg_payments.amount'}, document(project.impact('stg_payments.amount'))),
+        'explain': ({'ref': 'orders.amount'}, document(project.explain('orders.amount'))),
+    }
+
+    async def main() -> None:
+        async with Client(build_server(jaffle_built_graph)) as client:
+            for tool, (args, result) in expected.items():
+                answer = await client.call_tool(tool, args)
+                data = {'untrusted_content': UNTRUSTED_CONTENT, **result}
+                assert structured(answer) == data
+                [text] = answer.content
+                assert text.text == json.dumps(data, indent=2)  # type: ignore[union-attr]
+                assert answer.meta is None or 'ui' not in answer.meta
+
+    anyio.run(main)
+
+
+RESULTS = Path(__file__).resolve().parents[1] / 'viewer' / 'tests' / 'results'
+# The calls whose results the views' tests are given, recorded here: each name is a file in RESULTS.
+RECORDED: dict[str, tuple[str, dict[str, Any]]] = {
+    'impact': ('impact', {'ref': 'stg_payments.amount'}),
+    'impact-relation': ('impact', {'ref': 'stg_orders'}),
+    'impact-error': ('impact', {'ref': 'nope'}),
+    'explain-composed': ('explain', {'ref': 'customers.customer_lifetime_value', 'english': True}),
+    'explain-plain': ('explain', {'ref': 'customers.customer_lifetime_value'}),
+    'gate-passed': ('gate', {'base': 'HEAD'}),
+}
+
+
+def _paths(value: Any, prefix: str = '') -> set[str]:
+    """Every key path in ``value``, a list's items as ``[]``: the shape of a result, not its data."""
+    if isinstance(value, dict):
+        return {p for k, v in value.items() for p in {f'{prefix}.{k}'} | _paths(v, f'{prefix}.{k}')}
+    if isinstance(value, list):
+        return {p for item in value for p in _paths(item, f'{prefix}[]')}
+    return set()
+
+
+def test_the_views_recorded_results_are_what_the_tools_return(
+    jaffle_built_graph: Path, tmp_path: Path
+) -> None:
+    """The views are tested on results recorded from the tools (viewer/tests/results/): each is the
+    shape the tool returns today, so the recording cannot drift from it. KONSTRUCT_UPDATE_GOLDEN=1
+    records them again."""
+    root = tmp_path / 'jaffle_shop'
+    shutil.copytree(jaffle_built_graph, root)
+    (root / '.gitignore').write_text('konstruct-out/\n')
+    identity = ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false']
+    for args in (['init', '-q', '-b', 'main'], ['add', '-A'], ['commit', '-qm', 'Start']):
+        subprocess.run(['git', '-C', str(root), *identity, *args], check=True, capture_output=True)
+    model = root / 'models' / 'staging' / 'stg_payments.sql'
+
+    async def record() -> dict[str, dict[str, Any]]:
+        async with Client(build_server(root)) as client:
+            calls = {}
+            for name, (tool, args) in RECORDED.items():
+                calls[name] = {'tool': tool, 'arguments': args, 'result': await client.call_tool(tool, args)}
+            # A change that drops a column something downstream reads, so the gate fails.
+            model.write_text(
+                model.read_text().replace('amount / 100 as amount', 'amount / 100 as amount_aud')
+            )
+            calls['gate'] = {
+                'tool': 'gate',
+                'arguments': {'base': 'HEAD'},
+                'result': await client.call_tool('gate', {'base': 'HEAD'}),
+            }
+            return calls
+
+    calls = anyio.run(record)
+    assert not calls['gate']['result'].structured_content['passed']
+    for name, call in calls.items():
+        call['result'] = call['result'].model_dump(mode='json', by_alias=True, exclude_none=True)
+        path = RESULTS / f'{name}.json'
+        if os.environ.get('KONSTRUCT_UPDATE_GOLDEN'):
+            path.write_text(json.dumps(call, indent=2) + '\n', encoding='utf-8')
+        recorded = json.loads(path.read_text(encoding='utf-8'))
+        assert (recorded['tool'], recorded['arguments']) == (call['tool'], call['arguments']), name
+        assert _paths(recorded['result']) == _paths(call['result']), name
 
 
 def test_over_stdio(jaffle_built_graph: Path) -> None:
@@ -535,7 +665,8 @@ def test_without_prompts_the_server_names_none(jaffle_built_graph: Path) -> None
         server = build_server(jaffle_built_graph, prompts=False)
         async with Client(server) as client:
             assert (await client.list_prompts()).prompts == []
-            assert len((await client.list_resources()).resources) == 3
+            resources = (await client.list_resources()).resources
+            assert len([r for r in resources if str(r.uri).startswith('konstruct://')]) == 3
         assert 'prompts' not in (server.instructions or '')
         assert 'prompts' in (build_server(jaffle_built_graph).instructions or '')
 
