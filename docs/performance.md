@@ -39,8 +39,8 @@ A hook first asks whether the files are as its last run left them (the commit, t
 
 | Hook run | CPU time |
 |---|---:|
-| the files as its last run left them | 0.15 s |
-| after an edit to one column of the last model | 4.28 s |
+| the files as its last run left them | 0.21 s |
+| after an edit to one column of the last model | 3.91 s |
 
 ## Consumers' Lockfiles in the Gate
 
