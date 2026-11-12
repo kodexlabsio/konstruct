@@ -25,6 +25,7 @@ macro_rules! routine {
 }
 
 pub mod airflow;
+pub mod conform;
 pub mod dagster;
 pub mod dbt;
 pub mod discover;

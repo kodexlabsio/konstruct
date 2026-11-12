@@ -66,6 +66,11 @@ pub struct FormulaSet {
 }
 
 impl FormulaSet {
+    /// The formulas, for the conformance check to compare.
+    pub(crate) fn formulas(&mut self) -> &mut Formulas {
+        &mut self.inner
+    }
+
     fn check(&self, definition: u32) -> PyResult<()> {
         if (definition as usize) < self.inner.len() {
             Ok(())

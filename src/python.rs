@@ -586,6 +586,10 @@ mod core_module {
         parse_dbt_commands,
     };
     #[pymodule_export]
+    use crate::conform::python::{
+        conform_judge, conform_norm, conform_read_ddl, conform_read_yaml, conform_statements,
+    };
+    #[pymodule_export]
     use crate::dagster::python::{
         AssetInfo, DagsterFile, JobInfo, OpCall, OpInfo, SensorInfo, looks_like_dagster_file,
         parse_dagster_file, parse_dagster_source,
