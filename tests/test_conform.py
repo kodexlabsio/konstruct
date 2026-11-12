@@ -12,7 +12,7 @@ import json
 import sys
 import types
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import duckdb
 import pytest
@@ -546,6 +546,53 @@ def test_an_untrusted_project_refuses_the_warehouse_through_every_interface(
     assert log == []  # nothing connected
 
 
+@pytest.mark.parametrize('folder', ['views', 'views#2'])
+def test_the_gate_fails_a_metric_that_conformed_and_can_no_longer_be_compared(
+    tmp_path: Path, folder: str
+) -> None:
+    from konstruct.analysis.gate import PLATFORM_DEFINITION_DIFFERS, RULES
+    from konstruct.plugins.api import CheckContext
+
+    graph = tpch()
+    views = tmp_path / folder
+    views.mkdir()
+    (views / 'a.sql').write_text((FIXTURES / 'snowflake_reference.sql').read_text())
+    again = views / 'b.sql'
+    again.write_text(
+        'CREATE SEMANTIC VIEW again TABLES (o AS snowflake_sample_data.tpch_sf1.orders) '
+        'METRICS (o.order_average_value AS AVG(o.o_totalprice));'
+    )
+
+    def read() -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (name, layer)
+            for name in (f'{folder}/a.sql', f'{folder}/b.sql')
+            for _, layer in read_layers((tmp_path / name).read_text(), name)[0]
+        ]
+
+    before = conform(graph, derive(graph), read())
+    assert any(f['verdict'] == 'conforms' for f in before.findings)
+    baseline = {**document(before), 'inputs': [f'{folder}/a.sql', f'{folder}/b.sql']}
+    assert 'platform-definition-differs' in RULES
+
+    def gate_findings(conform_json: dict[str, Any] | None) -> list[Any]:
+        context: Any = CheckContext(
+            graph=graph, diff=cast(Any, None), conflicts=cast(Any, None), root=tmp_path, conform=conform_json
+        )
+        return PLATFORM_DEFINITION_DIFFERS.check(context)
+
+    assert gate_findings(baseline) == []  # still what the code says
+    assert gate_findings(None) == []  # nothing recorded, nothing held to it
+    # The code renames the column the view reads: the metric can no longer be compared.
+    renamed = tpch(omit='o_totalprice')
+    context: Any = CheckContext(
+        graph=renamed, diff=cast(Any, None), conflicts=cast(Any, None), root=tmp_path, conform=baseline
+    )
+    found = PLATFORM_DEFINITION_DIFFERS.check(context)
+    assert found and all(f.rule == 'platform-definition-differs' and f.fix for f in found)
+    assert any('order_average_value' in f.message and f.path == f'{folder}/b.sql' for f in found)
+
+
 def test_a_date_in_a_layer_is_read_as_text_not_a_crash() -> None:
     text = 'name: m\ntables:\n  - name: o\n    base_table: {table: ORDERS}\n    facts:\n      - {name: f, expr: a, as_of: 2024-01-31}\n'
     found, problems = read_layers(text, 'd.yaml')
@@ -952,3 +999,76 @@ def test_a_metric_that_reads_a_column_the_code_lost_blames_the_code_not_the_laye
     assert found['verdict'] == 'column-missing'
     assert 'field of the model' not in found['detail']
     assert 'the code no longer has' in found['detail'], found['detail']
+
+
+# What the gate holds a change to
+
+AGAIN = (
+    'CREATE SEMANTIC VIEW again TABLES (o AS snowflake_sample_data.tpch_sf1.orders) '
+    'METRICS (o.order_average_value AS {expression});'
+)
+
+
+def recorded_views(tmp_path: Path, graph: Graph) -> dict[str, Any]:
+    """A conform.json of two views (the reference and one that computes the same metric), whose
+    metrics conform to each other's, with their files in ``tmp_path``."""
+    (tmp_path / 'a.sql').write_text((FIXTURES / 'snowflake_reference.sql').read_text())
+    (tmp_path / 'b.sql').write_text(AGAIN.format(expression='AVG(o.o_totalprice)'))
+    documents = [
+        layer for name in ('a.sql', 'b.sql') for layer in read_layers((tmp_path / name).read_text(), name)[0]
+    ]
+    result = conform(graph, derive(graph), documents)
+    assert any(f['verdict'] == 'conforms' for f in result.findings)
+    return {**document(result), 'inputs': ['a.sql', 'b.sql']}
+
+
+def gate_rule(graph: Graph, tmp_path: Path, recorded: dict[str, Any]) -> list[Any]:
+    from konstruct.analysis.gate import PLATFORM_DEFINITION_DIFFERS
+    from konstruct.plugins.api import CheckContext
+
+    context: Any = CheckContext(
+        graph=graph, diff=cast(Any, None), conflicts=cast(Any, None), root=tmp_path, conform=recorded
+    )
+    return PLATFORM_DEFINITION_DIFFERS.check(context)
+
+
+def test_the_gate_does_not_fail_a_change_that_only_removes_the_metric_one_conformed_to(
+    tmp_path: Path,
+) -> None:
+    graph = tpch()
+    recorded = recorded_views(tmp_path, graph)
+    assert gate_rule(graph, tmp_path, recorded) == []
+    (tmp_path / 'b.sql').unlink()  # the partner goes: nothing is left to compare the metric with
+    assert gate_rule(graph, tmp_path, recorded) == []
+
+
+def test_the_gate_reports_the_pair_when_the_metric_one_conformed_to_changes(tmp_path: Path) -> None:
+    graph = tpch()
+    recorded = recorded_views(tmp_path, graph)
+    (tmp_path / 'b.sql').write_text(AGAIN.format(expression='SUM(o.o_totalprice)'))
+    [found] = gate_rule(graph, tmp_path, recorded)
+    assert found.rule == 'platform-definition-differs'
+    assert 'order_average_value' in found.message and 'a.sql' in found.message and 'b.sql' in found.message
+
+
+def test_the_gate_fails_a_metric_whose_table_the_graph_lost(tmp_path: Path) -> None:
+    recorded = recorded_views(tmp_path, tpch())
+    found = gate_rule(tpch(prefix='elsewhere.tpch'), tmp_path, recorded)
+    assert found and all('unbound' in f.message and 'does not have' in f.message for f in found)
+
+
+def test_the_gate_fails_a_metric_whose_required_filters_held_and_are_now_missing(tmp_path: Path) -> None:
+    graph = tpch(term_filter=REQUIRED, prefix='samples.tpch')
+    graph.nodes['term.order_average_value'].name = 'Fulfilled revenue'
+    path = tmp_path / 'm.yaml'
+    text = (
+        'version: 1.1\nsource: samples.tpch.orders\nmeasures:\n  - name: Fulfilled revenue\n    expr: "{}"\n'
+    )
+    path.write_text(text.format("SUM(o_totalprice) FILTER (WHERE o_orderstatus = 'F')"))
+    result = conform(graph, derive(graph), read_layers(path.read_text(), 'm.yaml')[0])
+    assert [f['verdict'] for f in result.findings if f['kind'] == 'metric'] == ['unbound']
+    recorded = {**document(result), 'inputs': ['m.yaml']}
+    assert gate_rule(graph, tmp_path, recorded) == []
+    path.write_text(text.format('SUM(o_totalprice)'))  # the filter is dropped
+    [found] = gate_rule(graph, tmp_path, recorded)
+    assert 'Fulfilled revenue' in found.message and 'differs' in found.message

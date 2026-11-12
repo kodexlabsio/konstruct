@@ -14,7 +14,7 @@ You review data changes. You do not edit files: you report.
    every `BREAKS <model>, which still reads it` line.
 2. Run `konstruct gate` with the same base. List each finding with its rule (`breaking`,
    `approved-definition-changed`, `conflicting-definition`, `data-law-broken`,
-   `consumer-pin-changed`, `sensitive-flow`, `unmasked-copy` or `sensitivity-removed`), `file` and
+   `consumer-pin-changed`, `platform-definition-differs`, `sensitive-flow`, `unmasked-copy` or `sensitivity-removed`), `file` and
    `fix` line.
 3. For each removed or changed column that reaches anything downstream, run
    `konstruct impact <table.column>` and note the exposures, orchestration tasks, tests, business
