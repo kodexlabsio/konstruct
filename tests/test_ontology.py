@@ -14,7 +14,15 @@ from konstruct import Project
 from konstruct.core.graph import Graph, Node, NodeKind
 from konstruct.interfaces.cli import main
 from konstruct.semantics.definitions import parse
-from konstruct.semantics.ontology import derivation, derive, entity_name, id_like, link_key, name_matches
+from konstruct.semantics.ontology import (
+    column_tests,
+    derivation,
+    derive,
+    entity_name,
+    id_like,
+    link_key,
+    name_matches,
+)
 
 
 @pytest.mark.parametrize(
@@ -364,6 +372,31 @@ def test_a_unique_test_on_some_rows_is_no_key() -> None:
     assert 'model.shop.customers#customer_id' not in ontology.unique_ids
     assert [e.name for e in ontology.entities] == ['order']
     assert all(r.cardinality is None for r in ontology.relationships if r.target == 'customer')
+
+
+@pytest.mark.parametrize(
+    'lenient',
+    [{'where': 'is_current'}, {'severity': 'warn'}, {'error_if': '>10'}, {'severity': 'WARN'}],
+)
+def test_a_not_null_or_relationships_test_that_does_not_hold_on_every_row_vouches_for_nothing(
+    lenient: dict[str, str],
+) -> None:
+    g = shop()
+    nn = g.add_node(Node('test.shop.nn', 'test', 'not_null', attrs={'test': 'not_null'}))
+    g.add_edge(nn.id, 'model.shop.customers#name', 'tests')
+    rel = g.add_node(Node('test.shop.rel', 'test', 'relationships', attrs={'test': 'relationships'}))
+    g.add_edge(rel.id, 'model.shop.orders#customer_id', 'tests')
+    g.add_edge(rel.id, 'model.shop.customers#customer_id', 'tests', role='relationship target')
+    tests = column_tests(g)
+    assert tests.not_null == {'model.shop.customers#name': ['test.shop.nn']}
+    assert tests.links == {
+        ('model.shop.orders#customer_id', 'model.shop.customers#customer_id'): ['test.shop.rel']
+    }
+    for test in (nn, rel):
+        test.attrs.update(lenient)
+    tests = column_tests(g)
+    assert tests.not_null == {} and tests.links == {}
+    assert not any(r.tested for r in derive(g).relationships)
 
 
 def test_primary_keys_are_keys_and_composite_ones_are_not() -> None:

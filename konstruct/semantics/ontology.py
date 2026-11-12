@@ -219,6 +219,18 @@ class Rule:
 
 
 @dataclass
+class ColumnTests:
+    """The dbt tests that vouch for a column on every row, by what they say."""
+
+    unique: dict[str, list[str]] = field(default_factory=dict)
+    """The ids of the ``unique`` tests on each column, by column id."""
+    not_null: dict[str, list[str]] = field(default_factory=dict)
+    """The ids of the ``not_null`` tests on each column."""
+    links: dict[tuple[str, str], list[str]] = field(default_factory=dict)
+    """The ids of the ``relationships`` tests, by the referring and the referred column id."""
+
+
+@dataclass
 class Ontology:
     """Entities, measures, relationships and rules, derived from one graph."""
 
@@ -235,6 +247,9 @@ class Ontology:
     unique_ids: frozenset[str] = field(default_factory=frozenset, repr=False)
     """The graph ids of the columns a test, a primary key or an identifier field shows unique,
     for tools; not written to ``ontology.yml``."""
+    tests: ColumnTests = field(default_factory=ColumnTests, repr=False)
+    """The tests that vouch for columns and relationships, with their ids, for tools; not written to
+    ``ontology.yml``."""
 
     @property
     def violations(self) -> list[str]:
@@ -342,17 +357,57 @@ def fails_on_any_row(test: Node) -> bool:
     return severity != 'warn' and threshold in ('!=0', '>0', '>=1')
 
 
+def holds_on_every_row(test: Node) -> bool:
+    """Whether passing ``test`` says something of every row of its column: it fails when a single
+    row breaks it (:func:`fails_on_any_row`), and has no ``where`` config (``is_current``), which
+    holds only on the rows it selects."""
+    return not test.attrs.get('where') and fails_on_any_row(test)
+
+
 def unique_tested(graph: Graph, test: Node) -> list[Node]:
-    """The columns ``test`` shows unique on every row: those of a ``unique`` test that fails on any
-    row (:func:`fails_on_any_row`), unless it has a ``where`` config (``is_current``), which holds
-    only on the rows it selects."""
-    if test.attrs.get('test') != 'unique' or test.attrs.get('where') or not fails_on_any_row(test):
+    """The columns ``test`` shows unique on every row: those of a ``unique`` test that holds on
+    every row (:func:`holds_on_every_row`)."""
+    if test.attrs.get('test') != 'unique' or not holds_on_every_row(test):
         return []
     found = []
     for edge in graph.out_edges(test.id, 'tests'):
         column = graph.nodes.get(edge.target)
         if edge.attrs.get('role') is None and column is not None and column.kind == 'column':
             found.append(column)
+    return found
+
+
+def column_tests(graph: Graph) -> ColumnTests:
+    """The ``unique``, ``not_null`` and ``relationships`` tests of ``graph`` that hold on every row
+    (:func:`holds_on_every_row`), read once for every reader of tests: a test that holds on only
+    some rows guarantees nothing, so it is left out. ``unique`` is :func:`unique_tested`."""
+    found = ColumnTests()
+    for node in graph.nodes.values():
+        if node.kind != 'test':
+            continue
+        for tested in unique_tested(graph, node):
+            found.unique.setdefault(tested.id, []).append(node.id)
+        kind = node.attrs.get('test')
+        if kind not in ('not_null', 'relationships') or not holds_on_every_row(node):
+            continue
+        sources: list[str] = []
+        targets: list[str] = []
+        for edge in graph.out_edges(node.id, 'tests'):
+            column = graph.nodes.get(edge.target)
+            if column is None or column.kind != 'column':
+                continue
+            role = edge.attrs.get('role')
+            if role is None:
+                sources.append(column.id)
+            elif role == 'relationship target':
+                targets.append(column.id)
+        if kind == 'not_null':
+            for source in sources:
+                found.not_null.setdefault(source, []).append(node.id)
+        else:
+            for source in sources:
+                for target in targets:
+                    found.links.setdefault((source, target), []).append(node.id)
     return found
 
 
@@ -533,6 +588,7 @@ class _Deriver:
 
     def __init__(self, graph: Graph) -> None:
         self.graph = graph
+        self.tests = column_tests(graph)  # the one reading of the graph's tests
         self.keys: dict[str, str] = {}  # column id of a key -> entity name
         self.entities: dict[str, Entity] = {}
         self.unique: set[str] = set()  # column ids with a uniqueness guarantee
@@ -605,6 +661,7 @@ class _Deriver:
             rules=list(self.rules.values()),
             concepts=self.concepts(),
             unique_ids=frozenset(self.unique),
+            tests=self.tests,
         )
 
     def entity_confidence(self, entity: Entity) -> None:
@@ -658,13 +715,15 @@ class _Deriver:
         self.unique = unique_columns(graph)
         found: dict[str, list[str]] = {}
         unenforced: dict[str, list[str]] = {}
+        for column_id, test_ids in self.tests.unique.items():
+            column = graph.nodes[column_id]
+            # A unique email or name is not what identifies the business object.
+            if id_like(column.name):
+                found.setdefault(column_id, []).extend(
+                    f'unique test on {graph.label(column)}' for _ in test_ids
+                )
         for node in graph.nodes.values():
-            if node.kind == 'test':
-                for column in unique_tested(graph, node):
-                    # A unique email or name is not what identifies the business object.
-                    if id_like(column.name):
-                        found.setdefault(column.id, []).append(f'unique test on {graph.label(column)}')
-            elif node.kind == 'column' and node.attrs.get('ossie_key'):
+            if node.kind == 'column' and node.attrs.get('ossie_key'):
                 found.setdefault(node.id, []).append(f'primary key in {node.attrs["ossie_key"]}')
             elif node.kind in RELATION_KINDS:
                 for attr, what in (('primary_key', 'primary key'), ('identifier_fields', 'identifier field')):
@@ -922,17 +981,16 @@ class _Deriver:
             if tested if declared is None else declared:
                 stated.add(key)
 
+        for (source_id, target_id), test_ids in self.tests.links.items():
+            for test_id in test_ids:
+                add(
+                    graph.nodes[source_id],
+                    graph.nodes[target_id],
+                    f'relationships test {graph.nodes[test_id].name}',
+                    True,
+                )
         for node in graph.nodes.values():
-            if node.kind == 'test' and node.attrs.get('test') == 'relationships':
-                edges = graph.out_edges(node.id, 'tests')
-                targets = [
-                    graph.nodes[e.target] for e in edges if e.attrs.get('role') == 'relationship target'
-                ]
-                sources = [graph.nodes[e.target] for e in edges if e.attrs.get('role') is None]
-                for source in sources:
-                    for target in targets:
-                        add(source, target, f'relationships test {node.name}', True)
-            elif node.kind in RELATION_KINDS:
+            if node.kind in RELATION_KINDS:
                 for condition in node.attrs.get('conditions', []) or []:
                     for left, right in join_columns(graph, str(condition)):
                         evidence = f'join in {graph.label(node)}'
