@@ -547,3 +547,28 @@ def test_every_hint_names_a_command_the_parser_accepts() -> None:
     assert hints
     for hint in hints:
         parser().parse_args(shlex.split(re.sub(r'\{[^}]*\}', 'orders', hint)))
+
+
+def test_conform(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    from tests.test_checksql import make_shop
+
+    make_shop(tmp_path)
+    layer = tmp_path / 'layer.sql'
+    layer.write_text(
+        'CREATE SEMANTIC VIEW v TABLES (o AS shop.raw.orders PRIMARY KEY (order_id)) '
+        'METRICS (o.total AS SUM(o.no_such_column));'
+    )
+    code, out, _ = run(capsys, '-C', str(tmp_path), 'conform', str(layer))
+    assert code == 1
+    assert 'metric total  column-missing' in out
+    code, out, _ = run(capsys, '-C', str(tmp_path), 'conform', str(layer), '--json')
+    assert code == 1
+    data = json.loads(out)
+    assert data['format_version'] == 1 and data['summary']['column_missing'] >= 1
+    clean = tmp_path / 'clean.sql'
+    clean.write_text('CREATE SEMANTIC VIEW v TABLES (o AS shop.raw.orders PRIMARY KEY (order_id));')
+    assert run(capsys, '-C', str(tmp_path), 'conform', str(clean))[0] == 0
+    code, _, err = run(capsys, '-C', str(tmp_path), 'conform')
+    assert code == 2 and 'give a file or folder' in err
+    code, _, err = run(capsys, '-C', str(tmp_path), 'conform', str(clean), '--view', 'x')
+    assert code == 2 and '--warehouse' in err

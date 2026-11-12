@@ -236,11 +236,12 @@ describe('the views on recorded results', () => {
 
     it('conform: implementations of one name in two layers are both listed', () => {
         const call = recorded('conform');
-        const [differs] = data(call).findings as Record<string, unknown>[];
+        const findings = data(call).findings as Record<string, unknown>[];
+        const differs = findings.find(f => f.name === 'completed_order');
         const against = differs!.against as Record<string, unknown>[];
         against.push({ ...against[0]!, source: 'ossie metric' });
         expect(textOf(html(Conform, call))).toContain(
-            'Net revenue term, columns+name Net revenue ossie metric',
+            'Completed order term, name Completed order ossie metric',
         );
     });
 
@@ -255,18 +256,18 @@ describe('the views on recorded results', () => {
         );
     });
 
-    it('conform: each verdict, the two formulas, what it was compared with and the witness', () => {
+    it('conform: each verdict, the two formulas, what it was compared with and the missing filter', () => {
         const page = textOf(html(Conform, recorded('conform')));
-        expect(page).toContain('4 Metrics 2 conforms 1 differs 1 unbound 0 unparsed');
+        expect(page).toContain('2 Metrics 0 conforms 1 differs 1 unbound 0 unparsed');
         expect(page).toContain(
-            'net_revenue differs error differs from what the code and its approved definition say',
+            'completed_order differs warning differs from a definition matched through its columns or its name alone',
         );
         expect(page).toContain(
-            'In the layer SUM(payments.amount) What the code computes SUM(raw_payments.amount',
+            'In the layer COUNT(orders.order_key) What the code computes COUNT(raw_orders.id)',
         );
-        expect(page).toContain("Missing filter status = 'completed' approved definition: Net revenue");
-        expect(page).toContain("Witness where amount = 100, status = 'returned'");
-        expect(page).toContain('The same, with an error of at most 2.7e-19.');
+        expect(page).toContain(
+            "Missing filter orders.status = 'completed' approved definition: Completed order",
+        );
         expect(page).toContain('orders.order_key key-misfiled warning');
     });
 

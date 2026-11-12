@@ -39,6 +39,7 @@ async def _exercise(client: Client) -> None:
         'search',
         'describe',
         'conflicts',
+        'conform',
         'define',
         'ontology',
         'entity',
@@ -77,8 +78,10 @@ async def _exercise(client: Client) -> None:
     assert {n for n, a in annotated.items() if not a.read_only_hint} == {'search', 'gate', 'receipt'}
     assert {n for n, a in annotated.items() if not a.idempotent_hint} == {'receipt'}
     assert not any(a.destructive_hint for a in annotated.values())
-    # These reach the warehouse: running the models' SQL, or reading its query history.
+    # These reach the warehouse: running the models' SQL, reading its query history or the
+    # semantic layers it serves.
     assert {n for n, a in annotated.items() if a.open_world_hint} == {
+        'conform',
         'mutation_test',
         'why',
         'check_history',
@@ -161,6 +164,10 @@ async def _exercise(client: Client) -> None:
     assert (checked['passed'], checked['checked'], checked['findings']) == (True, True, [])
     wrong = structured(await client.call_tool('check_sql', {'sql': 'select nope from customers'}))
     assert [f['rule'] for f in wrong['findings']] == ['unknown-column']
+    outside = await client.call_tool('conform', {'paths': ['../elsewhere.sql']})
+    assert outside.is_error and 'outside the project' in str(outside.content)
+    nothing = structured(await client.call_tool('conform', {}))
+    assert nothing['summary']['metrics'] == 0 and nothing['documents'] == []
     path = structured(await client.call_tool('path', {'start': 'raw_orders', 'end': 'orders'}))
     assert path['found'] is True
     answer = structured(
@@ -202,6 +209,7 @@ async def _prompts_and_resources(client: Client) -> None:
         'ui://konstruct/impact': 'text/html;profile=mcp-app',
         'ui://konstruct/explain': 'text/html;profile=mcp-app',
         'ui://konstruct/gate': 'text/html;profile=mcp-app',
+        'ui://konstruct/conform': 'text/html;profile=mcp-app',
     }
     report = (await client.read_resource('konstruct://report')).contents[0]
     # Each resource is marked as repository text, as the tools' results are.
@@ -226,21 +234,22 @@ def test_in_process(jaffle_built_graph: Path) -> None:
 
 
 def test_a_host_with_mcp_apps_is_offered_a_view_of_each_drawn_tool(jaffle_built_graph: Path) -> None:
-    """impact, explain and gate point at their views through `_meta.ui.resourceUri`, each view is a
-    `ui://` resource of the Apps MIME type that asks the host to let it reach nothing, and a view is
-    served only for a tool the server has (conform's, once the server has a conform tool)."""
+    """impact, explain, gate and conform point at their views through `_meta.ui.resourceUri`, each
+    view is a `ui://` resource of the Apps MIME type that asks the host to let it reach nothing, and
+    a view is served only for a tool the server has."""
 
     async def main() -> None:
         async with Client(build_server(jaffle_built_graph)) as client:
             tools = (await client.list_tools()).tools
             bound = {t.name: t.meta['ui']['resourceUri'] for t in tools if t.meta and 'ui' in t.meta}
-            assert bound == {name: f'ui://konstruct/{name}' for name in ('impact', 'explain', 'gate')}
+            assert bound == {
+                name: f'ui://konstruct/{name}' for name in ('impact', 'explain', 'gate', 'conform')
+            }
             assert set(bound) <= set(VIEWS)
             assert all(not t.meta or set(t.meta) == {'ui'} for t in tools)
             listed = {str(r.uri): r for r in (await client.list_resources()).resources}
             views = {uri for uri in listed if uri.startswith('ui://')}
             assert views == set(bound.values())
-            assert ('ui://konstruct/conform' in views) == ('conform' in {t.name for t in tools})
             nowhere: dict[str, list[str]] = {
                 'connectDomains': [],
                 'resourceDomains': [],
@@ -297,6 +306,7 @@ RECORDED: dict[str, tuple[str, dict[str, Any]]] = {
     'explain-composed': ('explain', {'ref': 'customers.customer_lifetime_value', 'english': True}),
     'explain-plain': ('explain', {'ref': 'customers.customer_lifetime_value'}),
     'gate-passed': ('gate', {'base': 'HEAD'}),
+    'conform': ('conform', {'paths': ['semantic_views']}),
 }
 
 
@@ -318,6 +328,13 @@ def test_the_views_recorded_results_are_what_the_tools_return(
     root = tmp_path / 'jaffle_shop'
     shutil.copytree(jaffle_built_graph, root)
     (root / '.gitignore').write_text('konstruct-out/\n')
+    # A semantic view over the example's marts, written as dbt_semantic_view writes one, with two
+    # divergences planted (tests/fixtures/conform/README.md).
+    (root / 'semantic_views').mkdir()
+    shutil.copy(
+        Path(__file__).parent / 'fixtures' / 'conform' / 'dbt_semantic_view_jaffle.sql',
+        root / 'semantic_views',
+    )
     identity = ['-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false']
     for args in (['init', '-q', '-b', 'main'], ['add', '-A'], ['commit', '-qm', 'Start']):
         subprocess.run(['git', '-C', str(root), *identity, *args], check=True, capture_output=True)

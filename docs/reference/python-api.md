@@ -166,6 +166,22 @@ for metric in history.shadow:
 .. automethod:: konstruct.Project.check_history
 ```
 
+## Checking Semantic Layers
+
+```python
+result = project.conform(['semantic_views/'])
+for finding in result.failing:
+    print(finding['kind'], finding['name'], finding['verdict'], finding['detail'])
+print(result.summary)  # metrics, conforms, differs, unbound, unparsed, and the counts of the rest
+```
+
+```{eval-rst}
+.. automethod:: konstruct.Project.conform
+
+.. autoclass:: konstruct.interfaces.project.Conformance
+   :members: failing, to_dict
+```
+
 ## Reviewing Changes and Checking Lineage
 
 ```python

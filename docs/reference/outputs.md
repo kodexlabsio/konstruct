@@ -97,6 +97,7 @@ misread it; `konstruct status` reports such a graph rather than failing.
 | `lock --check` | 1 |
 | `diff` | 1 |
 | `gate` | 1 |
+| `conform` and `conform.json` | 1 |
 | `check-sql` | 1 |
 | `check-sql --history` | 1 |
 | `receipts issue`, `receipts show` and `receipts check` | 1 |
@@ -104,3 +105,11 @@ misread it; `konstruct status` reports such a graph rather than failing.
 The exports follow their own specifications: OpenLineage events carry their `schemaURL`, and an
 Apache Ossie model its Ossie `version`. Mermaid and Graphviz DOT are drawn for people, and their
 text can change in any release.
+
+## The Conform Document
+
+`conform.json` (`konstruct conform --json`) holds `documents` (each layer read, by the `key` the findings refer to it by, with its `name`, `platform`, `path` and counts), a `summary` of counts, the `findings`, `problems` and the `inputs` it was read from. A finding has a `document`, a `kind` (`metric`, `pair`, `key`, `relationship`, `fact`, `dimension` or `table`), a `name`, a `verdict`, a `severity` (`error`, `warning` or `info`) and a `detail`.
+
+A metric's finding adds the `expression` as the layer wrote it, the `code` Konstruct composes it from when it differs, `against` (what it was compared with, each with its `name`, `source` and `grade`), `reasons`, `missing_filters`, the `error_bound` when it conforms, the `witness` when it differs, and `held`: true when it is `unbound` only because the filters an approved definition requires all hold, with no formula to compare. A pair's finding (two layers that compute one concept differently) adds `layers`, `grade` and `missing_filters`.
+
+Each entry of `missing_filters` has the `filter`, `against` (`approved definition` or `sibling implementation`) and `by`: what requires the filter. In a metric's finding it is the approved definition's name; in a pair's it is the metric of the other layer that applies the filter, as `name (document)`. The metric the filter is missing from is the finding's own, or, in a pair's, the other of its `layers`.

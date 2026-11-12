@@ -77,7 +77,7 @@ PROMPT_PREFACE = """\
 Konstruct's MCP tools take the names and main arguments of the commands below (`impact`, `trace`,
 `describe`, `explain`, `define`, `ontology`, `entity`, `metric`, `relate`, `conflicts`,
 `sensitivity`, `erasure`, `history`, `compile_metric` for `konstruct compile-metric`,
-`path`, `search`, `diff`, `gate`, `query`, `check_sql` for `konstruct check-sql`, `check_history`
+`path`, `search`, `diff`, `gate`, `query`, `check_sql` for `konstruct check-sql`, `conform`, `check_history`
 for `konstruct check-sql --history`, `release_notes`, `timeline`, `mutation_test` for `konstruct verify
 --mutate`, `why` for `konstruct verify --why`, `definition_effect` for `konstruct verify
 --effect`, `receipt` for `konstruct receipts issue`, `laws` for `konstruct verify --laws` and
@@ -266,6 +266,50 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
             return run(lambda: gate_copy(project, base))
         except DiffError as error:
             raise _untrusted_error(str(error)) from error
+
+    @view(apps, 'conform', annotations=READS_WAREHOUSE)
+    def conform(
+        paths: list[str] | None = None, warehouse: bool = False, views: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Check the semantic layers deployed on data platforms against what the code computes:
+        Snowflake semantic views (`CREATE SEMANTIC VIEW` files, or the YAML Snowflake gives back),
+        Databricks metric views (the YAML or the `CREATE VIEW ... WITH METRICS` file) and Apache
+        Ossie models. Each metric gets a verdict: `conforms` (what it computes is shown to be what
+        the approved definitions and the other implementations of the concept say, with the
+        identity test's error bound), `differs` (an error when matched by name or a synonym, or
+        against an approved formula, a warning when matched through the columns alone, with a
+        witness and the missing filter and what requires it), `unbound` (nothing to compare it with) or `unparsed` (never
+        `conforms`). Keys, relationships and columns are checked against the code's tests and
+        joins. `paths` are files or folders inside the project; with `warehouse` the layers the
+        project's Snowflake and Databricks connections serve are read too, by metadata
+        statements only (the project must be trusted), `views` naming which."""
+        root = project.path.resolve()
+        found: list[Path] = []
+        skipped: list[str] = []
+        for item in paths or []:
+            path = (root / item).resolve()
+            if not path.is_relative_to(root):
+                raise ToolError(f'{item} is outside the project')
+            # A folder's files are resolved too: a link inside it may lead out of the project, and
+            # that file is left unread, with a problem, not the whole call refused.
+            members = sorted(path.rglob('*')) if path.is_dir() else [path]
+            for member in members:
+                if member.is_file():
+                    if not member.resolve().is_relative_to(root):
+                        if not path.is_dir():
+                            raise ToolError(f'{item} is outside the project')
+                        skipped.append(
+                            f'{member.relative_to(root)}: a link to a file outside the project, not read'
+                        )
+                        continue
+                    found.append(member.resolve())
+
+        def check() -> Any:
+            result = project.conform(found, warehouse=warehouse, views=views or [])
+            result.problems += skipped
+            return result
+
+        return run(check)
 
     server = MCPServer('konstruct', version=__version__, instructions=instructions, extensions=[apps])
     if prompts:
