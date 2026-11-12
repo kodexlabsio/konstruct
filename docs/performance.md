@@ -176,6 +176,22 @@ A build makes no index for search by meaning; the first search by meaning does, 
 
 `vectors.bin` is 17.8 MB at that size: the index and every node's blocks, so a process whose graph is the one the file was made from reads them rather than computing them.
 
+## dbt Manifests and Jinja
+
+Konstruct reads `manifest.json` and `catalog.json` and renders the Jinja of models dbt has not compiled in its native core, without making a Python object for any of the manifest. At 2,000 models:
+
+| | Python reader and Jinja2 | Native core |
+|---|---:|---:|
+| Read the manifest and catalog into the graph | 0.60 s | 0.34 s |
+| Render the Jinja of 2,000 models that dbt only parsed | 5.2 s | 0.03 s |
+| Read that manifest and render it | 5.1 s | 0.07 s |
+| `--update`, nothing changed | 6.4 s | 5.9 s |
+| `--update`, one model edited | 5.8 s | 4.6 s |
+| Agent hook, nothing changed | 6.0 s | 4.6 s |
+| Agent hook, one model edited | 5.5 s | 4.2 s |
+
+The renderer output is the same text as Jinja2's on every model. `uv run .kodex/scripts/benchmark.py 2000` measures the right column and `uv run .kodex/scripts/benchmark.py 2000 --oracles` the left, on the same machine.
+
 ## Finding Files
 
 A build walks the repository once, on every CPU, and each input finds its files in that walk: the directories are read by a pool of threads, put in name order afterwards so the answer does not depend on which thread was first, and matched against suffixes, name patterns and `exclude` patterns as they are found. The record a build keeps of each file it read (size, times, device and inode) and of the folders beside it is made in the same native code. On the 2,000-model project of `tests/test_scale.py` (four cores, a release build), the time spent finding files in an `--update` build fell from about 0.22 s to 0.016 s, the median of three builds, and the whole build from about 3.3 s to 2.8 s; on the 500-model project discovery fell from about 55 ms to 6 ms. `.kodex/scripts/benchmark.py` prints the time to discover every input of each size it builds. The rest of an `--update` build is spent reading dbt's selectors for each Airflow task, building nodes and edges and writing graph.json, and the viewer's formulas.
