@@ -7,9 +7,10 @@ given. Any string may hold lone surrogates (a file name decoded with ``surrogate
 id comes back exactly as it was given. ``konstruct.interfaces.serve`` starts the server, which
 reads the graph files itself and asks ``konstruct.interfaces.http_api`` for every answer.
 ``konstruct.inputs.airflow`` and ``konstruct.inputs.dagster`` re-export the readers of the
-orchestrators' files, whose records here are the ones the build and the plugins read."""
+orchestrators' files, whose records here are the ones the build and the plugins read, and
+``konstruct.inputs.jinja`` the renderer of dbt's Jinja."""
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import Field
 from os import PathLike
 from pathlib import Path
@@ -496,6 +497,26 @@ def scan_python_files(paths: Sequence[str | PathLike[str]]) -> list[tuple[bool, 
     """For each path, whether the file looks like an Airflow DAG file and whether it looks like a
     Dagster file (``looks_like_dag_file`` and ``looks_like_dagster_file`` of its bytes), with the
     files read in parallel. A file that cannot be read is neither."""
+
+@final
+class Renderer:
+    """Renders models of one dbt project, with its macros and its installed packages' macros, in a
+    sandbox that reads no file but the macros', runs no query and reaches no environment."""
+
+    adapter_type: str
+    def __init__(
+        self,
+        project_root: StrPath,
+        manifest: dict[str, Any],
+        *,
+        adapter_type: str | None = None,
+        macro_paths: Sequence[StrPath] | None = None,
+        keep: Callable[[list[Path]], Iterable[Path]] | None = None,
+        variables: dict[str, Any] | None = None,
+    ) -> None: ...
+    def render(self, sql: str) -> str:
+        """The SQL of a model with its Jinja rendered. Raises ``ValueError`` for a template that does
+        not parse or fails as it runs."""
 
 @final
 class Tree:

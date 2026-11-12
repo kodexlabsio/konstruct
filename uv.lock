@@ -1491,7 +1491,6 @@ version = "0.13.24"
 source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
-    { name = "jinja2" },
     { name = "lkml" },
     { name = "mcp" },
     { name = "orjson" },
@@ -1536,6 +1535,7 @@ dev = [
     { name = "dbt-postgres" },
     { name = "google-cloud-bigquery" },
     { name = "hypothesis" },
+    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "mypy" },
     { name = "playwright" },
@@ -1564,7 +1564,6 @@ requires-dist = [
     { name = "databricks-sql-connector", marker = "extra == 'databricks'", specifier = ">=3.4" },
     { name = "duckdb", specifier = ">=1.1" },
     { name = "google-cloud-bigquery", marker = "extra == 'bigquery'", specifier = ">=3.25" },
-    { name = "jinja2", specifier = ">=3.1" },
     { name = "konstruct", extras = ["snowflake", "bigquery", "databricks", "trino", "rdf"], marker = "extra == 'all'" },
     { name = "lkml", specifier = ">=1.3" },
     { name = "mcp", specifier = ">=2.0,<3" },
@@ -1590,6 +1589,7 @@ dev = [
     { name = "dbt-postgres", specifier = ">=1.11.0" },
     { name = "google-cloud-bigquery", specifier = ">=3.47.0" },
     { name = "hypothesis", specifier = ">=6.170.15" },
+    { name = "jinja2", specifier = ">=3.1" },
     { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "mypy", specifier = ">=2.0" },
     { name = "playwright", specifier = ">=1.65.0" },
