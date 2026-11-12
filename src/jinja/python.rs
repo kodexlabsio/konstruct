@@ -12,8 +12,8 @@ use super::dbt::{Macros, Renderer as Engine, Tables};
 use super::value::Value;
 
 /// The `.sql` files under `base`, in the order `sorted(base.rglob('*.sql'))` has them.
-fn sql_files(base: &Path, root: &Path) -> Vec<PathBuf> {
-    fn walk(folder: &Path, root: &Path, found: &mut Vec<PathBuf>) {
+fn sql_files(base: &Path, root: Option<&Path>) -> Vec<PathBuf> {
+    fn walk(folder: &Path, root: Option<&Path>, found: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(folder) else {
             return;
         };
@@ -28,7 +28,7 @@ fn sql_files(base: &Path, root: &Path) -> Vec<PathBuf> {
                 walk(&path, root, found);
             } else if path.extension().is_some_and(|ext| ext == "sql")
                 && (kind.is_file() || kind.is_symlink())
-                && regular_inside(&path, root)
+                && readable(&path, root)
             {
                 found.push(path);
             }
@@ -38,6 +38,15 @@ fn sql_files(base: &Path, root: &Path) -> Vec<PathBuf> {
     walk(base, root, &mut found);
     found.sort();
     found
+}
+
+/// Whether a macro file may be read: a regular file and, unless something has chosen which files
+/// to trust (`root` is None), one that is in the project.
+fn readable(path: &Path, root: Option<&Path>) -> bool {
+    match root {
+        Some(root) => regular_inside(path, root),
+        None => std::fs::metadata(path).is_ok_and(|meta| meta.is_file()),
+    }
 }
 
 /// Whether `path` is a regular file that is in the project, once its links are followed: a macro
@@ -144,13 +153,18 @@ pub(crate) fn macro_text(
 ) -> PyResult<String> {
     let mut texts = Vec::new();
     for base in bases {
-        // A folder outside the project (absolute, or reached by `..`) is not read.
-        let inside = std::fs::canonicalize(base)
-            .is_ok_and(|real| std::fs::canonicalize(root).is_ok_and(|r| real.starts_with(r)));
+        // Where nothing has chosen which files to trust, a folder outside the project (absolute,
+        // or reached by `..`) is not read, and nor is a link that leads out of it. A caller that
+        // has (the build, from the trust a project was given) decides for itself.
+        let confine = if keep.is_some() { None } else { Some(root) };
+        let inside = confine.is_none_or(|root| {
+            std::fs::canonicalize(base)
+                .is_ok_and(|real| std::fs::canonicalize(root).is_ok_and(|r| real.starts_with(r)))
+        });
         if !inside || !base.is_dir() {
             continue;
         }
-        let mut files = sql_files(base, root);
+        let mut files = sql_files(base, confine);
         if let Some(keep) = keep {
             let path_class = py.import("pathlib")?.getattr("Path")?;
             let given = PyList::new(
@@ -169,7 +183,7 @@ pub(crate) fn macro_text(
         texts.extend(
             files
                 .iter()
-                .filter(|file| regular_inside(file, root))
+                .filter(|file| readable(file, confine))
                 .map(|file| read_text(file)),
         );
     }
