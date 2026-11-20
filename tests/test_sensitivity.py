@@ -31,6 +31,8 @@ from konstruct.core.graph import Graph, Node
 from konstruct.engine.config import ConfigError
 from konstruct.interfaces.cli import main
 
+from .conftest import cpu_seconds
+
 SQL = """\
 create table crm.contacts as select p.id, p.email, upper(p.email) as shout, concat(p.first, ' ', p.last) as full_name from raw.people p;
 create table mart.hashed as select p.id, md5(p.email) as email_hash, sha256(p.email) as sha, hash(p.email) as h, md5(lower(trim(p.email))) as normal_hash, md5(p.email) || p.email as leaky from raw.people p;
@@ -1433,8 +1435,6 @@ def test_the_commands(shop: Project, capsys: pytest.CaptureFixture[str]) -> None
 
 def test_scale(tmp_path: Path) -> None:
     """Sensitivity and the erasure map on a generated project of 2,000 models."""
-    import time
-
     from tests.test_scale import make_project
 
     make_project(tmp_path, 2000)
@@ -1447,9 +1447,9 @@ def test_scale(tmp_path: Path) -> None:
         if c.kind == 'column' and c.parent and graph.nodes[c.parent].kind in ('source', 'seed', 'table')
     )
     column.attrs['warehouse_tags'] = {'PII': ''}
-    started = time.perf_counter()
+    started = cpu_seconds()
     result = sensitivity(graph)
-    elapsed = time.perf_counter() - started
+    elapsed = cpu_seconds() - started
     assert result.columns and elapsed < 10
 
 

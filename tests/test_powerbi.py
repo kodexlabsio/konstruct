@@ -19,6 +19,8 @@ from konstruct.inputs.powerbi import (
 )
 from konstruct.interfaces.status import inspect, render_config
 
+from .conftest import cpu_seconds
+
 
 def tmdl(text: str) -> str:
     """TMDL as Power BI Desktop writes it: tab indentation."""
@@ -455,15 +457,14 @@ def test_incremental_refresh_and_variables() -> None:
 
 def test_long_chains_of_measures_resolve_quickly() -> None:
     import random
-    import time
 
     rng = random.Random(7)
     lines = ['table T', '    column A', '        sourceColumn: a', '    measure M0 = SUM(T[A])']
     for i in range(1, 400):
         lines.append(f'    measure M{i} = [M{rng.randrange(i)}] + [M{max(0, i - 1)}] + [M{max(0, i - 2)}]')
     lines += ['    partition T = m', '        source = S{[Schema="dbo",Item="t"]}[Data]']
-    started = time.perf_counter()
+    started = cpu_seconds()
     (table,), problems = resolve([parse(tmdl('\n'.join(lines) + '\n'), 'T.tmdl')])
-    assert time.perf_counter() - started < 5
+    assert cpu_seconds() - started < 5
     assert problems == []
     assert table.reads[('dbo.t', 'a')] == {'A', *(f'M{i}' for i in range(400))}

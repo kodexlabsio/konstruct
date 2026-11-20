@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,6 +19,8 @@ from konstruct.analysis.mutation import ROW_COUNT, MutationTesting, _holds, _red
 from konstruct.analysis.verify import Candidate
 from konstruct.core.graph import Graph, Node
 from konstruct.core.mutate import OPERATORS, mutants, parse_query
+
+from .conftest import cpu_seconds
 
 # Mutant generation, on SQL strings
 
@@ -922,9 +923,9 @@ def test_jaffle_shop(jaffle_built_graph: Path) -> None:
     from konstruct.analysis.query import load_graph
 
     graph = load_graph(jaffle_built_graph / 'konstruct-out')
-    started = time.perf_counter()
+    started = cpu_seconds()
     result = mutate(graph, jaffle_built_graph, jaffle_built_graph / 'jaffle_shop.duckdb', max_mutants=12)
-    assert time.perf_counter() - started < 60
+    assert cpu_seconds() - started < 60
     by_label = {m.label: m for m in result.models}
     assert {'customers', 'orders'} <= set(by_label)
     orders = by_label['orders']

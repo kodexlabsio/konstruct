@@ -13,7 +13,6 @@ SQL, and over a generated project of 2,000 models.
 from __future__ import annotations
 
 import shutil
-import time
 from pathlib import Path
 
 import duckdb
@@ -33,6 +32,8 @@ from tests.test_checksql import (
     make_shop,
     shop_rows,
 )
+
+from .conftest import cpu_seconds
 
 CORRECT: dict[str, list[str]] = {
     'shop': [
@@ -679,12 +680,12 @@ def test_correct_queries_on_a_project_of_2000_models_pass(tmp_path_factory: pyte
     root = tmp_path_factory.mktemp('corpus_big')
     make_project(root, models=2000)
     graph = Project(root).build(run_dbt=False).graph
-    started = time.perf_counter()
+    started = cpu_seconds()
     checker = Checker(graph)
-    ready = time.perf_counter() - started
-    started = time.perf_counter()
+    ready = cpu_seconds() - started
+    started = cpu_seconds()
     failures = {sql: loud(checker.check(sql)) for sql in CORRECT['big']}
-    per_query = (time.perf_counter() - started) / len(CORRECT['big'])
+    per_query = (cpu_seconds() - started) / len(CORRECT['big'])
     assert {sql: found for sql, found in failures.items() if found} == {}
     # Measured at about 0.5 s to build the checker and 50 ms a query.
     assert ready < 10 and per_query < 1, (ready, per_query)

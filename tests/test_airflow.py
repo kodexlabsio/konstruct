@@ -6,7 +6,6 @@ import pickle
 import subprocess
 import sys
 import textwrap
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,6 +18,8 @@ from konstruct.inputs.airflow import (
     parse_dbt_commands,
     parse_file,
 )
+
+from .conftest import cpu_seconds
 
 EXAMPLE_DAG = (
     Path(__file__).resolve().parents[1] / 'examples' / 'jaffle_shop' / 'dags' / 'jaffle_shop_daily.py'
@@ -423,14 +424,14 @@ def test_a_decorated_task_is_on_the_line_of_its_def(tmp_path: Path) -> None:
 
 def test_a_long_chain_of_elifs_is_read_in_bounded_time(tmp_path: Path) -> None:
     branches = ''.join(f'elif x == {i}:\n    BashOperator(task_id=f"{{u}}{i}")\n' for i in range(60))
-    started = time.perf_counter()
+    started = cpu_seconds()
     [dag] = parse(
         tmp_path,
         'from airflow import DAG\nwith DAG("d") as dag:\n    if x == -1:\n        pass\n'
         + textwrap.indent(branches, '    '),
     )
     assert dag.tasks == {} and len(dag.warnings) == 60
-    assert time.perf_counter() - started < 5
+    assert cpu_seconds() - started < 5
 
 
 def test_each_else_and_finally_is_read_once(tmp_path: Path) -> None:
@@ -443,10 +444,10 @@ def test_each_else_and_finally_is_read_once(tmp_path: Path) -> None:
             depth - 1, indent + '    '
         )
 
-    started = time.perf_counter()
+    started = cpu_seconds()
     [dag] = parse(tmp_path, 'from airflow import DAG\nwith DAG("d") as dag:\n' + nested(40, '    '))
     assert len(dag.warnings) == 1 and 'no constant task_id' in dag.warnings[0]
-    assert time.perf_counter() - started < 5
+    assert cpu_seconds() - started < 5
     [dag] = parse(
         tmp_path,
         """
@@ -670,10 +671,10 @@ def test_parse_dbt_commands(command: str, expected: list[DbtInvocation]) -> None
 
 def test_a_large_dict_literal_is_read_in_linear_time(tmp_path: Path) -> None:
     keys = ', '.join(f"'key{i}': [{i}, 'v{i}']" for i in range(40_000))
-    started = time.perf_counter()
+    started = cpu_seconds()
     [dag] = parse(
         tmp_path,
         f'from airflow import DAG\nCONFIG = {{{keys}}}\nwith DAG("d") as dag:\n    BashOperator(task_id="a")\n',
     )
     assert list(dag.tasks) == ['a']
-    assert time.perf_counter() - started < 5
+    assert cpu_seconds() - started < 5
