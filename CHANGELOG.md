@@ -1,3 +1,14 @@
+## v0.13.24 (2026-11-20)
+
+### Feat
+
+- **cli**: Export ODCS 3.2 data contracts and test a contract's claims against the graph
+- **graph**: Record how many nulls konstruct verify found in a key column
+
+### Fix
+
+- **graph**: Read a not_null and a relationships test's where and severity like a unique test's
+
 ## v0.13.23 (2026-11-12)
 
 ### Fix
