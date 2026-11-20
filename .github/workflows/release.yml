@@ -2,6 +2,10 @@ name: Create Release
 
 # Runs after Build and Test passes on a push to main. main is protected, so nothing here pushes to
 # it: a release is a tag on the tested commit, or on a commit above it, and a GitHub release.
+# A batch merges by rebase, so main gets the tree its pull request passed Build and Test on; that
+# run on push then checks what the pull request did not (Python 3.11, 3.13 and 3.14, the native
+# wheels on Linux, macOS and Windows, the package and the install from GitHub), and every job when
+# the tree is not one a pull request passed on a green main (.kodex/scripts/ci_tested.sh).
 #
 # - When the tested commit carries a version with no tag (a pull request ran
 #   .kodex/scripts/prepare_release.py), that commit is tagged and released.

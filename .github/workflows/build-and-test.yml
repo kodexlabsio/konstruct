@@ -1,10 +1,25 @@
 name: Build and Test
 
+# Which jobs run depends on the event, and the changes job decides:
+#
+# - A pull request runs Lint, Tests on Python 3.12 with coverage, the commit checks and the release
+#   check always. Each job that holds a release runs unless every path the change touches is one
+#   it is known not to read, and each optional job when the change touches a path it lists
+#   (.kodex/scripts/ci_changes.py; a change to CI runs them all). Python 3.11 and 3.14 join when
+#   the dependencies change. The Changes job records the tree the run tests, for the push.
+# - A push to main whose tree a pull request's run passed on main as the push found it, while main
+#   and the latest full run on main were green (.kodex/scripts/ci_tested.sh), runs what a pull request
+#   does not: Python 3.11, 3.13 and 3.14, the native wheels on Linux, macOS and Windows, built and
+#   imported, the package, and the install from GitHub that the README describes. The release
+#   workflow waits for this run.
+# - Any other push, the nightly run and a run by hand run every job.
 on:
   push:
     branches: [main]
   pull_request:
     branches: ['**']
+  schedule:
+    - cron: '37 1 * * *'
   workflow_dispatch:
 
 # No job writes to the repository: each reads the code, and uploads artifacts with the runner's
@@ -12,9 +27,11 @@ on:
 permissions:
   contents: read
 
+# Only a pull request's superseded runs are cancelled: a push to main is what the release waits
+# for, and a push never cancels a nightly run.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CI: true
@@ -22,11 +39,133 @@ env:
 
 # Installing Konstruct compiles its Rust core (Cargo.toml and src/) with maturin, the build
 # backend, so every job that installs it sets up the stable toolchain first; the rust job also
-# checks the crate on the oldest Rust it supports.
+# checks the crate on the oldest Rust it supports. Those jobs share one cargo cache of the
+# dependencies' builds, which main saves and pull requests read.
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # the checkout
+      actions: read # the pull request's runs of this workflow
+      pull-requests: read # the pull request a commit pushed to main came from
+    outputs:
+      full: ${{ steps.areas.outputs.full }}
+      pythons_matrix: ${{ steps.areas.outputs.pythons_matrix }}
+      rust: ${{ steps.areas.outputs.rust }}
+      wheels: ${{ steps.areas.outputs.wheels }}
+      viewer: ${{ steps.areas.outputs.viewer }}
+      package: ${{ steps.areas.outputs.package }}
+      realworld: ${{ steps.areas.outputs.realworld }}
+      end_to_end: ${{ steps.areas.outputs.end_to_end }}
+      action: ${{ steps.areas.outputs.action }}
+      airflow: ${{ steps.areas.outputs.airflow }}
+      dagster: ${{ steps.areas.outputs.dagster }}
+      trino: ${{ steps.areas.outputs.trino }}
+      snowflake: ${{ steps.areas.outputs.snowflake }}
+      databricks: ${{ steps.areas.outputs.databricks }}
+    steps:
+      # A pull request's checkout is its merge commit, whose first parent is the base: the two
+      # commits give exactly what the pull request changes, and the merge's tree is what it tests.
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Whether a pull request tested this tree
+        id: tested
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: bash .kodex/scripts/ci_tested.sh
+
+      - name: Choose the jobs
+        id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+          TESTED: ${{ steps.tested.outputs.tested }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            full=false
+            areas=$(git diff --name-only --no-renames -z HEAD^1 HEAD |
+              python3 .kodex/scripts/ci_changes.py -z)
+            if grep -qx 'pythons=true' <<< "$areas"; then
+              pythons='["3.11", "3.12", "3.14"]'
+            else
+              pythons='["3.12"]'
+            fi
+            # Whether the change turned every job on, as a change to CI does.
+            if grep -q '=false$' <<< "$areas"; then every_job=false; else every_job=true; fi
+            echo "every_job=${every_job}" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = push ] && [ "$TESTED" = true ]; then
+            full=false
+            python3 .kodex/scripts/ci_changes.py < /dev/null
+            pythons='["3.11", "3.13", "3.14"]'
+          else
+            full=true
+            python3 .kodex/scripts/ci_changes.py --all
+            pythons='["3.11", "3.12", "3.13", "3.14"]'
+          fi
+          echo "full=${full}" >> "$GITHUB_OUTPUT"
+          echo "pythons_matrix=${pythons}" >> "$GITHUB_OUTPUT"
+          echo "full=${full}, Python ${pythons}"
+
+      # What this run tests, which .kodex/scripts/ci_tested.sh reads when the pull request merges:
+      # a run's pull_requests are empty once a rebase merge has given main new commits.
+      - name: Record the tree this run tests
+        if: github.event_name == 'pull_request'
+        env:
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
+          EVERY_JOB: ${{ steps.areas.outputs.every_job }}
+        run: |
+          mkdir -p tested
+          {
+            echo "number=${NUMBER}"
+            echo "head=${HEAD_SHA}"
+            echo "base=$(git rev-parse HEAD^1)"
+            echo "base_ref=${BASE_REF}"
+            echo "base_repo=${BASE_REPO}"
+            echo "tree=$(git rev-parse 'HEAD^{tree}')"
+            echo "every_job=${EVERY_JOB}"
+          } | tee tested/tested.txt
+
+      - name: Upload the record
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tested
+          path: tested/tested.txt
+          retention-days: 14
+
+      # Whether this push runs every job, which ci_tested.sh reads to find the latest full run on
+      # main: a nightly run and a run by hand always do.
+      - name: Record whether this push runs every job
+        if: github.event_name == 'push'
+        env:
+          FULL: ${{ steps.areas.outputs.full }}
+        run: mkdir -p full && echo "full=${FULL}" | tee full/full.txt
+
+      - name: Upload whether this push runs every job
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: full
+          path: full/full.txt
+          retention-days: 14
+
   lint:
     name: Lint and type check
+    needs: changes
+    if: github.event_name == 'pull_request' || needs.changes.outputs.full == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -39,6 +178,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -64,6 +209,10 @@ jobs:
 
   rust:
     name: Rust core (format, lint and tests)
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -77,6 +226,11 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --check
@@ -105,6 +259,10 @@ jobs:
 
   rust-architectures:
     name: Rust core on ${{ matrix.target }} (qemu)
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Debian's cross compilers link the tests and qemu-user runs them: each architecture's
@@ -141,6 +299,12 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends qemu-user "gcc-${GNU}" "libc6-dev-${{ matrix.debian }}-cross"
 
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # rust-version in Cargo.toml, on every architecture: global_asm! is stable on powerpc64
       # only from 1.95.
       - name: Check the oldest supported Rust
@@ -158,33 +322,100 @@ jobs:
           export "CARGO_TARGET_${upper}_RUNNER=qemu-${QEMU} -L /usr/${GNU}"
           cargo test --locked --target "$TARGET"
 
-  wheels:
+  # A wheel for each platform: each assembles and links the core its own way (Mach-O on macOS,
+  # COFF on Windows), which the Linux jobs above do not see, and the native ones are installed and
+  # run, which imports the package's Python on that platform. Every push to main builds and runs
+  # the native wheels, so a release never tags a tree that fails to build or import there; a full
+  # run and a pull request that changes the crate or maturin's settings build them all. The
+  # release workflow builds the wheels it publishes from the tag. The macOS and Windows builds run
+  # on the runner, so they keep a cargo cache; the Linux ones run in a manylinux container.
+  wheels-native:
     name: Wheel (${{ matrix.target }})
+    needs: changes
+    if: >-
+      github.event_name == 'push' || needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.wheels == 'true')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: '2_28', native: true }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: '2_28', native: false }
-          - { os: ubuntu-latest, target: powerpc64le-unknown-linux-gnu, manylinux: '2_28', native: false }
-          - { os: ubuntu-latest, target: s390x-unknown-linux-gnu, manylinux: '2_28', native: false }
-          - { os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, manylinux: '2_31', native: false }
-          - { os: ubuntu-latest, target: loongarch64-unknown-linux-gnu, manylinux: '2_36', native: false }
-          - { os: macos-latest, target: aarch64-apple-darwin, native: true }
-          - { os: macos-latest, target: x86_64-apple-darwin, native: false }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, native: true }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc, native: false }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, manylinux: '2_28' }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Cache the Rust build
+        if: runner.os != 'Linux'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       # One abi3 wheel per platform serves every supported Python. Linux wheels are built in a
-      # manylinux container (cross-compiling for the other architectures), so they install on any
-      # distribution with glibc 2.28 or newer (2.31 for riscv64 and 2.36 for loongarch64).
+      # manylinux container, so they install on any distribution with glibc 2.28 or newer.
+      - name: Build the wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          args: --release --locked --out dist
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Install and run the wheel
+        shell: bash
+        run: |
+          uv tool install dist/*.whl
+          konstruct --version
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+
+  wheels:
+    name: Wheel (${{ matrix.target }})
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.wheels == 'true')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, manylinux: '2_28' }
+          - { os: ubuntu-latest, target: powerpc64le-unknown-linux-gnu, manylinux: '2_28' }
+          - { os: ubuntu-latest, target: s390x-unknown-linux-gnu, manylinux: '2_28' }
+          - { os: ubuntu-latest, target: riscv64gc-unknown-linux-gnu, manylinux: '2_31' }
+          - { os: ubuntu-latest, target: loongarch64-unknown-linux-gnu, manylinux: '2_36' }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache the Rust build
+        if: runner.os != 'Linux'
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Linux wheels cross-compile in manylinux containers, so they install on any distribution
+      # with glibc 2.28 or newer (2.31 for riscv64 and 2.36 for loongarch64).
       - name: Build the wheel
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         # The s390x cross compiler targets z900 by default, which lacks instructions the parser's
@@ -196,17 +427,6 @@ jobs:
           args: --release --locked --out dist
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-
-      - name: Set up uv
-        if: matrix.native
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-
-      - name: Install and run the wheel
-        if: matrix.native
-        shell: bash
-        run: |
-          uv tool install dist/*.whl
-          konstruct --version
 
       - name: Upload the wheel
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -226,28 +446,24 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
 
+      # The checks read git and commitizen, not Konstruct, so the Rust core is not built.
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --no-install-project
 
       - name: Conventional Commits
         env:
           RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
-        run: uv run cz check --rev-range "$RANGE"
+        run: uv run --no-sync cz check --rev-range "$RANGE"
 
       - name: Kodex Labs commit rules
         env:
           RANGE: ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
-        run: uv run python .kodex/scripts/check_commit_message.py --rev-range "$RANGE"
+        run: uv run --no-sync python .kodex/scripts/check_commit_message.py --rev-range "$RANGE"
 
   release-preparation:
     name: Release preparation
@@ -269,14 +485,18 @@ jobs:
           BASE: origin/${{ github.base_ref }}
         run: python3 .kodex/scripts/prepare_release.py --check --no-fetch --base "$BASE" --title "$TITLE"
 
+  # Python 3.12, the version the project develops against, with coverage on every pull request;
+  # the oldest and newest without it, as the changes job chooses. pytest-xdist runs the suite on
+  # every core.
   test:
     name: Tests (Python ${{ matrix.python }})
+    needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        python: ['3.11', '3.12', '3.13', '3.14']
+        python: ${{ fromJSON(needs.changes.outputs.pythons_matrix) }}
     services:
       postgres:
         image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
@@ -315,6 +535,12 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
@@ -342,11 +568,11 @@ jobs:
       # system libraries takes many minutes on these images).
       - name: Run tests with coverage
         if: matrix.python == '3.12'
-        run: uv run pytest --cov --cov-report=term --cov-report=xml
+        run: uv run pytest -n auto --cov --cov-report=term --cov-report=xml
 
       - name: Run tests
         if: matrix.python != '3.12'
-        run: uv run pytest -m "not browser"
+        run: uv run pytest -n auto -m "not browser"
 
       - name: Upload the coverage report
         if: matrix.python == '3.12'
@@ -357,6 +583,10 @@ jobs:
 
   real-world:
     name: Real-world dbt project (dbt-labs/jaffle-shop)
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.realworld == 'true')
     runs-on: ubuntu-latest
     # Two clones and dbt builds of jaffle-shop: the real-world tests and the answer benchmark's.
     timeout-minutes: 30
@@ -370,6 +600,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -391,6 +627,10 @@ jobs:
 
   airflow-parity:
     name: Airflow parser against Apache Airflow
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.airflow == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -403,6 +643,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -417,6 +663,10 @@ jobs:
 
   end-to-end:
     name: End to end (jaffle_shop)
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.end_to_end == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -429,6 +679,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -470,6 +726,10 @@ jobs:
 
   package:
     name: Package
+    needs: changes
+    if: >-
+      github.event_name == 'push' || needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.package == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -532,6 +792,10 @@ jobs:
 
   action:
     name: GitHub Action and its gate on a breaking and a safe change
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.action == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # `$/` runs the action from this repository at the commit under test, as `kodexlabsio/konstruct@v0`
@@ -596,6 +860,10 @@ jobs:
 
   databricks-live:
     name: Databricks connector against a workspace
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.databricks == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Runs when the workspace secrets are configured; otherwise the job reports that it skipped.
@@ -617,9 +885,18 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Cache the Rust build
+        if: env.KONSTRUCT_TEST_DATABRICKS_TOKEN != ''
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Set up uv
         if: env.KONSTRUCT_TEST_DATABRICKS_TOKEN != ''
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
 
       - name: Integration tests
         if: env.KONSTRUCT_TEST_DATABRICKS_TOKEN != ''
@@ -631,6 +908,10 @@ jobs:
 
   trino:
     name: Trino connector against a Trino server
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.trino == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:
@@ -652,8 +933,16 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
 
       - name: Wait for Trino to start
         run: |
@@ -669,6 +958,10 @@ jobs:
 
   viewer:
     name: Viewer (Svelte and TypeScript)
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.viewer == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -712,6 +1005,10 @@ jobs:
 
   dagster-parity:
     name: Dagster parser against Dagster
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.dagster == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -724,6 +1021,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -737,6 +1040,10 @@ jobs:
 
   snowflake-emulated:
     name: Snowflake connector against fakesnow
+    needs: changes
+    if: >-
+      needs.changes.outputs.full == 'true' ||
+      (github.event_name == 'pull_request' && needs.changes.outputs.snowflake == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -749,6 +1056,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3

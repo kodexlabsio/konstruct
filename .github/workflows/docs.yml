@@ -1,11 +1,14 @@
 name: Docs
 
-# Builds the Sphinx documentation on every pull request and push, failing on any warning (a
-# broken link, a missing page, an API change the reference no longer matches), the viewer for
-# the jaffle_shop example with the same code, as the live demo at /demo/, and the paper, whose
-# numbers paper/generate.py measures from the same commit. Pull requests get the paper as an
-# artifact. On pushes to main the site job joins the documentation and, when its job succeeded,
-# the paper at /paper/konstruct.pdf, and publishes them to GitHub Pages at
+# Builds the Sphinx documentation, failing on any warning (a broken link, a missing page, an API
+# change the reference no longer matches), the viewer for the jaffle_shop example with the same
+# code, as the live demo at /demo/, and the paper, whose numbers paper/generate.py measures from
+# the same commit. Every push to main builds both; a pull request builds the documentation when
+# it changes the pages, the files they include, the package's docstrings, command line or API, or
+# the example, and the paper when it changes the paper or what generate.py runs to measure it
+# (.kodex/scripts/ci_changes.py). Pull requests get the paper as an artifact. On pushes to main
+# the site job joins the documentation and, when its job succeeded, the paper at
+# /paper/konstruct.pdf, and publishes them to GitHub Pages at
 # https://kodexlabsio.github.io/konstruct/. A failed paper job stays red but does not hold back
 # the documentation, which is then published without the paper.
 
@@ -23,8 +26,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.areas.outputs.docs }}
+      paper: ${{ steps.areas.outputs.paper }}
+    steps:
+      # A pull request's checkout is its merge commit, whose first parent is the base.
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Choose the jobs
+        id: areas
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            git diff --name-only --no-renames -z HEAD^1 HEAD | python3 .kodex/scripts/ci_changes.py -z
+          else
+            python3 .kodex/scripts/ci_changes.py --all
+          fi
+
   paper:
     name: Build the paper
+    needs: changes
+    if: needs.changes.outputs.paper == 'true'
     # The runner image fixes the TeX Live release that apt installs.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -39,6 +70,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -77,6 +114,8 @@ jobs:
 
   build:
     name: Build the documentation
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -91,8 +130,16 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
 
       - name: Build
         run: uv run --group docs sphinx-build -W --keep-going -b html docs docs/_build/html

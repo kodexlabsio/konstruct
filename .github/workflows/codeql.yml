@@ -2,7 +2,9 @@ name: CodeQL
 
 # CodeQL code scanning of Konstruct's own code: the Python package, the viewer's TypeScript,
 # the workflows and action.yml, and the Rust core once its sources are in the repository.
-# The results go to the Security tab and, on pull requests, to the pull request.
+# The results go to the Security tab and, on pull requests, to the pull request. Every push to
+# main and the weekly run analyse every language; a pull request analyses the languages whose files
+# it changes (.kodex/scripts/ci_changes.py), and all of them when it changes CI.
 #
 # Advanced setup: code scanning's default setup must stay off for the repository, as GitHub
 # rejects uploads from an advanced configuration while it is on.
@@ -30,24 +32,38 @@ jobs:
     outputs:
       languages: ${{ steps.detect.outputs.languages }}
     steps:
+      # A pull request's checkout is its merge commit, whose first parent is the base.
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       # CodeQL fails a language with no source files, so Rust joins the matrix only once there is some.
       - name: Detect the languages
         id: detect
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
-          languages='"actions", "javascript-typescript", "python"'
-          if [ -n "$(git ls-files '*.rs')" ]; then
-            languages="${languages}, \"rust\""
+          if [ "$EVENT" = pull_request ]; then
+            areas=$(git diff --name-only --no-renames -z HEAD^1 HEAD |
+              GITHUB_OUTPUT='' python3 .kodex/scripts/ci_changes.py -z)
+          else
+            areas=$(GITHUB_OUTPUT='' python3 .kodex/scripts/ci_changes.py --all)
           fi
-          echo "languages=[${languages}]" >> "$GITHUB_OUTPUT"
+          languages=()
+          grep -qx 'codeql_actions=true' <<< "$areas" && languages+=('"actions"')
+          grep -qx 'codeql_javascript=true' <<< "$areas" && languages+=('"javascript-typescript"')
+          grep -qx 'codeql_python=true' <<< "$areas" && languages+=('"python"')
+          if grep -qx 'codeql_rust=true' <<< "$areas" && [ -n "$(git ls-files '*.rs')" ]; then
+            languages+=('"rust"')
+          fi
+          echo "languages=[$(IFS=,; echo "${languages[*]}")]" | tee -a "$GITHUB_OUTPUT"
 
   analyze:
     name: Analyse (${{ matrix.language }})
     needs: languages
+    if: needs.languages.outputs.languages != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
