@@ -18,6 +18,8 @@ from konstruct.analysis.release_notes import Change
 from konstruct.interfaces.cli import main
 from tests.test_history import commit, git
 
+from .conftest import cpu_seconds
+
 TERM = """terms:
   - name: Lifetime value
     definition: What a customer has paid.
@@ -385,8 +387,6 @@ def test_the_mcp_tools(shop: Project) -> None:
 def test_a_large_project(tmp_path: Path) -> None:
     """Release notes and English on the generated project of tests/test_scale.py, with a commit
     that changes twenty models."""
-    import time
-
     from tests.test_scale import MODELS, make_project
 
     make_project(tmp_path)
@@ -400,14 +400,14 @@ def test_a_large_project(tmp_path: Path) -> None:
     commit(tmp_path, 'Change twenty models', 'Linus', '2026-02-01T10:00:00+00:00')
     project = Project(tmp_path)
     project.build(run_dbt=False, warehouses=False)
-    started = time.perf_counter()
+    started = cpu_seconds()
     notes = project.release_notes()
-    seconds = time.perf_counter() - started
+    seconds = cpu_seconds() - started
     assert sum(1 for c in notes.changes if c.kind == 'rows') == 20
     assert sum(1 for c in notes.changes if c.kind == 'formula') == 20 * 5
-    started = time.perf_counter()
+    started = cpu_seconds()
     worded = project.english(f'm{MODELS - 1:03}.c01')
-    english = time.perf_counter() - started
+    english = cpu_seconds() - started
     assert worded.english and not worded.verbatim
     assert seconds < 30 and english < 5, (seconds, english)
     print(

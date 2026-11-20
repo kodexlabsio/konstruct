@@ -13,6 +13,7 @@ from konstruct import Project
 from konstruct.analysis.identity import Formulas, column_fingerprints, fingerprint
 from konstruct.core.graph import Graph, Node
 
+from .conftest import cpu_seconds
 from .test_gate import git
 
 pytestmark = pytest.mark.scale
@@ -113,12 +114,16 @@ def give_entities(graph: Graph) -> None:
     graph.changed()
 
 
-def test_large_project(tmp_path: Path) -> None:
+def test_large_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One worker, so that the full build's CPU time is one analysis of each model, as the update's
+    # is, rather than up to eight workers' starts and imports added together. Once the build no
+    # longer reads KONSTRUCT_WORKERS, setting it does nothing.
+    monkeypatch.setenv('KONSTRUCT_WORKERS', '1')
     make_project(tmp_path)
     project = Project(tmp_path)
-    started = time.perf_counter()
+    started = cpu_seconds()
     result = project.build(run_dbt=False, warehouses=False)
-    full = time.perf_counter() - started
+    full = cpu_seconds() - started
     graph = result.graph
     assert graph.warnings == []
     assert sum(1 for n in graph.nodes.values() if n.kind == 'model') == MODELS
@@ -129,9 +134,9 @@ def test_large_project(tmp_path: Path) -> None:
     # The best of three, as a single run on a busy hosted runner can take half a full build.
     timings = []
     for _ in range(3):
-        started = time.perf_counter()
+        started = cpu_seconds()
         again = project.build(update=True, run_dbt=False, warehouses=False)
-        timings.append(time.perf_counter() - started)
+        timings.append(cpu_seconds() - started)
         assert again.cache_misses == 0
     incremental = min(timings)
     assert incremental < full / 2, f'--update took {incremental:.1f}s against {full:.1f}s'
@@ -175,9 +180,9 @@ def test_graph_json_is_written_and_read_back_fast(tmp_path: Path) -> None:
     written = tmp_path / 'again.json'
     timings = []
     for _ in range(3):
-        started = time.perf_counter()
+        started = cpu_seconds()
         built.write(written)
-        timings.append(time.perf_counter() - started)
+        timings.append(cpu_seconds() - started)
     assert written.read_bytes() == path.read_bytes()
     read = Graph.read(path)
     read.write(written)
@@ -565,16 +570,16 @@ def test_orchestrator_files_are_found_and_read_at_scale(tmp_path: Path) -> None:
     dags, assets, others = 400, 100, 1000
     make_orchestrator_repo(tmp_path, dags, others, assets)
     config = load_config(tmp_path)
-    started = time.perf_counter()
+    started = cpu_seconds()
     found_dags = discover_dag_files(config)
     found_assets = discover_dagster_files(config)
-    discovery = time.perf_counter() - started
+    discovery = cpu_seconds() - started
     assert len(found_dags) == dags
     assert {p.parent.parent.name for p in found_dags} == {'dags'}
     assert len(found_assets) == assets
-    started = time.perf_counter()
+    started = cpu_seconds()
     parsed = [parse_file(path) for path in found_dags]
-    reading = time.perf_counter() - started
+    reading = cpu_seconds() - started
     assert all(len(d) == 1 and len(d[0].tasks) == 6 and d[0].warnings == [] for d in parsed)
     seven = {d[0].dag_id: d[0] for d in parsed}['feed_7']
     assert seven.dependencies == [

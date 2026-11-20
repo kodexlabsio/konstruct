@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,17 @@ settings.load_profile(os.environ.get('HYPOTHESIS_PROFILE', 'dev'))
 
 REPO = Path(__file__).resolve().parents[1]
 EXAMPLE = REPO / 'examples' / 'jaffle_shop'
+
+
+def cpu_seconds() -> float:
+    """The CPU time this process and the children it has waited for have used, in seconds.
+
+    A test that times work reads this, not the wall clock, so that a busy machine (the other
+    pytest-xdist workers, and a build's own worker processes on the same cores) does not count
+    against the code it times. A build waits for its workers when it ends, so their time counts.
+    """
+    times = os.times()
+    return time.process_time() + times.children_user + times.children_system
 
 
 @pytest.fixture(autouse=True, scope='session')

@@ -25,6 +25,8 @@ from tests.test_history import commit, git
 from tests.test_release_notes import make_pairs
 from tests.test_release_notes import make_shop as make_sql_shop
 
+from .conftest import cpu_seconds
+
 PROJECT = 'name: shop\nprofile: shop\n'
 CUSTOMERS = 'select id as customer_id, name as customer_name from raw.customers\n'
 ORDERS = 'select id as order_id, customer_id, amount, status from raw.orders\n'
@@ -966,10 +968,9 @@ def test_only_models_rendered_without_their_package_macros_are_named(tmp_path: P
     assert installed_packages(_project(tmp_path / 'none')) == set()
 
 
-def test_the_timeline_of_a_generated_project(tmp_path: Path) -> None:
+def test_the_timeline_of_a_generated_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Three commits on the generated project (tests/test_scale.py), each model with a primary key:
     a formula changed, a key dropped and a measure defined. Built once, then read from the cache."""
-    import time
 
     from tests.test_scale import MODELS, make_project
 
@@ -994,9 +995,13 @@ def test_the_timeline_of_a_generated_project(tmp_path: Path) -> None:
     term = f'terms:\n  - name: Middle value\n    kind: measure\n    columns: [{middle}.c01]\n'
     _files(tmp_path, **{'definitions.yml': term})
     commit(tmp_path, 'Define the middle value', 'Priya', '2026-01-04T10:00:00+00:00')
-    started = time.perf_counter()
+    # One worker, so that the cold timeline's CPU time is one analysis of each world's models, not
+    # up to eight workers' starts added together, and the cache is held to a third of it. Once
+    # the build no longer reads KONSTRUCT_WORKERS, setting it does nothing.
+    monkeypatch.setenv('KONSTRUCT_WORKERS', '1')
+    started = cpu_seconds()
     result = timeline(tmp_path, since='HEAD~3')
-    cold = time.perf_counter() - started
+    cold = cpu_seconds() - started
     assert [(e.commit.subject, e.changes[0].headline()) for e in result.entries] == [
         ('Triple c01', f"property '{middle}.c01': formulas changed"),
         ('Drop a key', f"entity '{last}': removed"),
@@ -1005,9 +1010,9 @@ def test_the_timeline_of_a_generated_project(tmp_path: Path) -> None:
     tripled = result.entries[0].changes[0]
     assert [line.endswith('times 3') for line in tripled.english] == [True]
     assert [c.name for c in result.entries[2].changes if c.kind == 'metric'] == ['Middle value']
-    started = time.perf_counter()
+    started = cpu_seconds()
     assert timeline(tmp_path, since='HEAD~3').to_dict() == result.to_dict()
-    cached = time.perf_counter() - started
+    cached = cpu_seconds() - started
     assert cached < cold / 3, (cold, cached)
     print(f'\n{MODELS} models, 4 worlds: {cold:.1f} s, then {cached:.2f} s from the cache')
 

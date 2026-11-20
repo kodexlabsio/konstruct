@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import textwrap
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -18,6 +17,8 @@ import pytest
 
 from konstruct import Project
 from konstruct.inputs.dagster import parse_file, parse_source
+
+from .conftest import cpu_seconds
 
 FIXTURE = Path(__file__).parent / 'fixtures' / 'dagster' / 'definitions.py'
 
@@ -544,11 +545,11 @@ def test_folding_values_that_double_is_capped(tmp_path: Path) -> None:
         'import sys; from konstruct.inputs.dagster import parse_file\n'
         'print([(a.key, a.description) for a in parse_file(sys.argv[1]).assets])'
     )
-    started = time.perf_counter()
+    started = cpu_seconds()
     done = subprocess.run([sys.executable, '-c', code, str(source)], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr[-300:]
     assert done.stdout.strip() == "[('a', None), ('b', 'ok')]"
-    assert time.perf_counter() - started < 5
+    assert cpu_seconds() - started < 5
 
 
 def test_records_copy_and_pickle_like_dataclasses() -> None:

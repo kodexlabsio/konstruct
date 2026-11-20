@@ -7,7 +7,6 @@ from __future__ import annotations
 import codecs
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -21,6 +20,8 @@ from konstruct.inputs import ingestion
 from konstruct.inputs.dbt import read_project
 from konstruct.interfaces import hook
 from konstruct.semantics import definitions, ossie
+
+from .conftest import cpu_seconds
 
 DIGITS = sys.get_int_max_str_digits() or sys.int_info.default_max_str_digits
 # Aliases to aliases: 7 levels of 9 stand for 5.3 million values in a few hundred bytes.
@@ -265,10 +266,10 @@ def test_a_character_past_the_basic_plane_is_read_written_or_escaped() -> None:
 def test_a_lone_surrogate_and_a_huge_sexagesimal_are_refused_at_once() -> None:
     with pytest.raises(yaml.YAMLError, match='surrogate'):
         yamlio.load_all('a: "\\ud800"\n')
-    started = time.perf_counter()
+    started = cpu_seconds()
     with pytest.raises(yaml.YAMLError, match='digits'):
         yamlio.load_all('a: 1' + ':59' * 20_000 + '\n')
-    assert time.perf_counter() - started < 2
+    assert cpu_seconds() - started < 2
 
 
 def test_the_aliases_of_each_document_are_counted_on_their_own() -> None:
@@ -290,10 +291,10 @@ def _bomb_stream(copies: int) -> str:
 def test_the_alias_budget_is_one_for_the_whole_stream() -> None:
     # One copy is under a million values; ten are five million, which the stream must not expand.
     assert len(yamlio.load_all(_bomb_stream(1))) == 1
-    started = time.perf_counter()
+    started = cpu_seconds()
     with pytest.raises(yaml.YAMLError, match='aliases'):
         yamlio.load_all(_bomb_stream(10))
-    assert time.perf_counter() - started < 2
+    assert cpu_seconds() - started < 2
     # Documents with a few aliases each are as many as a stream likes.
     small = 'a: &x [1, 2]\nb: *x\n'
     assert len(yamlio.load_all('---\n'.join([small] * 500))) == 500

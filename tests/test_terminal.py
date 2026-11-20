@@ -17,6 +17,8 @@ from konstruct.interfaces.cli import main
 from konstruct.interfaces.console import Console, colour_enabled, style_for, terminal_width, unicode_enabled
 from konstruct.interfaces.layout import Branch, Style, Text, pairs, sql, table, tree, wrap
 
+from .conftest import cpu_seconds
+
 ESCAPE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
 
 
@@ -604,9 +606,9 @@ def test_piped_text_is_never_shortened(jaffle_built_graph: Path) -> None:
 
 def test_sql_highlighting_is_linear() -> None:
     formula = 'SUM(orders.amount * 2) + ' * 25_000 + "'x'"
-    started = time.perf_counter()
+    started = cpu_seconds()
     highlighted = sql(formula)
-    elapsed = time.perf_counter() - started
+    elapsed = cpu_seconds() - started
     assert highlighted.plain == formula and len(formula) > 600_000
     assert elapsed < 3  # quadratic concatenation took about 20 s at this size
 

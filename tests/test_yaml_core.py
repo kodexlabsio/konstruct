@@ -18,6 +18,8 @@ import yaml
 from konstruct import _core
 from konstruct.core import yamlio
 
+from .conftest import cpu_seconds
+
 
 def failure(text: str | bytes, **options: Any) -> tuple[str, str | None, str]:
     with pytest.raises(_core.YamlFailure) as raised:
@@ -124,16 +126,6 @@ def test_text_with_a_surrogate_is_refused_where_it_is() -> None:
     assert mark == (8, 1, 3)
 
 
-def seconds(text: str, **options: Any) -> float:
-    best = float('inf')
-    for _ in range(3):
-        began = time.perf_counter()
-        with contextlib.suppress(_core.YamlFailure):
-            _core.yaml_load(text, **options)
-        best = min(best, time.perf_counter() - began)
-    return best
-
-
 def sized(make: Callable[[int], str], megabytes: int) -> str:
     """``make`` of a size that gives about ``megabytes`` MB."""
     probe = make(1000)
@@ -141,7 +133,7 @@ def sized(make: Callable[[int], str], megabytes: int) -> str:
 
 
 # Text that makes a reader slow when some step of it looks again at what it has read: each is read
-# at 1 MB and at 4 MB, and four times the text must not take much more than four times as long.
+# at a size that takes 20 ms and at four times it, which must not take much more than four times as long.
 GROWING: dict[str, Callable[[int], str]] = {
     'plain': lambda n: 'a: ' + 'word ' * (n // 5) + '\n',
     'flow': lambda n: '[' + ', '.join(['x'] * (n // 3)) + ']',
@@ -173,20 +165,27 @@ GROWING: dict[str, Callable[[int], str]] = {
 def test_four_times_the_text_takes_about_four_times_as_long(name: str, lines: bool) -> None:
     make = GROWING[name]
     read = _core.yaml_load_all if name == 'documents' else _core.yaml_load
-    small, large = sized(make, 1), sized(make, 4)
 
-    def best(text: str) -> float:
-        times = []
-        for _ in range(5):
-            began = time.perf_counter()
-            with contextlib.suppress(_core.YamlFailure):
-                read(text, lines=lines)
-            times.append(time.perf_counter() - began)
-        return min(times)
+    # The time this process spent reading, not the wall clock, so that a busy machine (the other
+    # test workers) does not count against the reader.
+    def once(text: str) -> float:
+        began = time.process_time()
+        with contextlib.suppress(_core.YamlFailure):
+            read(text, lines=lines)
+        return time.process_time() - began
 
-    first, second = best(small), best(large)
-    # Linear is 4; quadratic is 16. The floor keeps a fast reading from being all noise.
-    assert second < 10 * max(first, 0.005), (name, first, second)
+    # The smaller text is made large enough to take 20 ms, so that its reading is a measurement
+    # rather than noise, whatever the case and the machine; and the sizes are read in turn, so
+    # that both see the same machine.
+    megabytes = 1
+    while megabytes < 64 and min(once(sized(make, megabytes)) for _ in range(3)) < 0.02:
+        megabytes *= 2
+    small, large = sized(make, megabytes), sized(make, 4 * megabytes)
+    readings = [(once(small), once(large)) for _ in range(5)]
+    first, second = min(r[0] for r in readings), min(r[1] for r in readings)
+    assert first >= 0.01, (name, megabytes, first)
+    # Linear is 4; quadratic is 16.
+    assert second < 10 * first, (name, megabytes, first, second)
 
 
 def test_a_merge_chain_is_flattened_once_for_every_mapping_that_merges_it() -> None:
@@ -194,9 +193,9 @@ def test_a_merge_chain_is_flattened_once_for_every_mapping_that_merges_it() -> N
         f'm{n}: &m{n} {{<<: *m{n - 1}, k{n}: {n}}}\n' for n in range(1, 200)
     )
     siblings = ''.join(f's{n}: {{<<: *m199, own: {n}}}\n' for n in range(1_000))
-    began = time.perf_counter()
+    began = cpu_seconds()
     value = _core.yaml_load(chain + siblings)
-    assert time.perf_counter() - began < 1
+    assert cpu_seconds() - began < 1
     assert len(value['s999']) == 201
     assert list(value['m3']) == ['k0', 'k1', 'k2', 'k3']
 
@@ -354,11 +353,11 @@ def test_a_source_that_is_not_text_is_a_yaml_error(tmp_path: Path) -> None:
 def test_documents_with_merge_keys_and_lines_are_read_without_a_thread_each() -> None:
     """Building the values uses no thread, which would cost about a millisecond a file."""
     text = 'base: &b {x: 1}\nm: {<<: *b, y: 2}\n'
-    began = time.perf_counter()
+    began = cpu_seconds()
     for _ in range(2000):
         _core.yaml_load(text)
         _core.yaml_load(text, lines=True)
-    assert time.perf_counter() - began < 0.5
+    assert cpu_seconds() - began < 0.5
 
 
 def test_a_scalar_read_through_equals_keys_needs_no_stack() -> None:

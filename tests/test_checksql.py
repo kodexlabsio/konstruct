@@ -6,7 +6,6 @@ import ast
 import itertools
 import json
 import sys
-import time
 import types
 from collections.abc import Callable
 from pathlib import Path
@@ -32,6 +31,8 @@ from konstruct.analysis.checksql import (
 )
 from konstruct.core.graph import Graph
 from konstruct.inputs.usage import HistoryQuery, QueryHistory, UsageSettings, fetch_history
+
+from .conftest import cpu_seconds
 
 WAREHOUSE = """
 create schema raw;
@@ -2299,19 +2300,19 @@ def test_checking_a_query_on_a_large_project_is_fast(tmp_path: Path) -> None:
 
     make_project(tmp_path, models=300)
     graph = Project(tmp_path).build(run_dbt=False).graph
-    started = time.perf_counter()
+    started = cpu_seconds()
     checker = Checker(graph)
-    ready = time.perf_counter() - started
+    ready = cpu_seconds() - started
     sql = """
         select a.c00, sum(a.c01) as c01, sum(b.c02 * 2) as c04
         from wh.analytics.m299 a join wh.analytics.m150 b on a.c00 = b.c00
         where a.c03 > 0
         group by 1
     """
-    started = time.perf_counter()
+    started = cpu_seconds()
     for _ in range(20):
         checker.check(sql)
-    per_query = (time.perf_counter() - started) / 20
+    per_query = (cpu_seconds() - started) / 20
     assert ready < 20 and per_query < 2, (ready, per_query)
 
 
