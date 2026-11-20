@@ -1,3 +1,23 @@
+## v0.13.25 (2026-11-20)
+
+### Feat
+
+- **plugins**: Add the platform-definition-differs gate rule
+- **cli**: Add konstruct conform and the conform MCP tool
+- **query**: Check platform semantic layers against what the code computes
+- **query**: Add the native check of platform semantic layers against the code
+- **mcp**: Offer the views to hosts with the MCP Apps extension
+- **viewer**: Draw the impact, explain, gate and conform results as MCP App views
+- **dbt**: Read the manifest and catalog in the Rust core
+- **dbt**: Render dbt Jinja in the Rust core
+
+### Fix
+
+- **viewer**: Say when a copy button selected the text instead
+- **dbt**: Leave macro links to the build's trust, and confine the reads that have none
+- **dbt**: Read relation names as sqlglot does, and test it against sqlglot
+- **dbt**: Keep every Jinja2 feature and bound what a render may do
+
 ## v0.13.24 (2026-11-20)
 
 ### Feat
