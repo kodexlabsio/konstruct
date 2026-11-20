@@ -3,11 +3,37 @@ name: Fuzz
 # Runs the Atheris harnesses in tests/fuzz_targets/ against the readers of untrusted input (SQL,
 # Python DAG and job files, definitions and Ossie YAML, loader configuration): each must report
 # what it cannot read, never raise.
-# Pull requests that change the package fuzz each harness for two minutes; the weekly run for
-# twenty. A crash uploads the input that caused it.
+# A pull request fuzzes for two minutes each harness whose readers it changes, with the core and the
+# Rust core beneath them (.kodex/scripts/ci_changes.py, whose fuzz areas these paths join, as
+# tests/test_ci_changes.py checks); the weekly run fuzzes every harness for twenty. A crash uploads
+# the input that caused it.
 on:
   pull_request:
-    paths: ['konstruct/**', 'tests/fuzz_targets/**', 'uv.lock', '.github/workflows/fuzz.yml']
+    paths:
+      - '.github/actions/**'
+      - '.github/workflows/**'
+      - '.kodex/scripts/ci_changes.py'
+      - '.kodex/scripts/ci_tested.sh'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'konstruct/core/**'
+      - 'konstruct/inputs/airflow.py'
+      - 'konstruct/inputs/dagster.py'
+      - 'konstruct/inputs/dbt.py'
+      - 'konstruct/inputs/hcl.py'
+      - 'konstruct/inputs/ingestion.py'
+      - 'konstruct/inputs/jinja.py'
+      - 'konstruct/inputs/spark.py'
+      - 'konstruct/semantics/**'
+      - 'pyproject.toml'
+      - 'src/**'
+      - 'tests/fuzz_targets/fuzz_ingestion.py'
+      - 'tests/fuzz_targets/fuzz_jinja.py'
+      - 'tests/fuzz_targets/fuzz_manifest.py'
+      - 'tests/fuzz_targets/fuzz_python.py'
+      - 'tests/fuzz_targets/fuzz_sql.py'
+      - 'tests/fuzz_targets/fuzz_yaml.py'
+      - 'uv.lock'
   schedule:
     - cron: '41 3 * * 0'
   workflow_dispatch:
@@ -23,26 +49,49 @@ env:
   UV_FROZEN: '1'
 
 jobs:
+  changes:
+    name: Harnesses to run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+    steps:
+      # A pull request's checkout is its merge commit, whose first parent is the base.
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Choose the harnesses
+        id: targets
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            areas=$(git diff --name-only --no-renames -z HEAD^1 HEAD |
+              GITHUB_OUTPUT='' python3 .kodex/scripts/ci_changes.py -z)
+          else
+            areas=$(GITHUB_OUTPUT='' python3 .kodex/scripts/ci_changes.py --all)
+          fi
+          targets=()
+          while IFS='=' read -r target seeds; do
+            if grep -qx "fuzz_${target}=true" <<< "$areas"; then
+              targets+=("{\"target\": \"${target}\", \"seeds\": \"${seeds}\"}")
+            fi
+          done <<< $'sql=*.sql\npython=*.py\nyaml=*.y*ml\ningestion=*.json\njinja=*.sql\nmanifest=*.json'
+          echo "targets=[$(IFS=,; echo "${targets[*]}")]" | tee -a "$GITHUB_OUTPUT"
+
   fuzz:
     name: Fuzz (${{ matrix.target }})
+    needs: changes
+    if: needs.changes.outputs.targets != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: sql
-            seeds: '*.sql'
-          - target: python
-            seeds: '*.py'
-          - target: yaml
-            seeds: '*.y*ml'
-          - target: ingestion
-            seeds: '*.json'
-          - target: jinja
-            seeds: '*.sql'
-          - target: manifest
-            seeds: '*.json'
+        include: ${{ fromJSON(needs.changes.outputs.targets) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,6 +103,12 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: maturin
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Set up uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3

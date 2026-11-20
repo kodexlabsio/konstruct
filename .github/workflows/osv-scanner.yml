@@ -5,11 +5,24 @@ name: Dependency audit
 # core's Cargo.lock once it is in the repository, as the scan finds lock files wherever they are.
 # A vulnerability that does not affect Konstruct is ignored in the osv-scanner.toml beside its lock
 # file (at the root, for pnpm-lock.yaml), with the reason and a date to look at it again. The
-# daily run catches advisories published for versions that are already locked.
+# daily run catches advisories published for versions that are already locked, so a push or pull
+# request scans only when it changes a lock file or what the scan ignores.
 on:
   push:
     branches: [main]
+    paths:
+      - '**/uv.lock'
+      - '**/pnpm-lock.yaml'
+      - '**/Cargo.lock'
+      - '**/osv-scanner.toml'
+      - '.github/workflows/osv-scanner.yml'
   pull_request:
+    paths:
+      - '**/uv.lock'
+      - '**/pnpm-lock.yaml'
+      - '**/Cargo.lock'
+      - '**/osv-scanner.toml'
+      - '.github/workflows/osv-scanner.yml'
   schedule:
     - cron: '29 5 * * *'
   workflow_dispatch:
