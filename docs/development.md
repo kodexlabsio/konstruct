@@ -31,6 +31,7 @@ uv run playwright install chromium              # once, for the browser tests
 uv run pytest                                   # Postgres and Iceberg REST tests skip without services
 eval "$(.kodex/scripts/services.sh up)"         # start them in Docker and export their addresses
 uv run pytest --cov                             # everything, with branch coverage (fails under 90%)
+uv run pytest -n auto --cov                     # the same on every core, as CI runs it
 .kodex/scripts/services.sh down
 ```
 
