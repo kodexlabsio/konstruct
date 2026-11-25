@@ -387,12 +387,13 @@ def build_server(root: Path, *, plugins: bool = True, prompts: bool = True) -> M
     def check_sql(sql: str) -> dict[str, Any]:
         """Check SQL you wrote against the project before you run it or give it as an answer,
         without running it: a measure that leaves out a filter its approved definition requires
-        or computes it differently, a column of a retired term, a sum, count or average over a join
-        that repeats its rows, a measure of a coarser grain repeated on finer rows, a join off a
-        relationship's columns, and relations or columns the project does not have. Each finding
-        has its fix and evidence, and `corrected` holds the SQL with the safe fixes applied. Fix
-        the query and check it again until `passed` is true; `checked` is false when a statement
-        could not be analysed."""
+        or computes it differently, a measure named for a term that reads only other terms'
+        columns, a result in cents of a column the project reads in whole units, a column of a
+        retired term, a sum, count or average over a join that repeats its rows, a measure of a
+        coarser grain repeated on finer rows, a join off a relationship's columns, and relations
+        or columns the project does not have. Each finding has its fix and evidence, and
+        `corrected` holds the SQL with the safe fixes applied. Fix the query and check it again
+        until `passed` is true; `checked` is false when a statement could not be analysed."""
         return run(project.check_sql, sql)
 
     @server.tool(annotations=READS_WAREHOUSE)

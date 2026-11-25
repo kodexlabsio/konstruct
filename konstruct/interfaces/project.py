@@ -782,11 +782,12 @@ class Project:
         measure: its formula is composed down to source columns, with the filters on the way, and
         compared with the business term it is named for or the column of the project that already
         holds it. The checks find a measure that leaves out a filter its definition requires or
-        computes it differently, a column of a retired term, a sum, count or average over a join
-        that repeats the rows it aggregates, a measure of a coarser grain repeated on the rows of a
-        finer one, a join off the columns of a relationship, and a relation or column the project
-        does not have. Each finding carries its fix, and ``corrected`` holds the SQL with every fix
-        that changes nothing else applied.
+        computes it differently, a measure named for a term that reads only other terms' columns,
+        a result in cents of a column the project reads in whole units, a column of a retired term,
+        a sum, count or average over a join that repeats the rows it aggregates, a measure of a
+        coarser grain repeated on the rows of a finer one, a join off the columns of a
+        relationship, and a relation or column the project does not have. Each finding carries its
+        fix, and ``corrected`` holds the SQL with every fix that changes nothing else applied.
 
         Args:
             sql: One or more statements.

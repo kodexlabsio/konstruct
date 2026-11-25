@@ -431,8 +431,9 @@ def test_lifetime_value_by_customer_is_the_models_own_column(project: Project) -
     column = project.graph.resolve('customers.customer_lifetime_value')[0]
     compiled = checker.form(_value(result).sql(dialect='duckdb'))
     model = checker.form(None, column)
-    # In canonical form, composed down to source, the compiled SQL is the model's own formula.
-    assert compiled.formula == model.formula == 'SUM(jaffle_shop.main.raw_payments.amount / 100)'
+    # In canonical form, composed down to source with constant factors taken out of the sum, the
+    # compiled SQL is the model's own formula.
+    assert compiled.formula == model.formula == 'SUM(jaffle_shop.main.raw_payments.amount) / 100'
     assert compiled.sources == model.sources
     assert result.confidence == 'declared' and result.flags == []
 
