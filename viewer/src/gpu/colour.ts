@@ -29,6 +29,7 @@ const KIND_SLOT: Record<string, number> = {
     model: 5,
     snapshot: 5,
     table: 11,
+    file: 11,
     task: 12,
     exposure: 13,
 };

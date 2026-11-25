@@ -38,7 +38,19 @@ if TYPE_CHECKING:
 __all__ = ['OUT_DIR', 'find_out_dir', 'main', 'parser']
 
 BUILTIN_FORMATS = tuple(name for name, _ in BUILTINS['exports'])
-NODE_KINDS = ('source', 'table', 'column', 'model', 'seed', 'snapshot', 'dag', 'task', 'test', 'exposure')
+NODE_KINDS = (
+    'source',
+    'table',
+    'column',
+    'model',
+    'seed',
+    'snapshot',
+    'file',
+    'dag',
+    'task',
+    'test',
+    'exposure',
+)
 
 
 def _project(args: argparse.Namespace) -> Project:

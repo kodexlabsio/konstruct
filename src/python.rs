@@ -595,6 +595,8 @@ mod core_module {
         parse_dagster_file, parse_dagster_source,
     };
     #[pymodule_export]
+    use crate::datafile::python::{TrackedFiles, data_file_columns};
+    #[pymodule_export]
     use crate::dbt::python::{Artefact, read_artefact, relation_name};
     #[pymodule_export]
     use crate::discover::python::{
@@ -606,7 +608,8 @@ mod core_module {
     use crate::jinja::python::Renderer;
     #[pymodule_export]
     use crate::model::{
-        Edge, Graph, Node, Step, column_id, reading_key, relation_key, split_reading,
+        Edge, Graph, Node, Step, column_id, file_key, key_part, reading_key, relation_key,
+        split_reading,
     };
     #[pymodule_export]
     use crate::odcs::python::{odcs_check, odcs_export};
@@ -634,7 +637,7 @@ mod core_module {
             pyo3::types::PyFrozenSet::new(py, crate::model::RELATION_KINDS)?,
         )?;
         let order = pyo3::types::PyDict::new(py);
-        for kind in ["source", "model", "snapshot", "seed", "table"] {
+        for kind in ["source", "model", "snapshot", "seed", "table", "file"] {
             order.set_item(kind, crate::model::priority(kind))?;
         }
         module.add("RELATION_PRIORITY", order)?;

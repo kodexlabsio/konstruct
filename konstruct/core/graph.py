@@ -15,6 +15,10 @@ Every edge is stored as ``source -> target`` with these meanings:
 ``defines``       business term -> the column (or relation) that holds it
 ``relates_to``    business term -> a related term
 
+Relations are nodes of the kinds in ``RELATION_KINDS``: ``source``, ``table``, ``model``, ``seed``,
+``snapshot``, and ``file``, the files a table function reads by a literal path
+(``read_parquet('data/sales/*.parquet')``), keyed by :func:`file_key`.
+
 `downstream_edges()` and `upstream_edges()` hide those directions so callers think only in data
 flow.
 
@@ -41,13 +45,26 @@ from konstruct._core import (
     Node,
     Step,
     column_id,
+    file_key,
+    key_part,
     reading_key,
     relation_key,
     split_reading,
 )
 
 NodeKind = Literal[
-    'source', 'table', 'column', 'model', 'seed', 'snapshot', 'dag', 'task', 'test', 'exposure', 'term'
+    'source',
+    'table',
+    'column',
+    'model',
+    'seed',
+    'snapshot',
+    'file',
+    'dag',
+    'task',
+    'test',
+    'exposure',
+    'term',
 ]
 EdgeKind = Literal['contains', 'feeds', 'derived_from', 'runs', 'precedes', 'tests', 'defines', 'relates_to']
 IndexBasis = Literal['graph', 'nodes', 'relations']
@@ -65,6 +82,8 @@ __all__ = [
     'NodeKind',
     'Step',
     'column_id',
+    'file_key',
+    'key_part',
     'reading_key',
     'relation_key',
     'split_reading',

@@ -848,6 +848,7 @@
  "konstruct search --kind dag": "choice",
  "konstruct search --kind default": "None",
  "konstruct search --kind exposure": "choice",
+ "konstruct search --kind file": "choice",
  "konstruct search --kind model": "choice",
  "konstruct search --kind repeatable": "yes",
  "konstruct search --kind seed": "choice",

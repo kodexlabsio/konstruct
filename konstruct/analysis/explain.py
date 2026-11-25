@@ -180,9 +180,15 @@ class _Namer:
         """``relation.name`` as a column: the relation's short label, or with ``qualified``, its full
         relation key, which stays unambiguous where two relations share a label. ``reading`` names
         one reading of a relation a query reads more than once (see :func:`split_reading`)."""
-        *prefix, table = (
-            relation.relation if self.qualified and relation.relation else self.graph.label(relation)
-        ).split('.')
+        if relation.kind == 'file':
+            # Files are labelled by their path, whose dots part no name: "data/sales.parquet".amount,
+            # and qualified by their format (file.parquet), never by the key's escapes of the path.
+            prefix = relation.relation.split('.', 2)[:2] if self.qualified and relation.relation else []
+            table = self.graph.label(relation)
+        else:
+            *prefix, table = (
+                relation.relation if self.qualified and relation.relation else self.graph.label(relation)
+            ).split('.')
         parts = [self.identifier(part) for part in prefix]
         # The parts before the schema of a name of more than three (a project, a catalog) are one
         # catalog, printed with its dots.
@@ -216,6 +222,9 @@ class _Namer:
     def locate(self, column: exp.Column) -> tuple[Node, str, str] | None:
         """What :meth:`resolve` gives, and the reading of the relation the column names, if any."""
         parts = [p.name for p in column.parts]
+        if len(parts) > 3 and parts[0] == 'file':
+            # Canonical text writes a file's path as it is; its key escapes the dots (see _sql_name).
+            parts[2] = parts[2].replace('.', '%2e')
         for split in range(len(parts) - 1, 0, -1):
             relation, reading = split_reading('.'.join(parts[:split]))
             node = self.relation(relation)

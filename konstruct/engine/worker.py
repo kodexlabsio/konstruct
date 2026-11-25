@@ -20,7 +20,7 @@ from konstruct.core.sql import analyse
 
 def run(job: list[Any]) -> list[dict[str, Any]]:
     """One model's lineage as plain data."""
-    sql, dialect, schema, catalog, database, target, guessed = job
+    sql, dialect, schema, catalog, database, target, guessed, base = job
     return [
         s.to_dict()
         for s in analyse(
@@ -31,6 +31,7 @@ def run(job: list[Any]) -> list[dict[str, Any]]:
             default_catalog=catalog,
             default_db=database,
             target=target,
+            base=base,
         )
     ]
 

@@ -1679,7 +1679,8 @@ table.data .clip {
 .node.k-snapshot .kind-bar {
     fill: var(--accent);
 }
-.node.k-table .kind-bar {
+.node.k-table .kind-bar,
+.node.k-file .kind-bar {
     fill: var(--t-cast);
 }
 .node.k-task .kind-bar {

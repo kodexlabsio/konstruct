@@ -37,6 +37,7 @@
         'seed',
         'snapshot',
         'table',
+        'file',
         'exposure',
         'dag',
         'task',

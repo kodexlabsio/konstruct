@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
@@ -15,8 +16,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from konstruct import __version__
+from konstruct._core import TrackedFiles, data_file_columns, files_under, folder_files
 from konstruct._core import file_identity as identity
-from konstruct._core import files_under, folder_files
 from konstruct.core import jsonio
 from konstruct.core.graph import RELATION_KINDS, Edge, Graph, Node, relation_key
 from konstruct.core.sql import (
@@ -26,6 +27,9 @@ from konstruct.core.sql import (
     StatementLineage,
     analyse,
     dialect_for,
+    files_read,
+    is_local_path,
+    plain_read,
     relations_named,
     strip_templating,
 )
@@ -48,6 +52,7 @@ from konstruct.engine.config import (
     load_config,
     repository_profiles,
 )
+from konstruct.engine.snapshot import LFS_POINTER
 from konstruct.engine.watch import seen_files, watched_files
 from konstruct.inputs import airflow, dagster, dbt
 from konstruct.inputs.warehouse import MissingDriver, RelationMeta
@@ -265,6 +270,11 @@ class Builder:
         self.complete: set[str] = set()
         # What the statements that wrote each relation so far hold, by the relation's id.
         self.written: dict[str, _Shape] = {}
+        # The files each dbt model reads by a literal path, by its node id (see files_read).
+        self.model_files: dict[str, dict[str, dict[str, Any]]] = {}
+        # The files git tracks, listed once (see tracked).
+        self._tracked: TrackedFiles | None = None
+        self._shipped: dict[tuple[Any, ...], tuple[str, list[tuple[str, str]]] | None] = {}
 
     # Shared helpers
 
@@ -349,6 +359,155 @@ class Builder:
         )
         self.index.add(node)
         return node
+
+    def file(self, key: str, read: Mapping[str, Any], origin: str | None = None) -> Node:
+        """The node for the files a table function reads by a literal path (``read`` is what
+        :func:`konstruct.core.sql.files_as_relations` found of them). Its columns are those of the
+        first file the path matches where the repository holds one, a tracked Parquet or CSV file
+        reached without a link, and so all the files have; otherwise they are the columns queries
+        read. Only a read that leaves the columns those of that file gives them to the node, as
+        reads of one path may differ in the names, the header or the columns they add, and a call's
+        own list of columns is its own."""
+        node = self.graph.node_for_relation(key)
+        if node is not None and node.kind == 'file':
+            if origin and origin not in node.origins:
+                node.origins.append(origin)
+        else:
+            paths = list(read.get('paths') or [])
+            node = self.graph.add_node(
+                Node(
+                    id=key,
+                    kind='file',
+                    name=', '.join(paths),
+                    relation=key,
+                    origins=[origin] if origin else [],
+                    attrs={'format': read.get('format'), 'paths': paths},
+                )
+            )
+            self.index.add(node)
+        if not node.attrs.get('columns_from') and plain_read(read):
+            shipped = self.shipped_columns(read)
+            if shipped is not None:
+                path, columns = shipped
+                node.attrs['columns_from'] = path
+                for name, dtype in columns:
+                    column = self.graph.column(node.id, name)
+                    if column is None:
+                        self.graph.add_column(node, name, data_type=dtype or None, origin=origin)
+                    else:
+                        column.attrs.pop('inferred', None)
+                        column.data_type = column.data_type or dtype or None
+                self.complete.add(node.id)
+        return node
+
+    def tracked(self) -> TrackedFiles:
+        """The files the repository holds, made once: for a build of a commit's files, those
+        (``Config.tracked``), else what git lists under the repository's root as tracked (its
+        index, so a file added and not yet committed counts), as paths from it. A file the
+        repository does not hold is the workspace's own (a credential the CI wrote, a build's
+        output), which a pull request must not be able to read into the graph by naming it; a
+        link and a submodule's files are not read."""
+        if self._tracked is None:
+            names = self.config.tracked
+            self._tracked = TrackedFiles(sorted(self.git_files() if names is None else names))
+        return self._tracked
+
+    def git_files(self) -> set[str]:
+        """The regular files in git's index under the repository's root, by their paths from it;
+        none, with a warning, where git cannot list them (no git, or a repository another user
+        owns)."""
+        names: set[str] = set()
+        problem = ''
+        try:
+            listing = subprocess.run(
+                ['git', '-C', str(self.config.root), 'ls-files', '-z', '--stage', '--'],
+                capture_output=True,
+                check=False,
+                timeout=120,
+            )
+            if listing.returncode != 0:
+                lines = listing.stderr.decode(errors='replace').strip().splitlines()
+                problem = lines[0] if lines else f'git exited with status {listing.returncode}'
+        except (OSError, subprocess.SubprocessError) as error:
+            listing, problem = None, str(error) or type(error).__name__
+        if listing is not None and not problem:
+            for record in listing.stdout.split(b'\0'):
+                info, _, raw = record.partition(b'\t')
+                # A link (120000) and a submodule (160000) are not regular files.
+                if info.split(b' ')[0] in (b'100644', b'100755'):
+                    try:
+                        names.add(raw.decode('utf-8'))
+                    except UnicodeDecodeError:
+                        continue
+        if problem:
+            self.graph.warn(
+                f'git could not list the files of the repository ({problem}), so the columns of the '
+                'data files queries read by path are not read from them'
+            )
+        return names
+
+    def shipped_columns(self, read: Mapping[str, Any]) -> tuple[str, list[tuple[str, str]]] | None:
+        """The first tracked Parquet or CSV file under the repository ``read``'s paths match, from
+        the root, and its columns; None for files elsewhere (a URL, an absolute path, a drive, a
+        path that leaves the repository) and for files the repository does not hold. Each answer
+        is kept, as a build asks for it again for every read of the same files."""
+        fmt = read.get('format')
+        if fmt not in ('parquet', 'csv'):
+            return None
+        for path in read.get('paths') or []:
+            if not is_local_path(path):
+                continue
+            key = (fmt, path, read.get('delimiter'), read.get('header', True))
+            if key not in self._shipped:
+                self._shipped[key] = data_file_columns(
+                    str(self.config.root),
+                    path,
+                    fmt,
+                    self.tracked(),
+                    delimiter=read.get('delimiter'),
+                    header=read.get('header', True),
+                )
+            found = self._shipped[key]
+            if found is not None and self.pointer(found[0]):
+                found = None
+            elif found is None:
+                self.note_unread(fmt, path)
+            if found is not None:
+                self.watch(self.config.root / found[0])
+                return found
+        return None
+
+    def pointer(self, name: str) -> bool:
+        """Whether the tracked file ``name`` is a Git LFS pointer, as a working tree has it where
+        the data was not fetched: its text is not the data, so it is not read as it. Noted."""
+        try:
+            with (self.config.root / name).open('rb') as handle:
+                head = handle.read(len(LFS_POINTER))
+        except OSError:
+            return False
+        if head != LFS_POINTER:
+            return False
+        self.record_unread(name)
+        return True
+
+    def note_unread(self, fmt: str, path: str) -> None:
+        """Note the first data file of a tree written from a commit that ``path`` matches and that
+        is not the data (see :class:`konstruct.engine.snapshot.Held`), which a read of ``path``
+        then has no columns from."""
+        if self.config.unread:
+            first = TrackedFiles(sorted(self.config.unread)).first(path, fmt)
+            if first is not None:
+                self.record_unread(first)
+
+    def record_unread(self, name: str) -> None:
+        """Note in the graph that ``name``, a data file a read names, was not read as the data."""
+        noted = {*self.graph.meta.get('unread_files', []), name}
+        if 'unread_files' not in self.graph.meta:
+            self.graph.warn(
+                f'{name} is a Git LFS pointer, or a filter stores it as other text, so the columns of the '
+                'data files read from it are not read'
+            )
+        self.graph.meta['unread_files'] = sorted(noted)
 
     def columns_known(self, relation: Node) -> bool:
         """Whether a relation's columns are listed by something that defines it (the warehouse,
@@ -470,6 +629,8 @@ class Builder:
             attrs['via'] = via
         for error in statement.errors:
             self.graph.warn(f'{label}: {error}')
+        for key, files in statement.files.items():
+            self.file(key, files, origin)
         if target is None and statement.target:
             target = self.relation(statement.target, origin)
         if target is None:
@@ -529,6 +690,9 @@ class Builder:
         dialect: str | None = None,
     ) -> list[StatementLineage]:
         dialect = dialect or self.dialect
+        # Made before the analysis, so that the columns the repository's files have are its schema.
+        for key, read in files_read(sql, dialect=dialect).items():
+            self.file(key, read)
         # The columns the analysis is given are those known when it runs, which SQL applied before
         # it adds to, and so is the key: a cached analysis is used only with the same columns. Only
         # the relations the SQL names can matter, and the rest would make every file cost in
@@ -1216,7 +1380,7 @@ class Builder:
                         considered.update(m.node_id for m in ready)
                         self.prepare_models(ready, loaded, prepared)
                     node = self.graph.nodes[model.node_id]
-                    key, schema, guessed, dialect = self.model_key(model, loaded)
+                    key, schema, guessed, dialect, base = self.model_key(model, loaded)
                     early = prepared.pop(model.node_id, None)
 
                     def compute(
@@ -1227,6 +1391,7 @@ class Builder:
                         loaded: dbt.DbtLoad = loaded,
                         early: tuple[str, Any, bool] | None = early,
                         key: str = key,
+                        base: str = base,
                     ) -> Any:
                         if early is not None and early[0] == key:
                             self.workers.used += early[2]
@@ -1240,6 +1405,7 @@ class Builder:
                                 loaded.default_schema,
                                 model.relation,
                                 guessed,
+                                base,
                             )
                         )
 
@@ -1261,17 +1427,26 @@ class Builder:
 
     def model_key(
         self, model: dbt.ModelSql, loaded: dbt.DbtLoad
-    ) -> tuple[str, dict[str, Any], list[str], str | None]:
-        """A model's cache key, the schema of the models it reads, those of them whose columns are only
-        guessed, and its dialect."""
+    ) -> tuple[str, dict[str, Any], list[str], str | None, str]:
+        """A model's cache key, the schema of the models and files it reads, those of them whose
+        columns are only guessed, its dialect, and its project's folder from the repository's root,
+        which the paths of the files it reads are relative to."""
         node = self.graph.nodes[model.node_id]
+        dialect = loaded.dialect or self.dialect
+        base = self.rel_path(loaded.project.root).replace(os.sep, '/')
+        base = '' if base == '.' else base
+        files = self.model_files.get(model.node_id)
+        if files is None:
+            files = self.model_files[model.node_id] = files_read(model.sql, dialect=dialect, base=base)
         upstream = [self.graph.nodes[u] for u in model.upstream if u in self.graph.nodes]
+        # Made before the analysis, so that the columns the repository's files have are its schema.
+        upstream += [self.file(key, read) for key, read in files.items()]
         schema = self.schema_columns(upstream)
         guessed = self.guessed(schema)
         key = Cache.key(
-            'dbt', model.sql, self.dialect, model.relation, schema, guessed, node.attrs.get('checksum')
+            'dbt', model.sql, self.dialect, model.relation, schema, guessed, node.attrs.get('checksum'), base
         )
-        return key, schema, guessed, loaded.dialect or self.dialect
+        return key, schema, guessed, dialect, base
 
     def prepare_levels(
         self,
@@ -1340,7 +1515,7 @@ class Builder:
         found: dict[str, Any] = {}
         work = []
         for model in models:
-            key, schema, guessed, dialect = self.model_key(model, loaded)
+            key, schema, guessed, dialect, base = self.model_key(model, loaded)
             if key in self.cache.entries:
                 found[model.node_id] = self.cache.entries.get(key)
                 continue
@@ -1356,6 +1531,7 @@ class Builder:
                         loaded.default_schema,
                         model.relation,
                         guessed,
+                        base,
                     ),
                 )
             )
@@ -2685,7 +2861,7 @@ def _workers() -> int:
 
 
 def _analyse_model(
-    job: tuple[str, str | None, dict[str, Any], str | None, str | None, str | None, list[str]],
+    job: tuple[str, str | None, dict[str, Any], str | None, str | None, str | None, list[str], str],
 ) -> Any:
     """One model's lineage as plain data, in the build's own process."""
     from konstruct.engine import worker

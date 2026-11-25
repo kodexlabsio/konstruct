@@ -315,6 +315,12 @@ class Config:
     options: dict[str, Any] = field(default_factory=dict)
     """Build options given on the command line or to :meth:`konstruct.Project.build`, which apply
     to every repository built into the graph, not only this one."""
+    tracked: frozenset[str] | None = None
+    """The files the repository holds, as paths from ``root``, for a build of a tree written from a
+    commit (which has no ``.git`` to list them); None to ask git."""
+    unread: frozenset[str] = frozenset()
+    """The data files of such a tree that are not the data (a filter stores them as other text, or
+    they are a Git LFS pointer): not in ``tracked``, and noted in the graph when a read names one."""
     outside_links: dict[Path, set[str]] = field(default_factory=dict)
     """Files left unread because they lead outside the project through a symbolic link while it
     is untrusted: each directory holding such a link, with the links' names (see :meth:`inside`)."""

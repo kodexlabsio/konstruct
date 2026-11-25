@@ -850,7 +850,11 @@ class Listing:
 
 def list_nodes(graph: Graph, kinds: list[str] | None = None) -> Listing:
     """Every node of the given kinds (relations by default), sorted by kind then label."""
-    chosen = kinds or sorted(RELATION_KINDS)
+    # Files are listed by default only in a graph that has them, so a listing of any other is as
+    # it was before files were relations.
+    chosen = kinds or sorted(
+        k for k in RELATION_KINDS if k != 'file' or any(n.kind == 'file' for n in graph.nodes.values())
+    )
     nodes = [n for n in graph.nodes.values() if n.kind in chosen]
     nodes.sort(key=lambda n: (chosen.index(n.kind) if n.kind in chosen else 0, graph.label(n).lower()))
     return Listing(list(chosen), [item(graph, n) for n in nodes])

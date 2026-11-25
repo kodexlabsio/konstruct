@@ -289,7 +289,7 @@ Composed formulas are evaluated on the data and must match the final model row f
 
 | | |
 |---|---|
-| **Transformation** | dbt (manifest, catalog, or rendered without dbt), standalone SQL files, the SQL in PySpark jobs, warehouse views |
+| **Transformation** | dbt (manifest, catalog, or rendered without dbt), standalone SQL files, the SQL in PySpark jobs, warehouse views, and the Parquet, CSV and JSON files queries read by path (`read_parquet('data/*.parquet')`) |
 | **Orchestration** | Airflow (DAGs, TaskGroups, TaskFlow, assets, Cosmos) and Dagster (assets, op jobs, schedules, sensors), parsed without running them |
 | **Warehouses** | DuckDB, Postgres, Snowflake, BigQuery, Databricks, Trino, and Iceberg through any PyIceberg catalogue |
 | **Dashboards** | dbt exposures, Looker views field by field from LookML, and Power BI semantic models from TMDL |

@@ -49,6 +49,7 @@ import difflib
 import hashlib
 import hmac
 import math
+import posixpath
 import re
 import secrets
 from collections import defaultdict
@@ -73,7 +74,9 @@ from konstruct.core.sql import (
     StatementLineage,
     analyse,
     build_schema,
+    file_relation,
     normal_condition,
+    plain_read,
     split_conjuncts,
     table_key,
     without_readings,
@@ -698,16 +701,51 @@ class Checker:
             self._filled[relation.id] = found
         return found
 
-    def read_schema(self, tree: exp.Expr, catalog: str | None, db: str | None) -> dict[str, dict[str, str]]:
+    def read_schema(
+        self, tree: exp.Expr, catalog: str | None, db: str | None, base: str = ''
+    ) -> dict[str, dict[str, str]]:
         """The columns of the relations ``tree`` reads, its unqualified names in ``catalog`` and
-        ``db``: a schema of every relation in a large project costs more to build than the whole
-        check."""
+        ``db`` and its files' paths from ``base``: a schema of every relation in a large project
+        costs more to build than the whole check."""
         found = {}
         for table in tree.find_all(exp.Table):
-            key = table_key(table, catalog, db)
+            files = file_relation(table, self.sqlglot, base) if not table.name or '/' in table.name else None
+            key = files[0] if files else table_key(table, catalog, db)
             if key in self.schema:
                 found[key] = self.schema[key]
         return found
+
+    def base_for(self, trees: list[exp.Expr]) -> str:
+        """The folder the paths of the files ``trees`` read are from: the repository's root, or the
+        folder of a dbt project the graph holds, where that has the files (``sub/data/x.csv`` for
+        ``read_csv('data/x.csv')`` in the project ``sub``). The root wins where it has them too;
+        a file that merely ends in the path (``vendor/data/x.csv``) is not the one read."""
+        tables = [
+            t
+            for tree in trees
+            for t in tree.find_all(exp.Table)
+            if (not t.name or '/' in t.name) and file_relation(t, self.sqlglot) is not None
+        ]
+        if not tables:
+            return ''
+        # The folders of the dbt projects the graph was built from, which a model's paths are from.
+        watched = self.graph.meta.get('watched_files')
+        projects = (
+            {
+                posixpath.dirname(str(f['path']))
+                for f in watched
+                if isinstance(f, dict) and posixpath.basename(str(f.get('path'))) == 'dbt_project.yml'
+            }
+            if isinstance(watched, list)
+            else set()
+        )
+        candidates = {''} | projects
+
+        def found(base: str) -> int:
+            keys = (file_relation(t, self.sqlglot, base) for t in tables)
+            return sum(1 for k in keys if k is not None and self.graph.node_for_relation(k[0]) is not None)
+
+        return max(sorted(candidates, key=lambda b: (len(b), b)), key=found)
 
     def schemas_holding(self, name: str) -> set[tuple[str, str]]:
         """The catalogs and schemas that hold a relation called ``name`` (lower case)."""
@@ -1955,6 +1993,10 @@ def _subtotals(group: exp.Group) -> bool:
     )
 
 
+# The columns DuckDB's file readers add to any read (``filename = true`` and the like).
+_VIRTUAL = frozenset({'filename', 'file_row_number', 'file_index', 'rowid'})
+
+
 def _listed(table: exp.Table) -> list[str] | None:
     """The columns a table function names as all it returns (``read_csv(..., columns = {'a':
     'INT'})``), lower case, or None when it names none: its columns are then those of a file the
@@ -2073,9 +2115,9 @@ class _Run:
         self.readers: dict[int, list[Scope]] = defaultdict(list)
         self.infos: dict[int, _ScopeInfo] = {}
         self.laterals: dict[int, Scope] = {}
-        self.called: dict[str, list[str]] = {}
         self.placed: dict[tuple[str, str, str], str | None] = {}
         self.catalog, self.db = checker.default_catalog, checker.default_db
+        self.base = ''
         self.canon = Canonical(checker.sqlglot, self.catalog, self.db)
         self.schema = MappingSchema({}, dialect=checker.sqlglot)
 
@@ -2096,6 +2138,7 @@ class _Run:
             )
             return self.result
         self.locate(trees)
+        self.base = checker.base_for(trees)
         for index, (tree, query) in enumerate(zip(trees, _with_queries(trees), strict=True), 1):
             if query is None:
                 continue
@@ -2105,9 +2148,10 @@ class _Run:
                         analyse(
                             tree.sql(dialect=checker.sqlglot),
                             dialect=checker.dialect,
-                            schema=checker.read_schema(tree, self.catalog, self.db),
+                            schema=checker.read_schema(tree, self.catalog, self.db, self.base),
                             default_catalog=self.catalog,
                             default_db=self.db,
+                            base=self.base,
                         )
                     ),
                     None,
@@ -2180,7 +2224,7 @@ class _Run:
         checker = self.checker
         # Normalised as the dialect normalises unquoted names (Snowflake upper-cases them), so that
         # qualify resolves the query's columns against the graph's lower-case ones.
-        built = build_schema(checker.read_schema(query, self.catalog, self.db), checker.sqlglot)
+        built = build_schema(checker.read_schema(query, self.catalog, self.db, self.base), checker.sqlglot)
         self.schema = MappingSchema(built.mapping, dialect=checker.sqlglot, normalize=True)
         try:
             qualified = self._qualified(query)
@@ -2237,7 +2281,9 @@ class _Run:
     def names(self, lineage: StatementLineage, query: exp.Query) -> None:
         graph = self.graph
         for key in lineage.reads:
-            if graph.node_for_relation(key) is None:
+            # Files read by their path are a relation of the query's own, which the project need not
+            # read too.
+            if key not in lineage.files and graph.node_for_relation(key) is None:
                 labels = sorted({graph.label(n) for n in graph.relations()} | set(self.checker.schema))
                 close = difflib.get_close_matches(key.rsplit('.', 1)[-1], labels, n=3)
                 hint = f'; did you mean {", ".join(close)}?' if close else ''
@@ -2255,20 +2301,60 @@ class _Run:
             for t in query.find_all(exp.Table)
             if t.args.get('pivots') or any(s.args.get('pivots') for s in _ancestors(t, exp.Subquery))
         }
-        # The lineage gives a table function's columns the key of the default schema itself; they
-        # are checked against the columns the function lists, when the query reads only one.
-        functions = [t for t in query.find_all(exp.Table) if not t.name]
-        called = {table_key(t, self.catalog, self.db) for t in functions}
-        named = {table_key(t, self.catalog, self.db) for t in query.find_all(exp.Table) if t.name}
-        listed = _listed(functions[0]) if len(functions) == 1 else None
+        # The files a query reads by a literal path, by their relation: the columns it reads from
+        # them are checked against the calls' own lists, or else the file's.
+        calls: dict[str, list[exp.Table]] = defaultdict(list)
+        for table in query.find_all(exp.Table):
+            found = file_relation(table, self.checker.sqlglot, self.base) if not table.name else None
+            if found:
+                calls[found[0]].append(table)
         used = [(s.relation, s.column) for sources in lineage.columns.values() for s in sources]
         for relation_key, column in [*used, *lineage.references]:
             name = column.split('.', 1)[0]
-            if relation_key in called and relation_key not in named:
-                if listed is not None:
-                    self.unlisted(functions[0], listed, name)
+            if relation_key in calls:
+                self.file_column(calls[relation_key], name)
             elif relation_key not in pivoted:
                 self.unknown_column(self.graph.node_for_relation(relation_key), name)
+
+    def file_column(self, calls: list[exp.Table], name: str) -> None:
+        """A column the query reads from files it names by a literal path: one the calls list is
+        theirs, as DuckDB returns exactly what a call lists; with no list, one the file the project
+        holds has, when the calls read it as the node was (see :func:`plain_read`) and the column
+        is no virtual one (the file's name, a partition key)."""
+        lists = [_listed(c) for c in calls]
+        if all(listed is not None for listed in lists):
+            self.unlisted(calls[0], sorted({n for listed in lists for n in listed or []}), name)
+            return
+        reads = [file_relation(c, self.checker.sqlglot, self.base) for c in calls]
+        # ``names=[...]`` renames the file's first columns and leaves the rest as they are.
+        if len(reads) == 1 and reads[0] is not None and reads[0][1]['columns']:
+            read = reads[0][1]
+            node = self.graph.node_for_relation(reads[0][0])
+            if (
+                node is not None
+                and node.attrs.get('columns_from')
+                and not (read['complete'] or read['extra'] or 'delimiter' in read)
+                and read.get('header', True)
+            ):
+                given = [str(n) for n, _ in read['columns']]
+                rest = [c.name for c in self.graph.columns_of(node.id)][len(given) :]
+                self.unlisted(calls[0], [n.lower() for n in [*given, *rest]], name)
+            return
+        if any(r is None or not plain_read(r[1]) for r in reads) or reads[0] is None:
+            return
+        relation = self.graph.node_for_relation(reads[0][0])
+        if relation is None:
+            return
+        # A partition key is a column of files the path names by ``key=value`` folders, and
+        # DuckDB's own virtual columns come with a read of any file.
+        from_file = str(relation.attrs.get('columns_from') or '')
+        if (
+            name.lower() in _VIRTUAL
+            or '=' in from_file
+            or any('=' in p for p in relation.attrs.get('paths') or [])
+        ):
+            return
+        self.unknown_column(relation, name)
 
     def unlisted(self, function: exp.Table, listed: list[str], name: str) -> None:
         """A column the query reads from a table function that lists its columns without it."""
@@ -2327,9 +2413,7 @@ class _Run:
         for column in scope.columns:
             source = scope.sources.get(column.table)
             if isinstance(source, exp.Table) and not source.name:
-                listed = _listed(source)
-                if listed is not None:
-                    self.unlisted(source, listed, column.name)
+                self.file_column([source], column.name)
             elif isinstance(source, exp.Table) and not source.args.get('pivots'):
                 self.unknown_column(self.relation_of(source), column.name)
             elif isinstance(source, Scope) and column.table:
@@ -3344,11 +3428,13 @@ class _Run:
         return None
 
     def relation_of(self, source: Any) -> Node | None:
-        # A table function (read_csv(...)) has no name: it is no relation of the graph, whatever
-        # relation the default schema's own name stands for.
-        if isinstance(source, exp.Table) and source.name:
+        if not isinstance(source, exp.Table):
+            return None
+        if source.name and '/' not in source.name:
             return self.graph.node_for_relation(table_key(source, self.catalog, self.db))
-        return None
+        # Files read by a literal path are a relation; any other table function's rows are of none.
+        files = file_relation(source, self.checker.sqlglot, self.base)
+        return self.graph.node_for_relation(files[0]) if files else None
 
     def scope(self, scope: Scope, is_root: bool) -> _ScopeInfo:
         graph, infos = self.graph, self.infos

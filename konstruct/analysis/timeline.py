@@ -631,6 +631,7 @@ class _Worlds:
         self.built = 0
         self.scratch = Path(tempfile.mkdtemp(prefix='konstruct-timeline-'))
         self.present: dict[str, bytes] | None = None
+        self.held: snapshot.Held = snapshot.Held()
         """The files in the tree and their blobs, while the tree is whole."""
         self.last: tuple[str, World, Formulas] | None = None
         """The commit built last, its world and its formulas, which the next world built is worded
@@ -783,7 +784,7 @@ class _Worlds:
             if present is None:
                 tree.mkdir()  # a new directory, so nothing in it is a link that leads elsewhere
                 present = {}
-            snapshot.write_tree(self.top, sha, self.prefix, tree, present)
+            self.held = snapshot.write_tree(self.top, sha, self.prefix, tree, present)
             self.present = present
             root = tree / self.prefix
             if not root.is_dir():
@@ -811,6 +812,8 @@ class _Worlds:
         config = load_config(root, out_dir=self.scratch / 'out', trusted=False)
         config.override(run_dbt=False, warehouses=False, plugins=False)
         config.discover_warehouses = False
+        config.tracked = self.held
+        config.unread = self.held.unread
         config.html = False
         notes: list[str] = []
         if config.repositories:

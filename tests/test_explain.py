@@ -611,12 +611,13 @@ def test_a_quoted_name_is_read_as_the_parser_reads_it(dialect: str) -> None:
 def test_a_reading_of_a_relation_built_from_a_table_function_is_not_put_on_its_schema(
     tmp_path: Path,
 ) -> None:
-    """A table function's column is of no relation, so composing through a reading of the model
-    that reads it names no schema as that reading (``main#(base#1)``), and each reading still names
-    its own rows: the gap is not a column less itself. A lambda's parameter is no column read."""
+    """A table function's column is of no relation where it reads no files by a literal path, so
+    composing through a reading of the model that reads it names no schema as that reading
+    (``main#(base#1)``), and each reading still names its own rows: the gap is not a column less
+    itself. A lambda's parameter is no column read."""
     (tmp_path / 'base.sql').write_text(
         'create table main.base as select id, amount * 2 as amount, '
-        "list_transform(tags, x -> x || 'a') as tags from read_parquet('x/*.parquet')"
+        "list_transform(tags, x -> x || 'a') as tags from read_parquet(getvariable('x'))"
     )
     (tmp_path / 'pairs.sql').write_text(
         'create table main.pairs as select o.id, max(o.amount - p.amount) as gap, o.tags from main.base o '
@@ -626,6 +627,35 @@ def test_a_reading_of_a_relation_built_from_a_table_function_is_not_put_on_its_s
     project.build(dialect='duckdb', warehouses=False, run_dbt=False)
     assert project.explain('pairs.gap').composed == 'MAX(("#(base#1)".amount * 2) - ("#(base#2)".amount * 2))'
     assert project.explain('pairs.tags').composed == 'LIST_TRANSFORM("#(base#1)".tags, LAMBDA x : x || \'a\')'
+
+
+def test_a_formula_composes_down_to_the_files_a_model_reads(tmp_path: Path) -> None:
+    """Files read by a literal path are a relation, so a formula built on a model that reads them
+    composes to their columns, which are its sources; a self-join of a model names each reading."""
+    (tmp_path / 'sales.sql').write_text(
+        "create table main.sales as select id, country, sum(amount) as amount from read_parquet('data/sales/*.parquet') "
+        'group by 1, 2'
+    )
+    (tmp_path / 'pairs.sql').write_text(
+        'create table main.pairs as select o.id, o.amount - p.amount as gap from main.sales o '
+        'join main.sales p on p.id = o.id'
+    )
+    project = Project(tmp_path)
+    graph = project.build(dialect='duckdb', warehouses=False, run_dbt=False).graph
+    # Qualified, as a review and a diff print it: the path as written, not the key's escapes.
+    from konstruct.analysis.explain import Explainer
+
+    assert Explainer(graph, qualified=True).composed_text(graph.nodes['table.main.sales#amount']) == (
+        'SUM(file.parquet."data/sales/*.parquet".amount)'
+    )
+    amount = project.explain('sales.amount')
+    assert amount.composed == 'SUM("data/sales/*.parquet".amount)'
+    assert amount.sources == ['data/sales/*.parquet.amount']
+    gap = project.explain('pairs.gap')
+    assert gap.composed == (
+        'SUM("data/sales/*.parquet#(sales#2)".amount) - SUM("data/sales/*.parquet#(sales#1)".amount)'
+    )
+    assert gap.sources == ['data/sales/*.parquet.amount']
 
 
 JOINED_ON_TRUE = (

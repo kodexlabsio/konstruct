@@ -27,6 +27,7 @@
         'seed',
         'snapshot',
         'table',
+        'file',
         'column',
         'task',
         'dag',

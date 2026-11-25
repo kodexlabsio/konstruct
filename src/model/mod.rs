@@ -82,6 +82,35 @@ pub(crate) fn relation_key<'py>(
     PyString::new(py, ".").call_method1(pyo3::intern!(py, "join"), (kept,))
 }
 
+/// The relation key of the files a table function reads (`read_parquet('data/*.parquet')`):
+/// `file.<format>.<paths>`, each path a [`key_part`], joined by `,`, so that two reads of the same
+/// files have one key and no other files share it.
+#[pyfunction]
+pub(crate) fn file_key(format: &str, paths: Vec<String>) -> String {
+    // A `,` in a path is written `%2c` too, as `%` itself is, so the paths are joined apart.
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| key_part(p).replace(',', "%2c"))
+        .collect();
+    format!("file.{}.{}", format.to_lowercase(), paths.join(","))
+}
+
+/// `text` as one part of a relation key, in lower case as every key is: a `.` (which separates a
+/// key's parts), `#` (which names a reading), `%` and the quotes and brackets a key's parts are
+/// stripped of are written `%` and two hexadecimal digits.
+#[pyfunction]
+pub(crate) fn key_part(text: &str) -> String {
+    let mut part = String::with_capacity(text.len());
+    for c in text.to_lowercase().chars() {
+        if matches!(c, '.' | '#' | '%' | '"' | '`' | '[' | ']') {
+            part.push_str(&format!("%{:02x}", c as u32));
+        } else {
+            part.push(c);
+        }
+    }
+    part
+}
+
 /// How canonical text names one reading of a relation that a query reads more than once: the
 /// relation key with each `#` in it doubled, then `#` and the reading (`db.main.orders#2`). A
 /// relation read once is its key, escaped the same way, so a relation named `events#2` is never

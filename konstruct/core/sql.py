@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import functools
+import posixpath
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -25,7 +26,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 from sqlglot.schema import MappingSchema
 
-from konstruct.core.graph import reading_key, relation_key, split_reading
+from konstruct.core.graph import file_key, reading_key, relation_key, split_reading
 
 # What parsing SQL can raise: sqlglot's parse functions can fail with TypeError, ValueError,
 # AttributeError or RecursionError rather than a SqlglotError, for example on `->` in DuckDB, `#>`
@@ -138,6 +139,9 @@ class StatementLineage:
     nullable: dict[str, str] = field(default_factory=dict)
     read_before: dict[str, list[str]] = field(default_factory=dict)
     star_reads: dict[str, list[str]] = field(default_factory=dict)
+    # The files the statement reads by a literal path, by the relation key it reads them as (see
+    # :func:`files_as_relations`).
+    files: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,6 +162,7 @@ class StatementLineage:
             'nullable': self.nullable,
             'read_before': self.read_before,
             'star_reads': self.star_reads,
+            'files': self.files,
         }
 
     @classmethod
@@ -180,6 +185,7 @@ class StatementLineage:
             nullable=dict(data.get('nullable', {})),
             read_before={k: list(v) for k, v in data.get('read_before', {}).items()},
             star_reads={k: list(v) for k, v in data.get('star_reads', {}).items()},
+            files={k: dict(v) for k, v in data.get('files', {}).items()},
         )
 
 
@@ -267,23 +273,230 @@ def table_key(table: exp.Table, default_catalog: str | None, default_db: str | N
 
 
 def relations_named(
-    sql: str, *, dialect: str | None = None, default_catalog: str | None = None, default_db: str | None = None
+    sql: str,
+    *,
+    dialect: str | None = None,
+    default_catalog: str | None = None,
+    default_db: str | None = None,
+    base: str = '',
 ) -> list[str]:
     """The keys of the relations ``sql`` names, as :func:`analyse` reads them, or none if it does
     not parse. Only these relations' columns can change what the analysis finds."""
     try:
-        statements = sqlglot.parse(sql, dialect=Dialect.get_or_raise(dialect))
+        resolved = Dialect.get_or_raise(dialect)
+        statements = sqlglot.parse(sql, dialect=resolved)
     except PARSE_ERRORS:
         return []
-    return sorted(
-        {
-            table_key(table, default_catalog, default_db)
-            for statement in statements
-            if statement is not None
-            for table in statement.find_all(exp.Table)
-            if table.name
-        }
-    )
+    found: set[str] = set()
+    for statement in statements:
+        if statement is None:
+            continue
+        found.update(files_as_relations(statement, resolved, base))
+        found.update(
+            table_key(t, default_catalog, default_db) for t in statement.find_all(exp.Table) if t.name
+        )
+    return sorted(found)
+
+
+# The table functions that read files, by the format of the files they read.
+_FILE_READERS = {
+    'read_parquet': 'parquet',
+    'parquet_scan': 'parquet',
+    'read_csv': 'csv',
+    'read_csv_auto': 'csv',
+    'read_json': 'json',
+    'read_json_auto': 'json',
+    'read_ndjson': 'json',
+    'read_ndjson_auto': 'json',
+}
+# The options of a read that leave its columns those of its first file, and those that give them.
+_PLAIN_OPTIONS = frozenset(
+    {
+        'header',
+        'delim',
+        'sep',
+        'delimiter',
+        'columns',
+        'names',
+        'column_names',
+        'types',
+        'dtypes',
+        'quote',
+        'escape',
+        'nullstr',
+        'null_padding',
+        'ignore_errors',
+        'sample_size',
+        'dateformat',
+        'timestampformat',
+        'compression',
+        'encoding',
+        'new_line',
+        'parallel',
+        'binary_as_string',
+    }
+)
+_REMOTE = re.compile(r'^[a-z][a-z0-9+.-]*://|^[a-z]:[\\/]', re.IGNORECASE)
+_MAY_READ_FILES = re.compile(r'\b(?:' + '|'.join(_FILE_READERS) + r')\b', re.IGNORECASE)
+"""Text without which SQL reads no file, so most SQL is never parsed to look for one."""
+
+
+def may_read_files(sql: str) -> bool:
+    """Whether ``sql`` may read files by their path (see :func:`files_as_relations`)."""
+    return _MAY_READ_FILES.search(sql) is not None
+
+
+def files_read(sql: str, *, dialect: str | None = None, base: str = '') -> dict[str, dict[str, Any]]:
+    """The files ``sql`` reads by a literal path, by their relation key, as
+    :attr:`StatementLineage.files` holds them; none if it does not parse."""
+    if not may_read_files(sql):
+        return {}
+    try:
+        resolved = Dialect.get_or_raise(dialect)
+        statements = sqlglot.parse(sql, dialect=resolved)
+    except PARSE_ERRORS:
+        return {}
+    found: dict[str, dict[str, Any]] = {}
+    for statement in statements:
+        if statement is not None:
+            found.update(files_as_relations(statement, resolved, base))
+    return found
+
+
+def files_as_relations(tree: exp.Expr, dialect: DialectType, base: str = '') -> dict[str, dict[str, Any]]:
+    """Name each read of files by a literal path in ``tree`` as a relation of its own, in place,
+    and return what each is, by its key (:func:`konstruct.core.graph.file_key`): its ``format``,
+    its ``paths``, and the ``columns`` the call lists (``read_csv(..., columns={'a': 'INT'})``,
+    ``names=[...]``) with their types, empty where it gives none, ``complete`` when they are all
+    the files have, and a CSV reader's ``delimiter`` and ``header``.
+
+    A table function such as ``read_parquet('data/sales/*.parquet')``, DuckDB's ``read_csv`` and
+    ``read_json`` read files, whose rows are of no relation the warehouse has; named so, the
+    files are a relation like any other, and two queries that read the same files read the same
+    relation. Spark's ``parquet.`path``` stays a table, as it was named before. A path that is not a
+    literal (a parameter, or an expression computed when the query runs) is left as it is. A local
+    path relative to the folder ``base`` (a dbt project's, from the repository's root) is taken
+    from the repository's root, as the reader would find it from there."""
+    found: dict[str, dict[str, Any]] = {}
+    for table in list(tree.find_all(exp.Table)):
+        named = file_relation(table, dialect, base)
+        if named is None:
+            continue
+        key, read = named
+        found.setdefault(key, read)
+        _, fmt, last = key.split('.', 2)
+        table.set('this', exp.to_identifier(last, quoted=True))
+        table.set('db', exp.to_identifier(fmt))
+        table.set('catalog', exp.to_identifier('file'))
+    return found
+
+
+def file_relation(
+    table: exp.Table, dialect: DialectType, base: str = ''
+) -> tuple[str, dict[str, Any]] | None:
+    """The key of the files ``table`` reads by a literal path, and what they are (see
+    :func:`files_as_relations`), or None where it reads none."""
+    read = _file_read(table, base)
+    return None if read is None else (file_key(read['format'], read['paths']), read)
+
+
+def _file_read(table: exp.Table, base: str) -> dict[str, Any] | None:
+    this = table.this
+    if not isinstance(this, exp.Func):
+        return None
+    name = this.name if isinstance(this, exp.Anonymous) else this.sql_name()
+    fmt = _FILE_READERS.get(name.lower())
+    if fmt is None:
+        return None
+    # An anonymous function's ``this`` is its name; a known reader's is its first argument.
+    first = None if isinstance(this, exp.Anonymous) else this.args.get('this')
+    arguments = [a for a in (first, *this.expressions) if isinstance(a, exp.Expr)]
+    if not arguments:
+        return None
+    paths = _literal_strings(arguments[0])
+    if not paths:
+        return None
+    read: dict[str, Any] = {
+        'format': fmt,
+        'paths': [_located(p, base) for p in paths],
+        'columns': [],
+        'complete': False,
+        'extra': False,
+    }
+    for option in arguments[1:]:
+        if not isinstance(option, (exp.EQ, exp.PropertyEQ)):
+            continue
+        named, value = option.this.name.lower(), option.expression
+        # An option that adds columns (a partition key, the file's name) or takes them from every
+        # file makes the call's columns more than the first file's.
+        if named not in _PLAIN_OPTIONS:
+            read['extra'] = True
+        # DuckDB computes an option that is not a literal of the form it expects, so what it gives
+        # the columns is not known: the read is not plain.
+        if named == 'columns':
+            if isinstance(value, exp.Struct) and all(
+                isinstance(p, exp.PropertyEQ) for p in value.expressions
+            ):
+                read['columns'] = [
+                    [p.this.name, p.expression.name if isinstance(p.expression, exp.Literal) else '']
+                    for p in value.expressions
+                ]
+                read['complete'] = True
+            else:
+                read['extra'] = True
+        elif named in ('names', 'column_names'):
+            listed = _literal_strings(value)
+            if not listed:
+                read['extra'] = True
+            elif not read['complete']:
+                read['columns'] = [[n, ''] for n in listed]
+        elif fmt == 'csv' and named in ('delim', 'sep', 'delimiter'):
+            if isinstance(value, exp.Literal):
+                read['delimiter'] = value.name
+            else:
+                read['extra'] = True
+        elif fmt == 'csv' and named == 'header':
+            if isinstance(value, exp.Boolean):
+                read['header'] = bool(value.this)
+            else:
+                read['extra'] = True
+    return read
+
+
+def plain_read(read: Mapping[str, Any]) -> bool:
+    """Whether a read of files (as :func:`files_as_relations` describes it) leaves their columns
+    those of the first file: it lists none, takes none from every file or adds none (a partition
+    key, the file's name), and reads the first record of a CSV file as names, by the delimiter the
+    record suggests."""
+    return not (read['columns'] or read['extra'] or 'delimiter' in read or not read.get('header', True))
+
+
+def _literal_strings(node: exp.Expr) -> list[str]:
+    """The strings of a string literal, or of an array of them; none for anything else, or for a
+    template left unrendered."""
+    items = node.expressions if isinstance(node, exp.Array) else [node]
+    if not items or not all(isinstance(i, exp.Literal) and i.is_string and i.name for i in items):
+        return []
+    texts = [i.name for i in items]
+    return [] if any(PLACEHOLDER in t or '{{' in t or '{%' in t for t in texts) else texts
+
+
+def is_local_path(path: str) -> bool:
+    """Whether ``path`` names files under the repository's root: not a URL, an absolute path, one
+    from the home folder, with a drive or backslash, or that leaves the root."""
+    return bool(path) and not path.startswith(('/', '~', '..')) and ':' not in path and '\\' not in path
+
+
+def _located(path: str, base: str) -> str:
+    """``path`` from the repository's root where it is local and relative to ``base``, and as it
+    is otherwise (a URL, an absolute path, a path from the home folder)."""
+    if _REMOTE.match(path) or path.startswith(('~', '\\')):
+        return path
+    if path.startswith('/'):
+        # ``//a//b`` is ``/a/b`` to every file system that matters here, so one key names the files.
+        return '/' + '/'.join(part for part in path.split('/') if part)
+    joined = posixpath.normpath(posixpath.join(base, path.replace('\\', '/')))
+    return '' if joined == '.' else joined
 
 
 def analyse(
@@ -295,13 +508,16 @@ def analyse(
     default_db: str | None = None,
     target: str | None = None,
     guessed: Collection[str] = (),
+    base: str = '',
 ) -> list[StatementLineage]:
     """Analyse every statement in ``sql``.
 
     ``target`` names the relation a bare SELECT writes (a dbt model's relation). Relations
     created by earlier statements become part of the schema for later ones. ``guessed`` names the
     relations of ``schema`` whose columns are only those other queries were seen to read: they place
-    a column, but are not taken to be all the columns the relation has.
+    a column, but are not taken to be all the columns the relation has. Files read by a literal
+    path are relations of their own (see :func:`files_as_relations`), a local path relative to the
+    folder ``base`` from the repository's root; the columns a read lists are theirs.
     """
     known: dict[str, dict[str, str]] = {k: dict(v) for k, v in (schema or {}).items()}
     partial = {key.lower() for key in guessed}
@@ -315,9 +531,28 @@ def analyse(
 
     results: list[StatementLineage] = []
     for statement in statements:
+        files = files_as_relations(statement, resolved, base)
+        # A call's own list of columns is the columns of that call alone, whatever the files hold.
+        before = {k: (known.get(k), k in partial) for k, read in files.items() if read['columns']}
+        for key, read in files.items():
+            if read['columns']:
+                known[key] = {name: dtype or 'UNKNOWN' for name, dtype in read['columns']}
+                if read['complete']:
+                    partial.discard(key)
+                else:
+                    partial.add(key)
         result = _analyse_statement(statement, resolved, known, partial, default_catalog, default_db, target)
+        for key, (kept, was_partial) in before.items():
+            if kept is None:
+                known.pop(key, None)
+            else:
+                known[key] = kept
+            partial.discard(key)
+            if was_partial:
+                partial.add(key)
         if result is None:
             continue
+        result.files = {k: read for k, read in files.items() if k in result.reads or k == result.target}
         if result.target and result.columns and (result.target not in known or result.target in partial):
             known[result.target] = dict.fromkeys(result.columns, 'UNKNOWN')
             partial.discard(result.target)
@@ -1622,7 +1857,11 @@ def sql_part(part: str, dialect: DialectType) -> str:
 def _sql_name(name: str, dialect: DialectType) -> str:
     """A name in canonical text (see :func:`reading_key`), a relation key or one with a column, as
     SQL: each part as :func:`sql_part` prints it."""
-    return '.'.join(sql_part(part, dialect) for part in name.split('.'))
+    parts = name.split('.')
+    if len(parts) > 2 and parts[0] == 'file':
+        # Files' paths are written as they are, not as a key escapes their dots (``x%2ecsv``).
+        parts[2] = parts[2].replace('%2e', '.')
+    return '.'.join(sql_part(part, dialect) for part in parts)
 
 
 def _unquoted(name: str) -> str:

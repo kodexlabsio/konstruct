@@ -1614,10 +1614,15 @@ def _vanished(
     if not unbound and not blind:
         return []
     previous = base_graph(root, ref, base_cache())
+    # A data file the base holds as a pointer, or that a filter stores as other text, is not read
+    # there though the head reads the real file: what the base's columns were is not known.
+    unread = [str(n) for n in (previous.meta.get('unread_files') or [])] if previous is not None else []
     found: list[Finding] = []
     for term, column in unbound:
         if previous is None:
             why = 'Konstruct cannot build the base'
+        elif unread:
+            why = f"Konstruct cannot read the base's data file {unread[0]} (it is not the data)"
         elif term.id not in previous.nodes and not _changed_file(files, term.path):
             why = 'the base, built from its files, has no such term'
         else:
@@ -1667,6 +1672,8 @@ def _vanished(
             what = 'which may hold sensitive data at the base (Konstruct cannot build the base to tell)'
         elif held.get(source):
             what = f'which holds {", ".join(held[source])} data at the base'
+        elif unread:
+            what = f"which may hold sensitive data at the base (Konstruct cannot read the base's data file {unread[0]})"
         else:
             continue
         found.append(
@@ -1725,8 +1732,10 @@ def base_graph(root: Path, ref: str, cache: Path | None = None) -> Graph | None:
     with tempfile.TemporaryDirectory(prefix='konstruct-base-') as scratch:
         tree = Path(scratch) / 'tree'
         try:
-            snapshot.write_tree(top, commit, prefix, tree)
+            held = snapshot.write_tree(top, commit, prefix, tree)
             config = load_config(tree / prefix, Path(scratch) / 'out', trusted=False)
+            config.tracked = held
+            config.unread = held.unread
             config.override(run_dbt=False, warehouses=False)
             config.html = config.report = False
             graph = build(config).graph
