@@ -484,6 +484,7 @@ class Checker:
         self._forms: dict[str, _Form] = {}
         self._keys: dict[str, list[frozenset[str]]] = {}
         self._filled: dict[str, list[frozenset[str]]] = {}
+        self._by_name: dict[str, set[tuple[str, str]]] | None = None
         self._names: dict[str, list[tuple[int, Node]]] | None = None
         self._named: dict[str, list[Node]] = {}
         self._additive: set[str] | None = None
@@ -697,15 +698,26 @@ class Checker:
             self._filled[relation.id] = found
         return found
 
-    def read_schema(self, tree: exp.Expr) -> dict[str, dict[str, str]]:
-        """The columns of the relations ``tree`` reads: a schema of every relation in a large project
-        costs more to build than the whole check."""
+    def read_schema(self, tree: exp.Expr, catalog: str | None, db: str | None) -> dict[str, dict[str, str]]:
+        """The columns of the relations ``tree`` reads, its unqualified names in ``catalog`` and
+        ``db``: a schema of every relation in a large project costs more to build than the whole
+        check."""
         found = {}
         for table in tree.find_all(exp.Table):
-            key = table_key(table, self.default_catalog, self.default_db)
+            key = table_key(table, catalog, db)
             if key in self.schema:
                 found[key] = self.schema[key]
         return found
+
+    def schemas_holding(self, name: str) -> set[tuple[str, str]]:
+        """The catalogs and schemas that hold a relation called ``name`` (lower case)."""
+        if self._by_name is None:
+            self._by_name = defaultdict(set)
+            for node in self.graph.relations():
+                parts = (node.relation or '').lower().split('.')
+                if len(parts) == 3:
+                    self._by_name[parts[2]].add((parts[0], parts[1]))
+        return self._by_name.get(name, set())
 
     def column_at(self, parts: list[str]) -> Node | None:
         """The graph column a fully qualified name (relation key, then column) refers to."""
@@ -2063,7 +2075,8 @@ class _Run:
         self.laterals: dict[int, Scope] = {}
         self.called: dict[str, list[str]] = {}
         self.placed: dict[tuple[str, str, str], str | None] = {}
-        self.canon = Canonical(checker.sqlglot, checker.default_catalog, checker.default_db)
+        self.catalog, self.db = checker.default_catalog, checker.default_db
+        self.canon = Canonical(checker.sqlglot, self.catalog, self.db)
         self.schema = MappingSchema({}, dialect=checker.sqlglot)
 
     def add(self, finding: Finding, *key: str) -> None:
@@ -2082,6 +2095,7 @@ class _Run:
                 Finding('unparsed', 'error', f'the SQL could not be parsed: {message}', 'Correct the syntax.')
             )
             return self.result
+        self.locate(trees)
         for index, (tree, query) in enumerate(zip(trees, _with_queries(trees), strict=True), 1):
             if query is None:
                 continue
@@ -2091,9 +2105,9 @@ class _Run:
                         analyse(
                             tree.sql(dialect=checker.sqlglot),
                             dialect=checker.dialect,
-                            schema=checker.read_schema(tree),
-                            default_catalog=checker.default_catalog,
-                            default_db=checker.default_db,
+                            schema=checker.read_schema(tree, self.catalog, self.db),
+                            default_catalog=self.catalog,
+                            default_db=self.db,
                         )
                     ),
                     None,
@@ -2119,6 +2133,39 @@ class _Run:
                 )
         return self._finish(trees)
 
+    def locate(self, trees: list[exp.Expr]) -> None:
+        """Read the query's unqualified names in the one schema that holds every relation it names,
+        when the graph's default schema holds not all of them: a graph built from several dbt
+        projects keeps the default schema of one, and each project's SQL names its own relations
+        unqualified."""
+        checker = self.checker
+        ctes = {c.alias_or_name.lower() for tree in trees for c in tree.find_all(exp.CTE)}
+        tables = [
+            t
+            for tree in trees
+            for t in tree.find_all(exp.Table)
+            if t.name and not t.catalog and (t.db or t.name.lower() not in ctes)
+        ]
+
+        def holds(catalog: str | None, db: str | None) -> bool:
+            return all(self.graph.node_for_relation(table_key(t, catalog, db)) is not None for t in tables)
+
+        inputs = self.graph.meta.get('inputs')
+        projects = inputs.get('dbt_projects', 0) if isinstance(inputs, dict) else 0
+        # With one project, its default schema is where the query's names are, found or not.
+        if not tables or not isinstance(projects, int) or projects < 2 or holds(self.catalog, self.db):
+            return
+        places = {
+            place
+            for t in tables
+            for place in checker.schemas_holding(t.name.lower())
+            if not t.db or place[1] == t.db.lower()
+        }
+        found = [place for place in sorted(places) if holds(*place)]
+        if len(found) == 1:
+            self.catalog, self.db = found[0]
+            self.canon = Canonical(checker.sqlglot, self.catalog, self.db)
+
     def _finish(self, trees: list[exp.Expr]) -> SqlCheck:
         order = {s: i for i, s in enumerate(SEVERITIES)}
         self.result.findings.sort(key=lambda f: order[f.severity])
@@ -2133,7 +2180,7 @@ class _Run:
         checker = self.checker
         # Normalised as the dialect normalises unquoted names (Snowflake upper-cases them), so that
         # qualify resolves the query's columns against the graph's lower-case ones.
-        built = build_schema(checker.read_schema(query), checker.sqlglot)
+        built = build_schema(checker.read_schema(query, self.catalog, self.db), checker.sqlglot)
         self.schema = MappingSchema(built.mapping, dialect=checker.sqlglot, normalize=True)
         try:
             qualified = self._qualified(query)
@@ -2204,19 +2251,15 @@ class _Run:
                 )
         # A PIVOT or UNPIVOT makes new columns out of a relation's, which it does not have.
         pivoted = {
-            table_key(t, self.checker.default_catalog, self.checker.default_db)
+            table_key(t, self.catalog, self.db)
             for t in query.find_all(exp.Table)
             if t.args.get('pivots') or any(s.args.get('pivots') for s in _ancestors(t, exp.Subquery))
         }
         # The lineage gives a table function's columns the key of the default schema itself; they
         # are checked against the columns the function lists, when the query reads only one.
         functions = [t for t in query.find_all(exp.Table) if not t.name]
-        called = {table_key(t, self.checker.default_catalog, self.checker.default_db) for t in functions}
-        named = {
-            table_key(t, self.checker.default_catalog, self.checker.default_db)
-            for t in query.find_all(exp.Table)
-            if t.name
-        }
+        called = {table_key(t, self.catalog, self.db) for t in functions}
+        named = {table_key(t, self.catalog, self.db) for t in query.find_all(exp.Table) if t.name}
         listed = _listed(functions[0]) if len(functions) == 1 else None
         used = [(s.relation, s.column) for sources in lineage.columns.values() for s in sources]
         for relation_key, column in [*used, *lineage.references]:
@@ -3304,9 +3347,7 @@ class _Run:
         # A table function (read_csv(...)) has no name: it is no relation of the graph, whatever
         # relation the default schema's own name stands for.
         if isinstance(source, exp.Table) and source.name:
-            return self.graph.node_for_relation(
-                table_key(source, self.checker.default_catalog, self.checker.default_db)
-            )
+            return self.graph.node_for_relation(table_key(source, self.catalog, self.db))
         return None
 
     def scope(self, scope: Scope, is_root: bool) -> _ScopeInfo:
@@ -4436,10 +4477,10 @@ class _Run:
             'validate_qualify_columns': False,
             'identify': False,
         }
-        if checker.default_db:
-            kwargs['db'] = checker.default_db
-            if checker.default_catalog:
-                kwargs['catalog'] = checker.default_catalog
+        if self.db:
+            kwargs['db'] = self.db
+            if self.catalog:
+                kwargs['catalog'] = self.catalog
         return qualify(query.copy(), **kwargs)
 
     def rename(self, query: exp.Query, old: Node, new: Node) -> str | None:
@@ -4456,11 +4497,7 @@ class _Run:
                 getattr(select.args.get('from_'), 'this', None),
             ]
             aliases = {t.alias_or_name: t for t in tables if isinstance(t, exp.Table)}
-            mine = {
-                a
-                for a, t in aliases.items()
-                if table_key(t, self.checker.default_catalog, self.checker.default_db) == relation.relation
-            }
+            mine = {a for a, t in aliases.items() if table_key(t, self.catalog, self.db) == relation.relation}
             if not mine:
                 continue
             nested = select.find_ancestor(exp.CTE, exp.Subquery) is not None
