@@ -40,6 +40,9 @@ over a relation with unknown columns, selecting 20 of its columns at the end; an
 the best of three ``--update`` builds of a project of 400 SQL files with no warehouse. It times
 statements that read one relation twice the same way, and both those and the chains also in CPU
 time, the least of 25 runs (10 for a chain), which other work on the machine does not inflate.
+On the largest size it builds the scale project again in a database whose name needs quotes
+(``wh-1``) and in ``wh``, and times the cold build and, in CPU time, composing every column's
+formula and the identity test of every formula in each.
 
 For the dbt input it measures reading a manifest into a graph (``dbt.load``, with nothing rendered)
 on the scale project, and, on a generated dbt project that dbt has only parsed (``dbt parse``, so
@@ -93,6 +96,7 @@ sys.path.insert(0, str(ROOT))
 from konstruct import Project, __version__  # noqa: E402
 from konstruct.analysis import semantic  # noqa: E402
 from konstruct.analysis.conflicts import find_conflicts  # noqa: E402
+from konstruct.analysis.explain import Explainer  # noqa: E402
 from konstruct.analysis.gate import gate  # noqa: E402
 from konstruct.analysis.identity import Formulas  # noqa: E402
 from konstruct.analysis.query import search  # noqa: E402
@@ -687,6 +691,33 @@ def sql_files_project(root: Path, files: int = 400) -> None:
         )
 
 
+def measure_quoted(models: int) -> dict[str, float]:
+    """Seconds for a cold build, and CPU seconds (the least of three runs) for composing every
+    column's formula and translating and fingerprinting every formula for the identity test, for
+    the scale project in a database whose name needs quotes (``wh-1``) and in one whose name does
+    not (``wh``)."""
+    found: dict[str, float] = {}
+    for label, database in (('plain', 'wh'), ('quoted', 'wh-1')):
+        with tempfile.TemporaryDirectory(prefix='konstruct-bench-quoted-') as directory:
+            root = Path(directory)
+            make_project(root, models=models, columns_per_model=COLUMNS, database=database)
+            cold, result = timed(Project(root).build, run_dbt=False, warehouses=False)
+            graph = result.graph
+            columns = [n for n in graph.nodes.values() if n.kind == 'column']
+            # In CPU time, the least of three runs, each with a new explainer, which composes once.
+            composed = least_cpu(
+                lambda g=graph, cs=columns: [Explainer(g, qualified=True).composed_text(c) for c in cs],
+                repeat=3,
+            )
+            translated = least_cpu(lambda g=graph: identity(g), repeat=3)
+            found |= {
+                f'{label}_cold_build_s': round(cold, 2),
+                f'{label}_compose_s': round(composed, 2),
+                f'{label}_identity_s': round(translated, 2),
+            }
+    return found
+
+
 def measure_sql_files(files: int = 400) -> dict[str, float]:
     """Seconds for a cold build and the best of three ``--update`` builds of a project of SQL files."""
     with tempfile.TemporaryDirectory(prefix='konstruct-bench-sql-') as directory:
@@ -848,6 +879,7 @@ def main() -> int:
     chains, chains_cpu = measure_star_chains() if rows else ({}, {})
     joined, joined_cpu = measure_self_joins() if rows else ({}, {})
     sql_files = measure_sql_files() if rows else {}
+    quoted = measure_quoted(max(sizes)) if rows else {}
     dbt_read = measure_dbt_read(max(sizes)) if rows else {}
     machine = (
         f'{platform.machine()}, {platform.system()} {platform.release()}, Python {platform.python_version()}'
@@ -895,6 +927,13 @@ def main() -> int:
             f'{sql_files["sql_files"]} SQL files and no warehouse: cold build {sql_files["sql_cold_build_s"]} s, '
             f'`--update` {sql_files["sql_update_s"]} s.'
         )
+        print(
+            f'In a database whose name needs quotes (`wh-1`, against `wh`), {max(sizes)} models: cold build '
+            f'{quoted["quoted_cold_build_s"]} s ({quoted["plain_cold_build_s"]} s); in CPU time, the least of '
+            f'three runs, composing every formula {quoted["quoted_compose_s"]} s ({quoted["plain_compose_s"]} '
+            f's), the identity test of every formula {quoted["quoted_identity_s"]} s '
+            f'({quoted["plain_identity_s"]} s).'
+        )
     for r in yaml_rows:
         print(f'\nThe schema files of {r["models"]:,} models: {r["files"]} files, {r["megabytes"]} MB\n')
         print('| Reader | CPU seconds | MB/s | Time, against the core |')
@@ -926,6 +965,7 @@ def main() -> int:
             'star_chains_cpu_ms': chains_cpu,
             'self_joins_cpu_ms': joined_cpu,
             **sql_files,
+            **quoted,
         }
         args.json.write_text(json.dumps(data, indent=1))
     return 0

@@ -1412,6 +1412,104 @@ def test_a_relation_whose_name_has_a_hash_is_not_a_reading() -> None:
     assert result.conditions == ['JOIN ON: db.main.events.id = db.main."events##2".id']
 
 
+def test_a_name_that_needs_quotes_is_quoted_in_canonical_text() -> None:
+    """A database named ``ds6-module-2`` printed bare reads back as a subtraction, so each part of a
+    name the dialect would not read back as one name is quoted, as the dialect quotes."""
+    result = one(
+        'select o."order-id", a.price - b.price as gap from "ds6-module-2".ingestion.orders o '
+        'join "ds6-module-2".ingestion.orders a on a.id = o.id '
+        'join "ds6-module-2".ingestion.orders b on b.id = o.id',
+        schema={},
+    )
+    assert result.expressions == {
+        'order-id': '"ds6-module-2".ingestion."orders#1"."order-id"',
+        'gap': '"ds6-module-2".ingestion."orders#3".price - "ds6-module-2".ingestion."orders#2".price',
+    }
+    assert result.conditions == [
+        'JOIN ON: "ds6-module-2".ingestion."orders#2".id = "ds6-module-2".ingestion."orders#1".id',
+        'JOIN ON: "ds6-module-2".ingestion."orders#3".id = "ds6-module-2".ingestion."orders#1".id',
+    ]
+    bigquery = one('select o.price from `ds6-module-2.ingestion.orders` o', dialect='bigquery', schema={})
+    assert bigquery.expressions == {'price': '`ds6-module-2`.ingestion.orders.price'}
+
+
+def test_conditions_quote_the_names_that_need_quotes() -> None:
+    """A condition names its columns as a formula does: printed bare, ``order-id`` reads back as a
+    subtraction and ``order id`` as a column with an alias."""
+    assert one('select o.id from main.orders o where o."order-id" > 1', schema={}).conditions == [
+        'WHERE: db.main.orders."order-id" > 1'
+    ]
+    joined = one(
+        'select o.id from main.orders o join main.items i on i."order id" = o."order id" group by o."order id"',
+        schema={},
+    )
+    assert joined.conditions == [
+        'GROUP BY: db.main.orders."order id"',
+        'JOIN ON: db.main.items."order id" = db.main.orders."order id"',
+    ]
+    # A quoted name is still a name, which needs no brackets inside another expression.
+    assert one('select "my col" + 1 as x from main.t', schema={}).expressions == {
+        'x': 'db.main.t."my col" + 1'
+    }
+    assert (
+        without_readings('db.main."my-t#2".x = db.main."my-t#1".x') == 'db.main."my-t".x = db.main."my-t".x'
+    )
+
+
+NAMES = [
+    *(
+        'select order user date from group table true false null current_date current_user interval case end'.split()
+    ),
+    *('by limit key value values all any default left join natural comment not'.split()),
+    *('MyCol café 日本 1abc 2024 1 1e5 0x1f nan inf e _ __ _1 x1 a$b $x $1 @x ? + - * % /'.split()),
+    *[
+        'a b',
+        'a-b',
+        'ds6-module-2',
+        'a"b',
+        'a`b',
+        "a'b",
+        'a#b',
+        'x--y',
+        'x/*y*/',
+        'a\\b',
+        '[x]',
+        '{x}',
+        'tab\tx',
+    ],
+]
+
+
+@pytest.mark.parametrize(
+    'dialect', ['duckdb', 'postgres', 'snowflake', 'bigquery', 'databricks', 'redshift', 'tsql', 'trino']
+)
+def test_every_name_in_canonical_text_reads_back_as_the_name_it_is(dialect: str) -> None:
+    """A part of a name is quoted unless the dialect reads it back, alone, as a column of that name:
+    a word that is a literal (``2024``, ``true``), a keyword (``end``, ``current_date``) or an
+    operator would otherwise read back as something else, here or as a column of a table function."""
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.dialects.dialect import Dialect
+
+    from konstruct.core.sql import _sql_name
+
+    keywords = {
+        k.lower()
+        for k in Dialect.get_or_raise(dialect).tokenizer_class.KEYWORDS
+        if k.replace('_', '').isalpha()
+    }
+    for name in [*NAMES, *sorted(keywords)]:
+        qualified = sqlglot.parse_one(_sql_name(f'cat.sch.tbl.{name}', dialect), read=dialect)
+        assert isinstance(qualified, exp.Column) and [p.name for p in qualified.parts] == [
+            'cat',
+            'sch',
+            'tbl',
+            name,
+        ], name
+        bare = sqlglot.parse_one(_sql_name(name, dialect), read=dialect)
+        assert isinstance(bare, exp.Column) and bare.name == name and not bare.table, name
+
+
 def test_a_cte_read_by_two_others_names_each_reference_and_moving_a_filter_between_them_shows() -> None:
     """jaffle_shop's customers reads stg_orders through one CTE that two others read, each joined to
     customers on its own: the two readings meet through customers, so each is named, and a filter
