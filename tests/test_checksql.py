@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import itertools
 import json
+import os
 import sys
 import types
 from collections.abc import Callable
@@ -32,7 +33,7 @@ from konstruct.analysis.checksql import (
 from konstruct.core.graph import Graph
 from konstruct.inputs.usage import HistoryQuery, QueryHistory, UsageSettings, fetch_history
 
-from .conftest import cpu_seconds
+from .conftest import cpu_seconds, dbt_executable
 
 WAREHOUSE = """
 create schema raw;
@@ -364,6 +365,192 @@ def test_a_measure_without_its_required_filter_is_an_error_with_the_filter_added
     # The corrected SQL computes the measure as its column does, which is only a note.
     assert rules(shop.check(result.corrected)) == ['recomputes-measure']
     runs_alike(shop_db, NET_REVENUE, result)
+
+
+ORDER_AMOUNTS = """\
+create table mart.order_amounts as
+select o.order_id, o.status, sum(p.amount) as amount,
+    sum(case when p.method = 'card' then p.amount else 0 end) as card_amount,
+    sum(case when o.status = 'returned' then p.amount else 0 end) as returned_amount,
+    count(*) as payments
+from raw.orders o
+join raw.payments p on p.order_id = o.order_id
+group by o.order_id, o.status
+"""
+
+
+AMOUNTS_DEFINITIONS = """\
+version: 1
+terms:
+  - name: Net amount
+    kind: measure
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [order_amounts.amount]
+    filters: ["order_amounts.status = 'completed'"]
+"""
+
+
+@pytest.fixture(scope='module')
+def amounts(tmp_path_factory: pytest.TempPathFactory) -> Checker:
+    """The shop with each order's payments added up in total and by card."""
+    root = tmp_path_factory.mktemp('amounts')
+    make_shop(root, definitions=AMOUNTS_DEFINITIONS)
+    (root / 'mart' / 'order_amounts.sql').write_text(ORDER_AMOUNTS)
+    return Checker(Project(root).build(run_dbt=False).graph)
+
+
+def test_a_column_that_computes_a_measure_over_some_of_its_rows_needs_its_filters(amounts: Checker) -> None:
+    """card_amount adds up the same payment amounts as amount, the column of 'Net amount', over the
+    card payments alone: it is net amount by card, so it needs the filter net amount requires. A
+    column with the same formula over the same rows, or a count, is not a slice of it."""
+    finding = only(amounts.check('select sum(card_amount) from mart.order_amounts'), 'missing-filter')
+    assert (finding.severity, finding.term) == ('warning', 'Net amount')
+    assert finding.evidence == [
+        "required by term 'Net amount' (definitions.yml:3)",
+        "order_amounts.card_amount computes 'Net amount' as order_amounts.amount does, over the rows where "
+        "payments.method = 'card'",
+    ]
+    assert finding.rewrite == "order_amounts.status = 'completed' added to the WHERE clause"
+    for sql in (
+        "select sum(card_amount) from mart.order_amounts where status = 'completed'",
+        'select sum(payments) from mart.order_amounts',
+        'select sum(paid) from mart.order_payments',
+    ):
+        assert loud(amounts.check(sql)) == [], sql
+
+
+def test_a_column_s_not_null_filter_on_its_group_key_is_no_filter_of_the_same_groups(tmp_path: Path) -> None:
+    """Grouped by order, WHERE order_id IS NOT NULL drops only the group of payments with no order,
+    and changes no other group's average: a query grouped by order too has those groups and one
+    more, for NULL, so it needs no such filter. A query grouped otherwise (by method) averages the
+    payments with no order into its groups, which DuckDB shows differ, so it needs the filter; and
+    a filter on other columns still counts."""
+    root = tmp_path / 'shop'
+    root.mkdir()
+    make_shop(root)
+    model = (
+        'create table mart.order_averages as select order_id, avg(amount) as avg_paid, '
+        "avg(amount) filter (where method <> 'voucher') as avg_kept "
+        'from raw.payments where order_id is not null group by order_id'
+    )
+    (root / 'mart' / 'order_averages.sql').write_text(model)
+    checker = Checker(Project(root).build(run_dbt=False).graph)
+    by_order = 'select order_id, avg(amount) as avg_paid from raw.payments group by order_id'
+    assert 'missing-filter' not in rules(checker.check(by_order))
+    assert 'missing-filter' not in rules(checker.check(by_order.replace('group by order_id', 'group by 1')))
+    by_method = 'select method, avg(amount) as avg_paid from raw.payments group by method'
+    finding = only(checker.check(by_method), 'missing-filter')
+    assert 'order_id IS NULL' in finding.message
+    for sql in (by_method, 'select avg(amount) as avg_paid from raw.payments'):
+        assert 'missing-filter' in rules(checker.check(sql)), sql
+    con = duckdb.connect()
+    con.execute(WAREHOUSE)
+    con.execute("insert into raw.payments values (1, 1, 10, 'card'), (2, null, 30, 'card')")
+    assert (
+        con.execute(by_method).fetchall()
+        != con.execute(by_method.replace('group by', 'where order_id is not null group by')).fetchall()
+    )
+    finding = only(checker.check(by_order.replace('avg_paid', 'avg_kept')), 'missing-filter')
+    assert "method <> 'voucher'" in finding.message and 'NULL' not in finding.message
+    # Written in the query too, the filter is the model's own: the same SQL recomputes it.
+    same = by_order.replace('from raw.payments', 'from raw.payments where order_id is not null')
+    assert rules(checker.check(same)) == ['recomputes-measure']
+
+
+def test_a_comparison_on_a_column_implies_it_is_not_null(tmp_path: Path) -> None:
+    """A comparison is NULL where its column is, so a query that keeps payments of 10 or more keeps
+    no payment with a NULL amount: it applies amount IS NOT NULL. One that tests the column only
+    inside an OR, or with IS DISTINCT FROM, does not."""
+    root = tmp_path / 'shop'
+    root.mkdir()
+    make_shop(root)
+    (root / 'mart' / 'method_averages.sql').write_text(
+        'create table mart.method_averages as select method, avg(order_id) as avg_order '
+        'from raw.payments where amount is not null group by method'
+    )
+    checker = Checker(Project(root).build(run_dbt=False).graph)
+    base = 'select method, avg(order_id) as avg_order from raw.payments where {} group by method'
+    for kept in ('amount >= 10', 'amount <> 0', 'amount in (1, 2)', 'not (amount < 0)'):
+        assert 'missing-filter' not in rules(checker.check(base.format(kept))), kept
+    for loose in ("amount >= 10 or method = 'card'", 'amount is distinct from 0'):
+        assert 'missing-filter' in rules(checker.check(base.format(loose))), loose
+
+
+ACTIVE_WAREHOUSE = """
+create schema raw;
+create table raw.orders (order_id int primary key, customer_id int, amount int, status varchar);
+create table raw.customers (customer_id int primary key, first_order_id int);
+"""
+ACTIVE_DATA = """
+create schema raw; create schema stg;
+create table raw.orders as select * from (values (1, 10, 100, 'x'), (2, 10, 50, null)) v(order_id, customer_id, amount, status);
+create view stg.stg_orders as select order_id, customer_id, status from raw.orders;
+create table raw.customers as select * from (values (10, 1)) v(customer_id, first_order_id);
+"""
+
+
+def test_a_comparison_on_a_row_tied_to_the_measure_s_is_no_filter_of_its_rows(tmp_path: Path) -> None:
+    """Active amount adds up orders whose status is not NULL. A comparison on the status of the
+    customer's first order, or of the row a deduplicated subquery keeps for the customer, says
+    nothing of the status of the orders summed: DuckDB shows 150 where the term gives 100. On
+    the summed order's own status it is the filter."""
+    con = duckdb.connect(str(tmp_path / 'w.duckdb'))
+    con.execute(ACTIVE_WAREHOUSE)
+    con.close()
+    (tmp_path / 'stg').mkdir()
+    (tmp_path / 'stg' / 'stg_orders.sql').write_text(
+        'create view stg.stg_orders as select order_id, customer_id, status from raw.orders'
+    )
+    (tmp_path / 'definitions.yml').write_text(
+        'version: 1\nterms:\n  - name: Active amount\n    kind: measure\n    status: approved\n'
+        '    approved: 2026-10-01\n    owner: {name: Ana Ruiz}\n    columns: [raw.orders.amount]\n'
+        '    filters: ["orders.status IS NOT NULL"]\n'
+    )
+    checker = Checker(Project(tmp_path).build(run_dbt=False).graph)
+    data = duckdb.connect()
+    data.execute(ACTIVE_DATA)
+    truth = data.execute('select sum(amount) from raw.orders where status is not null').fetchall()
+    for sql in (
+        'select sum(o.amount) as active_amount from raw.orders o join (select customer_id, status '
+        'from stg.stg_orders qualify row_number() over (partition by customer_id order by status nulls last) = 1) s '
+        "on s.customer_id = o.customer_id where s.status = 'x'",
+        'select sum(o.amount) as active_amount from raw.orders o join raw.customers c '
+        "on c.customer_id = o.customer_id join raw.orders f on f.order_id = c.first_order_id where f.status = 'x'",
+    ):
+        assert 'missing-filter' in rules(checker.check(sql)), sql
+        assert data.execute(sql).fetchall() != truth
+    own = "select sum(o.amount) as active_amount from raw.orders o where o.status = 'x'"
+    assert 'missing-filter' not in rules(checker.check(own))
+
+
+def test_a_slice_on_the_column_a_measure_filters_is_not_that_measure(amounts: Checker) -> None:
+    """returned_amount keeps the payments of returned orders: a slice on the very column net amount
+    filters is another idea, not net amount for some rows. A query that filters or groups by that
+    column chose its rows itself: at most a note, and the SQL is not rewritten."""
+    assert 'missing-filter' not in rules(amounts.check('select sum(returned_amount) from mart.order_amounts'))
+    for sql in (
+        "select sum(card_amount) from mart.order_amounts where status = 'returned'",
+        'select status, sum(card_amount) from mart.order_amounts group by status',
+    ):
+        result = amounts.check(sql)
+        assert loud(result) == [] and result.corrected is None, sql
+
+
+def test_a_filter_two_terms_require_is_added_once(tmp_path: Path) -> None:
+    """Two terms of one column require the same filter: each finding names its term, and the
+    corrected SQL applies the filter once."""
+    second = AMOUNTS_DEFINITIONS + AMOUNTS_DEFINITIONS.split('terms:\n', 1)[1].replace(
+        'Net amount', 'Average net amount'
+    )
+    root = tmp_path / 'shop'
+    root.mkdir()
+    make_shop(root, definitions=second)
+    (root / 'mart' / 'order_amounts.sql').write_text(ORDER_AMOUNTS)
+    result = check_sql(Project(root).build(run_dbt=False).graph, 'select sum(amount) from mart.order_amounts')
+    assert sorted(f.term or '' for f in result.findings) == ['Average net amount', 'Net amount']
+    assert flat(result.corrected or '').count("status = 'completed'") == 1
 
 
 @pytest.mark.parametrize(
@@ -1456,6 +1643,17 @@ def test_a_value_preserving_wrapper_is_the_same_formula(shop: Checker, value: st
     assert rules(shop.check(sql)) == ['recomputes-measure']
 
 
+@pytest.mark.parametrize('dialect', ['bigquery', 'snowflake'])
+def test_a_function_is_the_same_whatever_case_it_is_written_in(
+    dialects: dict[str, Checker], dialect: str
+) -> None:
+    """BigQuery keeps a function name's case as written, where Snowflake upper-cases it; SUM and
+    sum are one function either way."""
+    sql = 'select o.order_id, SUM(p.amount) as paid from raw.orders o join raw.payments p on p.order_id = o.order_id group by 1'
+    assert 'formula-differs' not in rules(dialects[dialect].check(sql))
+    assert 'formula-differs' not in rules(dialects[dialect].check(sql.replace('SUM', 'sum')))
+
+
 @pytest.mark.parametrize(
     'value',
     [
@@ -1651,6 +1849,849 @@ def test_joins_that_keep_the_grain_are_not_fan_outs(shop: Checker, sql: str) -> 
     assert 'fan-out' not in rules(shop.check(sql))
 
 
+def test_an_average_of_a_value_fixed_by_its_group_is_that_value(shop: Checker) -> None:
+    """Grouped by the customer's key, every row of a group repeats one customer, so averaging the
+    copies of its value gives the value: the join's repeats change nothing. A sum of the copies, or
+    an average grouped by something else, still counts each repeat."""
+    sql = (
+        'select c.customer_id, avg(c.customer_id) as avg_id from raw.customers c '
+        'join raw.orders o on o.customer_id = c.customer_id group by c.customer_id'
+    )
+    assert 'fan-out' not in rules(shop.check(sql))
+    assert 'fan-out' in rules(shop.check(sql.replace('avg(', 'sum(')))
+    assert 'fan-out' in rules(
+        shop.check(
+            sql.replace('group by c.customer_id', 'group by c.region').replace(
+                'select c.customer_id,', 'select c.region,'
+            )
+        )
+    )
+
+
+ACCOUNTS = "select * from (values (1, null, 100), (2, null, 200), (3, 'k3', 300)) v(account_id, account_key, credit_limit)"
+EVENTS = 'select * from (values (10, 1), (11, 1), (12, 1), (13, 2), (14, 3)) v(event_id, account_id)'
+
+
+@pytest.fixture(scope='module')
+def accounts(tmp_path_factory: pytest.TempPathFactory) -> Checker:
+    """A dbt project whose accounts have an id tested unique and not null, and a key tested unique
+    only, which two accounts leave NULL."""
+    from konstruct.engine.build import build
+    from konstruct.engine.config import load_config
+
+    dbt = dbt_executable()
+    if dbt is None:
+        pytest.skip('dbt is not installed')
+    root = tmp_path_factory.mktemp('accounts')
+    (root / 'models').mkdir()
+    (root / 'dbt_project.yml').write_text(
+        "name: shop\nversion: '1.0'\nprofile: shop\nmodel-paths: [models]\n"
+    )
+    (root / 'profiles.yml').write_text(
+        'shop:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: shop.duckdb\n'
+    )
+    (root / 'models' / 'accounts.sql').write_text(ACCOUNTS.replace('null', 'cast(null as varchar)'))
+    (root / 'models' / 'events.sql').write_text(EVENTS)
+    (root / 'models' / 'schema.yml').write_text(
+        'version: 2\nmodels:\n  - name: accounts\n    columns:\n      - name: account_id\n'
+        '        tests: [unique, not_null]\n      - name: account_key\n        tests: [unique]\n'
+        '  - name: events\n    columns:\n      - name: event_id\n        tests: [unique, not_null]\n'
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv('PATH', f'{Path(dbt).parent}{os.pathsep}{os.environ.get("PATH", "")}')
+        patch.setenv('DBT_SEND_ANONYMOUS_USAGE_STATS', 'false')
+        build(load_config(root, trusted=True))
+    return Checker(Project(root).graph)
+
+
+def test_an_average_grouped_by_a_key_that_can_be_null_is_a_fan_out(accounts: Checker) -> None:
+    """A unique test lets many rows hold NULL, and grouped by the key they make one group, in which
+    the join repeats each account as often as it has events: the average weighs them so. Grouped by
+    an id also tested not null, each group is one account. DuckDB shows the averages of NULL's
+    group differ (125 against 150)."""
+    sql = (
+        'select a.account_key, avg(a.credit_limit) as avg_limit from accounts a '
+        'join events e on e.account_id = a.account_id group by a.account_key'
+    )
+    assert only(accounts.check(sql), 'fan-out').severity == 'warning'
+    assert 'fan-out' not in rules(accounts.check(sql.replace('account_key', 'account_id')))
+    con = duckdb.connect()
+    con.execute(f'create table accounts as {ACCOUNTS}; create table events as {EVENTS}')
+    assert (
+        con.execute(sql + ' order by 1').fetchall()
+        != con.execute('select account_key, avg(credit_limit) from accounts group by 1 order by 1').fetchall()
+    )
+
+
+def test_a_named_window_is_the_window_it_names(shop: Checker) -> None:
+    """``OVER w`` with ``WINDOW w AS (PARTITION BY ...)`` runs over the partition the WINDOW clause
+    gives: the first row of each order's payments is one row per order, and of each method's is
+    not."""
+    first = (
+        'select sum(o.amount) from raw.orders o join (select order_id, amount from raw.payments '
+        'window w as (partition by order_id order by payment_id) qualify row_number() over w = 1) p '
+        'on p.order_id = o.order_id'
+    )
+    assert 'fan-out' not in rules(shop.check(first))
+    assert 'fan-out' in rules(shop.check(first.replace('partition by order_id', 'partition by method')))
+
+
+def test_a_rollup_has_rows_that_span_its_groups(shop: Checker, tmp_path: Path) -> None:
+    """Grouped by the payment, each group reads one order; but the subtotal row of a ROLLUP, or of
+    MySQL's WITH ROLLUP, reads every payment, and repeats each order once per payment. DuckDB shows
+    the total row is not the total of the orders."""
+    sql = (
+        'select p.payment_id, sum(o.amount) as total from raw.payments p '
+        'join raw.orders o on o.order_id = p.order_id group by rollup (p.payment_id)'
+    )
+    assert only(shop.check(sql), 'fan-out').severity == 'warning'
+    assert 'fan-out' not in rules(shop.check(sql.replace('rollup (p.payment_id)', 'p.payment_id')))
+    mysql = Checker(make_shop(tmp_path, dialect='mysql'))
+    written = sql.replace('rollup (p.payment_id)', 'p.payment_id with rollup')
+    assert only(mysql.check(written), 'fan-out').severity == 'warning'
+    average = written.replace('sum(o.amount)', 'avg(p.amount)').replace(
+        'join raw.orders o on o.order_id = p.order_id', 'join raw.payments q on q.order_id = p.order_id'
+    )
+    assert only(mysql.check(average), 'fan-out').severity == 'warning'
+    con = duckdb.connect()
+    con.execute(WAREHOUSE)
+    con.execute("insert into raw.orders values (1, 1, 10, 'completed', '2026-01-01')")
+    con.execute("insert into raw.payments values (1, 1, 4, 'card'), (2, 1, 6, 'card')")
+    total = [r for r in con.execute(sql).fetchall() if r[0] is None]
+    assert total == [(None, 20)] != con.execute('select null, sum(amount) from raw.orders').fetchall()
+
+
+def test_a_null_safe_join_on_the_columns_a_distinct_keeps_matches_one_row(shop: Checker) -> None:
+    """SELECT DISTINCT returns one row per combination of its columns, and a column that is the same
+    on every row (a constant) distinguishes none, so the rows are unique on the others. Joined on
+    those columns with IS NOT DISTINCT FROM, which matches NULL to NULL as DISTINCT groups NULLs
+    into one row, each order matches at most one of them; with a column the join leaves out, it can
+    match several."""
+    sql = (
+        "with w as (select distinct customer_id, status, date '1900-01-01' as since from raw.orders) "
+        'select sum(p.amount) from raw.payments p join raw.orders o on o.order_id = p.order_id '
+        'join w on w.customer_id = o.customer_id and w.status is not distinct from o.status '
+        'and o.order_date >= w.since'
+    )
+    assert 'fan-out' not in rules(shop.check(sql))
+    loose = sql.replace(
+        'select distinct customer_id, status,', 'select distinct customer_id, status, amount,'
+    )
+    assert 'fan-out' in rules(shop.check(loose))
+    # A key matched from two sources: each payment's order and its method fix one row of w.
+    two = (
+        'with w as (select distinct customer_id, status from raw.orders) select sum(p.amount) '
+        'from raw.payments p join raw.orders o on o.order_id = p.order_id '
+        'join w on w.customer_id = o.customer_id and w.status = p.method'
+    )
+    assert 'fan-out' not in rules(shop.check(two))
+    # Customers and orders each joined on a key the other fixes, but orders joined to payments on
+    # no key of theirs: many orders, each with its customer, match one payment.
+    cycle = (
+        'select sum(p.amount) from raw.payments p join raw.orders o on o.status = p.method '
+        'join raw.customers c on c.customer_id = o.customer_id and o.order_id = c.customer_id'
+    )
+    assert only(shop.check(cycle), 'fan-out').severity == 'warning'
+    # Rows a unique test shows unique can still share NULL, which IS NOT DISTINCT FROM matches.
+    null_safe = [('p', 'order_id', 'o', 'order_id')]
+    tested = {'o': [frozenset({'order_id'})]}
+    assert reachable(['p', 'o'], [], tested, None, null_safe)['p'] == {'p'}
+    assert reachable(['p', 'o'], [], tested, None, null_safe, tested)['p'] == {'p', 'o'}
+
+
+ITEMS_WAREHOUSE = """
+create schema raw;
+create schema stg;
+create schema mart;
+create table raw.items (id int, order_id int, sku varchar);
+create table raw.products (sku varchar, price int, weight int);
+create table raw.supplies (supply_id int, sku varchar, cost int);
+create table raw.orders (id int, order_total int, tax_paid int);
+create table raw.events (id int, kind varchar);
+create table stg.stg_items (item_id int primary key, order_id int, product_id varchar);
+create table stg.stg_products (
+    product_id varchar primary key, product_price decimal(12, 2), weight int, weight_kg decimal(12, 3)
+);
+create table stg.stg_orders (
+    order_id int primary key, order_total decimal(12, 2), tax_paid_cents int, tax_paid decimal(12, 2)
+);
+create table stg.stg_events (event_id int primary key);
+create table mart.order_items (
+    item_id int primary key, order_id int, product_id varchar, product_price decimal(12, 2),
+    supply_cost decimal(12, 2)
+);
+"""
+ITEMS_MODELS = {
+    'stg/stg_items.sql': 'create view stg.stg_items as select id as item_id, order_id, sku as product_id from raw.items',
+    'stg/stg_products.sql': (
+        'create view stg.stg_products as select sku as product_id, price / 100 as product_price, weight, '
+        'weight / 1000 as weight_kg '
+        'from raw.products'
+    ),
+    'stg/stg_orders.sql': (
+        'create view stg.stg_orders as select id as order_id, order_total / 100 as order_total, '
+        'tax_paid as tax_paid_cents, tax_paid / 100 as tax_paid from raw.orders'
+    ),
+    'stg/stg_events.sql': "create view stg.stg_events as select id as event_id from raw.events where kind = 'click'",
+    'mart/order_items.sql': """\
+create table mart.order_items as
+with supply as (select sku, sum(cost / 100) as supply_cost from raw.supplies group by sku)
+select i.item_id, i.order_id, i.product_id, p.product_price, s.supply_cost
+from stg.stg_items i
+left join stg.stg_products p on p.product_id = i.product_id
+left join supply s on s.sku = i.product_id
+""",
+    'mart/order_totals.sql': (
+        'create table mart.order_totals as select order_id, sum(product_price) as subtotal, '
+        'sum(supply_cost) as cost from mart.order_items group by 1'
+    ),
+}
+
+
+ITEMS_DEFINITIONS = """\
+version: 1
+terms:
+  - name: Revenue
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [order_items.product_price]
+    unit: currency
+  - name: Order total
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [stg_orders.order_total]
+    unit: currency
+  - name: Large order
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [stg_orders.order_total]
+    filters: ["stg_orders.order_total >= 20"]
+  - name: Subtotal
+    kind: measure
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [order_totals.subtotal]
+  - name: Gross profit
+    kind: measure
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [order_items.product_price, order_items.supply_cost]
+"""
+
+
+def make_items(
+    root: Path, extra: dict[str, str] | None = None, warehouse: str = '', definitions: str = ''
+) -> Graph:
+    """Raw tables with no key of their own, staging views that copy them under tested keys, and a
+    mart that carries each product's price and supply cost onto its order items and adds them up;
+    the raw amounts are in cents."""
+    con = duckdb.connect(str(root / 'items.duckdb'))
+    con.execute(ITEMS_WAREHOUSE + warehouse)
+    con.close()
+    for name, sql in {**ITEMS_MODELS, **(extra or {})}.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(sql)
+    (root / 'definitions.yml').write_text(ITEMS_DEFINITIONS + definitions)
+    return Project(root).build(run_dbt=False).graph
+
+
+@pytest.fixture(scope='module')
+def items(tmp_path_factory: pytest.TempPathFactory) -> Checker:
+    return Checker(make_items(tmp_path_factory.mktemp('items')))
+
+
+@pytest.mark.parametrize(
+    ('dialect', 'kept'),
+    [
+        ('duckdb', True),
+        # A MySQL flag is a number: WHERE is_active keeps 2, which is_active = TRUE (= 1) does not.
+        ('mysql', False),
+    ],
+)
+def test_a_boolean_compared_with_true_is_the_boolean_where_it_is_a_type(
+    tmp_path: Path, dialect: str, kept: bool
+) -> None:
+    con = duckdb.connect(str(tmp_path / 'w.duckdb'))
+    con.execute(
+        'create schema stg; create table stg.accounts (account_id int primary key, is_active int, balance int)'
+    )
+    con.close()
+    (tmp_path / 'stg').mkdir()
+    (tmp_path / 'stg' / 'account_bal.sql').write_text(
+        'create view stg.account_bal as select account_id, balance from stg.accounts where is_active = true'
+    )
+    (tmp_path / 'definitions.yml').write_text(
+        'version: 1\nterms:\n  - name: Active balance\n    kind: measure\n    status: approved\n'
+        '    approved: 2026-10-01\n    owner: {name: Ana Ruiz}\n    columns: [account_bal.balance]\n'
+        '    filters: ["accounts.is_active = true"]\n'
+    )
+    checker = Checker(Project(tmp_path).build(run_dbt=False, dialect=dialect).graph)
+    sql = 'select sum(a.balance) as active_balance from stg.accounts a where a.is_active'
+    assert ('missing-filter' not in rules(checker.check(sql))) is kept
+    assert 'missing-filter' in rules(checker.check(sql.replace(' where a.is_active', '')))
+
+
+def test_a_key_of_a_copy_is_no_key_of_what_it_copies(items: Checker) -> None:
+    """Uniqueness flows downstream only: a staging view tested unique on a key it renames may be
+    an incremental model merged on that key over a source that keeps every version of a row."""
+    keys = {str(r.relation).split('.', 1)[1]: items.relation_keys(r) for r in items.graph.relations()}
+    assert frozenset({'order_id'}) in keys['stg.stg_orders']
+    assert keys['raw.orders'] == keys['raw.events'] == []
+
+
+UNSOUND_WAREHOUSE = """
+create schema raw; create schema stg; create schema mart;
+create table raw.orders (id int, customer_id int, amount int, tags varchar[]);
+create table raw.cust_cdc (id int, name varchar, updated_at timestamp, primary key (id, updated_at));
+create table stg.stg_orders (order_id int primary key, customer_id int, amount int, ordered_at date, valid_to date);
+create table stg.stg_cust (customer_id int primary key, name varchar);
+create table stg.customers (customer_id int primary key, region varchar, credit_limit int);
+create table stg.customer_months (customer_id int, month int, primary key (customer_id, month));
+create table stg.order_months (order_id int primary key, month int);
+create table mart.order_tags (order_id int, tag varchar, primary key (order_id, tag));
+create table mart.order_lines (line_id int primary key, order_id int, customer_id int, credit_limit int);
+create table mart.rates (region varchar, valid_from date, rate int, tags varchar[], primary key (region, valid_from));
+create table mart.days (day date primary key);
+create table mart.region_days (region varchar, day date, primary key (region, day));
+create table raw.orders_tagged (order_id int primary key, tags varchar[]);
+create table raw.lines (line_id int, order_id int);
+"""
+UNSOUND_MODELS = {
+    'stg/stg_cust.sql': 'create table stg.stg_cust as select id as customer_id, name from raw.cust_cdc',
+    'mart/order_tags.sql': 'create table mart.order_tags as select order_id, unnest(tags) as tag from stg.stg_orders',
+    'mart/order_lines.sql': (
+        'create table mart.order_lines as select l.line_id, l.order_id, o.customer_id, c.credit_limit '
+        'from raw.lines l join stg.stg_orders o on o.order_id = l.order_id '
+        'join stg.customers c on c.customer_id = o.customer_id'
+    ),
+}
+UNSOUND_DEFINITIONS = """\
+version: 1
+terms:
+  - name: Credit limit
+    kind: term
+    status: approved
+    approved: 2026-10-01
+    owner: {name: Ana Ruiz}
+    columns: [order_lines.credit_limit]
+"""
+UNSOUND_DATA = """
+create schema raw; create schema stg; create schema mart;
+create table raw.cust_cdc as select * from (values (10, 'Ann', timestamp '2026-01-01'),
+    (10, 'Ann B', timestamp '2026-02-01')) v(id, name, updated_at);
+create table stg.stg_orders as select * from (values (1, 10, 100, date '2026-03-01', null::date),
+    (2, 10, 50, date '2026-03-02', null::date)) v(order_id, customer_id, amount, ordered_at, valid_to);
+create table stg.customers as select * from (values (10, 'EU', 500), (11, 'EU', 700)) v(customer_id, region, credit_limit);
+create table stg.customer_months as select * from (values (10, 1), (10, 2), (10, 3)) v(customer_id, month);
+create table stg.order_months as select * from (values (1, 1), (2, 2)) v(order_id, month);
+create table mart.order_tags as select * from (values (1, 'a'), (1, 'b'), (2, 'c')) v(order_id, tag);
+create table mart.rates as select * from (values ('EU', date '2026-01-01', 1, ['x']),
+    ('EU', date '2026-02-01', 2, ['y', 'z']), ('US', date '2026-01-01', 3, ['w'])) v(region, valid_from, rate, tags);
+create table mart.region_days as select * from (values ('EU', date '2026-01-15'), ('EU', date '2026-01-20'),
+    ('EU', date '2026-02-15')) v(region, day);
+create table mart.days as select * from (values (date '2026-01-15'), (date '2026-02-15'), (date '2026-03-15')) v(day);
+create table raw.orders_tagged as select * from (values (1, ['a', 'b']), (2, ['c'])) v(order_id, tags);
+create table raw.lines as select * from (values (1, 1), (2, 1), (3, 2)) v(line_id, order_id);
+create view mart.order_lines as select l.line_id, l.order_id, o.customer_id, c.credit_limit
+    from raw.lines l join stg.stg_orders o on o.order_id = l.order_id join stg.customers c on c.customer_id = o.customer_id;
+"""
+
+
+@pytest.fixture(scope='module')
+def unsound(tmp_path_factory: pytest.TempPathFactory) -> Checker:
+    """A shop whose joins each repeat rows in a way a looser rule would miss."""
+    root = tmp_path_factory.mktemp('unsound')
+    con = duckdb.connect(str(root / 'w.duckdb'))
+    con.execute(UNSOUND_WAREHOUSE)
+    con.close()
+    for name, sql in UNSOUND_MODELS.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(sql)
+    (root / 'definitions.yml').write_text(UNSOUND_DEFINITIONS)
+    return Checker(Project(root).build(run_dbt=False).graph)
+
+
+INTERVALS = (
+    '(select region, valid_from, lead(valid_from) over (partition by region order by valid_from) as valid_to, '
+    'rate from mart.rates)'
+)
+RATES = (
+    'join stg.customers c on c.customer_id = o.customer_id join (select region, valid_from, '
+    'lead(valid_from) over (partition by region order by valid_from) as valid_to from mart.rates) r '
+    'on r.region = c.region and o.ordered_at >= r.valid_from'
+)
+
+
+@pytest.mark.parametrize(
+    ('sql', 'truth'),
+    [
+        # A unique test on a copy shows nothing of its source, which may hold every version.
+        (
+            'select sum(o.amount) from stg.stg_orders o join raw.cust_cdc c on c.id = o.customer_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # An UNNEST in the select list repeats each order once per tag.
+        (
+            'select sum(o.amount) from stg.stg_orders o join mart.order_tags t on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # A key matched only in an outer join's ON fixes nothing: the join keeps what it misses.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.customer_months cm on cm.customer_id = o.customer_id '
+            'left join stg.order_months om on om.order_id = o.order_id and om.month = cm.month',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # The NULL arm tests the order's own column, so every interval after the start matches.
+        (
+            f'select sum(o.amount) from stg.stg_orders o {RATES} and (o.valid_to is null or o.ordered_at < r.valid_to)',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # uuid() differs on every row, so DISTINCT keeps every tag of an order.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select distinct uuid() as u, order_id '
+            'from mart.order_tags) t on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # A term that only names the copy says nothing of adding it up per line.
+        (
+            'select c.region, sum(c.credit_limit) from mart.order_lines l join stg.customers c '
+            'on c.customer_id = l.customer_id group by 1',
+            'select region, sum(credit_limit) from stg.customers where customer_id in (select customer_id from mart.order_lines) group by 1',
+        ),
+        # GROUP BY ALL groups by the order and the tag, not by nothing.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, tag, count(*) as n '
+            'from mart.order_tags group by all) g on g.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # IS NOT DISTINCT FROM on a column that is no key is a join that repeats rows.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, tag from mart.order_tags) d '
+            'on d.order_id is not distinct from o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # A scalar subquery's aggregate is computed once per group: GROUP BY ALL groups by tg too.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, coalesce(tag, (select max(tag) '
+            'from mart.order_tags)) as tg, count(*) as n from mart.order_tags group by all) g '
+            'on g.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # The first row of each tag, through a named window, is one row per tag, not per order.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, tag from mart.order_tags '
+            'window w as (partition by tag order by order_id) qualify row_number() over w = 1) t '
+            'on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # Intervals per region, through a named window, joined without the region: one per region.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select region, valid_from, lead(valid_from) '
+            'over (w order by valid_from) as valid_to from mart.rates window w as (partition by region)) r '
+            'on o.ordered_at >= r.valid_from and (r.valid_to is null or o.ordered_at < r.valid_to)',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # The point is a day, which the customer does not fix: each order matches every day's interval.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.customers c on c.customer_id = o.customer_id '
+            'join (select region, valid_from, lead(valid_from) over (partition by region order by valid_from) '
+            'as valid_to from mart.rates) r on r.region = c.region join mart.days d on d.day >= r.valid_from '
+            'and (r.valid_to is null or d.day < r.valid_to)',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # Each interval matches every day of its region in it: the rate repeats once per day.
+        (
+            f'select sum(r.rate) from mart.region_days d join {INTERVALS} r on r.region = d.region '
+            'and d.day >= r.valid_from and (r.valid_to is null or d.day < r.valid_to)',
+            "select sum(rate) from mart.rates where region = 'EU'",
+        ),
+        # A subquery of intervals that unnests in its select list repeats each interval per element.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.customers c on c.customer_id = o.customer_id '
+            'join (select region, valid_from, lead(valid_from) over (partition by region order by valid_from) '
+            'as valid_to, unnest(tags) as tag from mart.rates) r on r.region = c.region '
+            'and o.ordered_at >= r.valid_from and (r.valid_to is null or o.ordered_at < r.valid_to)',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # A range in a later LEFT JOIN's ON pairs nothing: each order matches every interval of its region.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.customers c on c.customer_id = o.customer_id '
+            f'join {INTERVALS} r on r.region = c.region left join mart.days d on d.day = o.ordered_at '
+            'and o.ordered_at >= r.valid_from and (r.valid_to is null or o.ordered_at < r.valid_to)',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # So does a key's equality there: k is every order, for each order.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.stg_orders k on true '
+            'left join mart.days d on d.day = o.ordered_at and k.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # Joined in parentheses, the LEFT JOIN still keeps every order and every k beside it.
+        (
+            'select sum(o.amount) from stg.stg_orders o join stg.stg_orders k on true '
+            'left join (mart.days d join stg.order_months m on m.month = 1) '
+            'on d.day = o.ordered_at and k.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # Grouped, then unnested in the select list: each group's row repeats per element.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, unnest(list(tag)) as tag '
+            'from mart.order_tags group by order_id) t on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, unnest(list(tag)) as tag '
+            'from mart.order_tags group by order_id) t on t.order_id is not distinct from o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # A ROW_NUMBER beside an UNNEST in the select list numbers the rows before they repeat.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, tag from (select order_id, '
+            'unnest(tags) as tag, row_number() over (partition by order_id order by order_id) as rn '
+            'from raw.orders_tagged) s where rn = 1) t on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # Joined on a range alone, any number of days match an order.
+        (
+            'select sum(o.amount) from stg.stg_orders o join mart.days d on d.day <= o.ordered_at',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        # An UNNEST in the select list runs after QUALIFY and DISTINCT: it repeats the rows they keep.
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select order_id, unnest(tags) as tag '
+            'from raw.orders_tagged qualify row_number() over (partition by order_id order by order_id) = 1) t '
+            'on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+        (
+            'select sum(o.amount) from stg.stg_orders o join (select distinct order_id, unnest(tags) as tag '
+            'from raw.orders_tagged) t on t.order_id = o.order_id',
+            'select sum(amount) from stg.stg_orders',
+        ),
+    ],
+)
+def test_a_join_that_repeats_rows_is_reported_however_it_is_written(
+    unsound: Checker, sql: str, truth: str
+) -> None:
+    """Each join repeats rows in the data: the total it gives is not the true one."""
+    assert only(unsound.check(sql), 'fan-out').severity == 'warning'
+    con = duckdb.connect()
+    con.execute(UNSOUND_DATA)
+    assert con.execute(sql).fetchall() != con.execute(truth).fetchall()
+
+
+def test_a_join_in_parentheses_pairs_the_rows_of_each_source_in_it(tmp_path: Path) -> None:
+    """A LEFT JOIN of a join in parentheses brings in each source in it: an equality in its ON on
+    the key of one of them pairs each order with one customer, and each customer with one day."""
+    warehouse = (
+        'create schema stg; create schema mart; '
+        'create table stg.stg_orders (order_id int primary key, customer_id int, amount int); '
+        'create table mart.cust (customer_id int primary key, since date); '
+        'create table mart.days (day date primary key); '
+    )
+    data = (
+        'insert into stg.stg_orders values (1, 10, 100), (2, 10, 50); '
+        "insert into mart.cust values (10, date '2026-03-01'), (11, date '2026-01-10'); "
+        "insert into mart.days values (date '2026-01-15'), (date '2026-02-15'), (date '2026-03-01');"
+    )
+    con = duckdb.connect(str(tmp_path / 'w.duckdb'))
+    con.execute(warehouse + data)
+    sql = (
+        'select sum(o.amount) from stg.stg_orders o left join (mart.cust k join mart.days d on d.day = k.since) '
+        'on k.customer_id = o.customer_id'
+    )
+    assert con.execute(sql).fetchall() == con.execute('select sum(amount) from stg.stg_orders').fetchall()
+    con.close()
+    result = Checker(Project(tmp_path).build(run_dbt=False).graph).check(sql)
+    assert result.passed and result.findings == []
+
+
+def test_a_value_the_project_adds_up_at_the_grain_of_the_rows_it_is_joined_to_is_not_a_fan_out(
+    items: Checker,
+) -> None:
+    """Revenue is the price of each item's product, which the project's own order_items repeats on
+    every item and adds up: joined to items on the product's key, the price counts once per item,
+    as the measure means. A value the project never adds up at that grain still repeats."""
+    for sql in (
+        'select sum(p.product_price) as revenue from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id',
+        'select sum(p.product_price) from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id',
+        'select count(*) as items from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id',
+    ):
+        assert loud(items.check(sql)) == [], sql
+    for sql in (
+        'select sum(p.weight) from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id',
+        'select sum(o.order_total) from stg.stg_orders o join stg.stg_items i on i.order_id = o.order_id',
+    ):
+        assert only(items.check(sql), 'fan-out').severity == 'warning', sql
+
+
+def test_a_value_the_project_sums_without_a_definition_at_that_grain_still_repeats(
+    tmp_path: Path,
+) -> None:
+    """A model that copies each product's weight onto its items and sums it there, and another
+    that sums the weight per product, say nothing about whether the weight adds up once per item:
+    a project's own model can repeat a value as wrongly as the query. Only a definition bound to
+    the copy says the value is a measure at that grain."""
+    checker = Checker(
+        make_items(
+            tmp_path,
+            {
+                'mart/item_weights.sql': (
+                    'create table mart.item_weights as select i.item_id, i.order_id, p.weight '
+                    'from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id'
+                ),
+                'mart/shipped.sql': (
+                    'create table mart.shipped as select order_id, sum(weight) as shipped_weight '
+                    'from mart.item_weights group by 1'
+                ),
+                'mart/product_weight.sql': (
+                    'create table mart.product_weight as select product_id, sum(weight) as total_weight '
+                    'from stg.stg_products group by 1'
+                ),
+            },
+            'create table mart.item_weights (item_id int primary key, order_id int, weight int);',
+        )
+    )
+    sql = 'select sum(p.weight) from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id'
+    assert only(checker.check(sql), 'fan-out').severity == 'warning'
+    sql = 'select sum(p.product_price) as revenue from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id'
+    assert loud(checker.check(sql)) == []
+
+
+def test_an_aggregate_the_project_adds_up_at_the_grain_of_the_rows_it_is_joined_to_is_not_a_fan_out(
+    items: Checker,
+) -> None:
+    """A product's supply cost, summed over its supplies and joined to items on the product, is what
+    order_items repeats on each item and the project adds up: it counts once per item. A total of
+    another grain (each order's subtotal) still repeats on every item of the order."""
+    sql = (
+        'with supply as (select sku, sum(cost) as cost from raw.supplies group by sku) '
+        'select sum(p.product_price) - sum(coalesce(s.cost, 0)) / 100 as gross_profit from stg.stg_items i '
+        'join stg.stg_products p on p.product_id = i.product_id left join supply s on s.sku = i.product_id'
+    )
+    assert loud(items.check(sql)) == []
+    by_supply = sql.replace('group by sku', 'group by sku, supply_id').replace(
+        'sku, sum', 'sku, supply_id, sum'
+    )
+    assert 'fan-out' in loud(items.check(by_supply))
+    subtotal = (
+        'with t as (select order_id, sum(product_price) as subtotal from mart.order_items group by order_id) '
+        'select sum(t.subtotal) from stg.stg_items i join t on t.order_id = i.order_id'
+    )
+    assert only(items.check(subtotal), 'fan-out').severity == 'warning'
+
+
+@pytest.mark.parametrize(
+    ('sql', 'flagged'),
+    [
+        # tax_paid is in cents: the project copies it as tax_paid_cents and divides it by 100.
+        ('select sum(tax_paid) from raw.orders', True),
+        ('select sum(tax_paid_cents) from stg.stg_orders', True),
+        ('select sum(tax_paid) / 100.0 from raw.orders', False),
+        ('select sum(tax_paid) as tax_paid_cents from raw.orders', False),
+        ('select sum(tax_paid) from stg.stg_orders', False),
+        # price is in cents: Revenue, an amount of money, reads it divided by 100.
+        ('select max(p.price) from raw.products p', True),
+        ('select round(avg(p.price) / 100, 2) as average_price from raw.products p', False),
+        ('select sum(p.price * 2) / 100 from raw.products p', False),
+        # A ratio of two amounts in cents is not in cents.
+        (
+            'select round(100.0 * sum(p.price) filter (where p.weight > 1) / sum(p.price), 1) from raw.products p',
+            False,
+        ),
+        # weight is divided by 1000, but nothing says it is an amount of money or in minor units.
+        ('select sum(weight) from raw.products', False),
+        # Divided by 100 however it is written, the result is in whole units.
+        ('select sum(p.price) / 10 / 10 from raw.products p', False),
+        ('select sum(p.price) / cast(100 as decimal) from raw.products p', False),
+        ('select sum(p.price) / 100::numeric from raw.products p', False),
+        ('select sum(p.price) * 1.0 / 100 from raw.products p', False),
+        # A percentile of amounts is an amount.
+        ('select percentile_cont(0.5) within group (order by p.price) from raw.products p', True),
+        ('select quantile_cont(p.price, 0.5) from raw.products p', True),
+    ],
+)
+def test_a_result_in_cents_of_what_the_project_reads_in_whole_units_is_a_warning(
+    items: Checker, sql: str, flagged: bool
+) -> None:
+    result = items.check(sql)
+    assert ('minor-units' in loud(result)) is flagged, str(result)
+
+
+def test_a_rate_that_scales_an_amount_of_money_is_not_in_cents(tmp_path: Path) -> None:
+    """A discount in percent, divided by 100 to make the rate that multiplies a subtotal, is not an
+    amount of money: the net amount carries the subtotal's units, not the rate's. An amount divided
+    by 100 that the net amount adds up as it is still is."""
+    checker = Checker(
+        make_items(
+            tmp_path,
+            {
+                'stg/stg_quotes.sql': (
+                    'create view stg.stg_quotes as select id as quote_id, subtotal, '
+                    'discount_percent / 100 as discount_rate, fee / 100 as fee from raw.quotes'
+                ),
+                'mart/quotes.sql': (
+                    'create table mart.quotes as select quote_id, subtotal * (1 - discount_rate) as net_amount, '
+                    'subtotal * discount_rate as discount, fee + subtotal as total from stg.stg_quotes'
+                ),
+            },
+            'create table raw.quotes (id int, subtotal decimal(12, 2), discount_percent int, fee int);',
+            """\
+  - name: Net quote
+    status: approved
+    columns: [quotes.net_amount]
+    unit: currency
+  - name: Discount
+    status: approved
+    columns: [quotes.discount]
+    unit: currency
+  - name: Quote total
+    status: approved
+    columns: [quotes.total]
+    unit: currency
+""",
+        )
+    )
+    assert 'minor-units' not in rules(
+        checker.check('select avg(discount_percent) as discount from raw.quotes')
+    )
+    assert only(checker.check('select sum(fee) as fees from raw.quotes'), 'minor-units').severity == 'warning'
+
+
+def test_a_minor_units_finding_says_how_the_project_reads_the_column(items: Checker) -> None:
+    finding = only(items.check('select sum(tax_paid) as tax from raw.orders'), 'minor-units')
+    assert (finding.severity, finding.column) == ('warning', 'tax')
+    assert finding.message == (
+        'tax is in hundredths: orders.tax_paid holds hundredths of the unit stg_orders.tax_paid reads '
+        'it in, and the query does not divide it by 100'
+    )
+    assert finding.fix == 'Divide SUM(orders.tax_paid) by 100, or read stg_orders.tax_paid.'
+    assert finding.evidence == [
+        'stg_orders.tax_paid = orders.tax_paid / 100',
+        'stg_orders.tax_paid_cents copies orders.tax_paid',
+    ]
+
+
+def test_a_threshold_a_definition_sets_in_whole_units_compared_with_cents_is_a_warning(
+    items: Checker,
+) -> None:
+    finding = only(items.check('select count(*) from raw.orders where order_total >= 20'), 'minor-units')
+    assert finding.message == (
+        'the query compares orders.order_total, in hundredths, with 20, the value '
+        "'Large order' requires of stg_orders.order_total = orders.order_total / 100"
+    )
+    assert finding.fix == 'Compare orders.order_total with 2000, or compare stg_orders.order_total with 20.'
+    for sql in (
+        'select count(*) from raw.orders where order_total >= 2000',
+        'select count(*) from stg.stg_orders where order_total >= 20',
+        'select count(*) from raw.orders where order_total >= 25',
+    ):
+        assert loud(items.check(sql)) == [], sql
+
+
+def test_a_measure_named_for_a_term_computed_from_another_term_s_column_is_a_warning(items: Checker) -> None:
+    """Revenue is the price of each item; an order's total, which another term holds, is not it,
+    though both are amounts of an order. A measure named revenue that reads only the order total
+    computes the other term; one that also reads a column no other term holds may be revenue
+    computed another way."""
+    for sql in (
+        'select sum(order_total) / 100.0 as revenue from raw.orders',
+        'select sum(order_total) as revenue from stg.stg_orders',
+    ):
+        finding = only(items.check(sql), 'conflicting-column')
+        assert (finding.severity, finding.column, finding.term) == ('warning', 'revenue', 'Revenue'), sql
+    finding = only(
+        items.check('select sum(order_total) as revenue from stg.stg_orders'), 'conflicting-column'
+    )
+    assert finding.message == (
+        "revenue is named for 'Revenue', but reads stg_orders.order_total, which holds 'Order total', "
+        "not 'Revenue' (order_items.product_price)"
+    )
+    assert finding.fix == (
+        "Compute 'Revenue' from order_items.product_price (approved 'Gross profit', approved 'Revenue'), "
+        'or name the column for what it computes.'
+    )
+    for sql in (
+        'select sum(p.product_price) as revenue from stg.stg_items i join stg.stg_products p on p.product_id = i.product_id',
+        'select sum(subtotal) as revenue from mart.order_totals',
+        'select sum(weight) as revenue from raw.products',
+        # The order total less its tax reads a column no other term holds: it may be revenue,
+        # computed another way.
+        'select sum(order_total) - sum(tax_paid) as revenue from stg.stg_orders',
+    ):
+        assert 'conflicting-column' not in rules(items.check(sql)), sql
+
+
+def test_a_constant_factor_inside_or_outside_a_sum_is_the_same_formula(items: Checker) -> None:
+    """A sum of each price divided by 100 is the sum of the prices divided by 100, where division is
+    exact (DuckDB): the subtotal recomputed either way computes the same measure."""
+    join = 'from raw.items i join raw.products p on p.sku = i.sku'
+    for value in ('sum(p.price) / 100.0', 'sum(p.price / 100)', '0.01 * sum(p.price)'):
+        assert 'formula-differs' not in rules(items.check(f'select {value} as subtotal {join}')), value
+    assert 'formula-differs' in rules(items.check(f'select sum(p.price) / 10 as subtotal {join}'))
+
+
+def test_a_measure_of_a_term_bound_to_its_inputs_is_not_compared_with_one_of_them(items: Checker) -> None:
+    """Gross profit is bound to the price and the supply cost it is computed from: a query that
+    computes it from both is not a different formula for the price alone. Nothing says how the two
+    combine, so the check says it did not compare the formula, whether it subtracts or adds."""
+    sql = (
+        'with supply as (select sku, sum(cost) as cost from raw.supplies group by sku) '
+        'select sum(p.product_price) - sum(coalesce(s.cost, 0)) / 100 as gross_profit from stg.stg_items i '
+        'join stg.stg_products p on p.product_id = i.product_id left join supply s on s.sku = i.product_id'
+    )
+    for written in (sql, sql.replace(') - sum(', ') + sum(')):
+        result = items.check(written)
+        assert loud(result) == []
+        note = only(result, 'formula-differs')
+        assert note.severity == 'info' and note.term == 'Gross profit'
+        assert 'order_items.product_price, order_items.supply_cost' in note.message
+        assert 'not compared' in note.message
+
+
+def test_a_threshold_in_cents_scaled_from_the_definition_s_counts_as_its_filter(items: Checker) -> None:
+    """Large orders are those of 20 dollars or more: order_total >= 2000 on the cents it is read
+    from is that filter."""
+    sql = 'select count(*) as large_orders from raw.orders where order_total >= 2000'
+    assert 'missing-filter' not in rules(items.check(sql))
+    finding = only(
+        items.check('select count(*) as large_orders from raw.orders where order_total >= 1000'),
+        'missing-filter',
+    )
+    assert finding.message.startswith("'Large order' requires stg_orders.order_total >= 20")
+
+
+@pytest.mark.parametrize(
+    'total',
+    [
+        'cast(order_total / 100 as int)',
+        'round(order_total / 100)',
+        'order_total // 100',
+    ],
+)
+def test_a_threshold_in_cents_is_no_filter_of_a_rounded_amount(tmp_path: Path, total: str) -> None:
+    """Rounded or cast to an integer, 1960 cents is 20 dollars, a large order, though it is below
+    2000 cents: order_total >= 2000 on the cents leaves it out. A division that truncates moves the
+    boundary of other comparisons (2050 // 100 > 20 is false), so it is not taken as scaled either."""
+    model = (
+        f'create view stg.stg_orders as select id as order_id, {total} as order_total, '
+        'tax_paid as tax_paid_cents, tax_paid / 100 as tax_paid from raw.orders'
+    )
+    checker = Checker(make_items(tmp_path, {'stg/stg_orders.sql': model}))
+    sql = 'select count(*) as large_orders from raw.orders where order_total >= 2000'
+    assert 'missing-filter' in rules(checker.check(sql))
+    con = duckdb.connect()
+    con.execute('create table orders as select * from (values (1960), (2500)) v(order_total)')
+    rounded = con.execute(f'select count(*) from (select {total} as t from orders) where t >= 20').fetchall()
+    if '//' not in total:
+        assert rounded != con.execute('select count(*) from orders where order_total >= 2000').fetchall()
+
+
 def test_distinct_without_the_key_keeps_the_fan_out(shop: Checker) -> None:
     sql = (
         'with x as (select distinct o.customer_id, o.amount, p.payment_id from raw.orders o '
@@ -1720,6 +2761,40 @@ def test_a_coarser_measure_repeated_on_finer_rows_is_a_mixed_grain(shop: Checker
             'select o.order_id, c.region from raw.orders o join raw.customers c on c.customer_id = o.customer_id'
         )
     )
+
+
+@pytest.mark.parametrize(
+    ('latest', 'repeats'),
+    [
+        ('select customer_id, status as top_status from ranked where rn = 1', False),
+        ('select customer_id, status as top_status from ranked where 1 = rn', False),
+        ('select customer_id, status as top_status from ranked where rn <= 2', True),
+        (
+            'select customer_id, status as top_status from by_status '
+            'qualify row_number() over (partition by customer_id order by amount desc) = 1',
+            False,
+        ),
+        (
+            'select customer_id, status as top_status from by_status '
+            'qualify rank() over (partition by customer_id order by amount desc) = 1',
+            True,
+        ),
+    ],
+)
+def test_the_first_row_of_each_partition_is_one_row_per_partition(
+    shop: Checker, latest: str, repeats: bool
+) -> None:
+    """Keeping the rows where ROW_NUMBER() over a partition is 1 keeps one row per value of the
+    partition's columns; RANK() keeps every row that ties, and rn <= 2 keeps two."""
+    sql = (
+        'with by_status as (select customer_id, status, sum(amount) as amount from raw.orders group by 1, 2), '
+        'ranked as (select customer_id, status, '
+        'row_number() over (partition by customer_id order by amount desc) as rn from by_status), '
+        f'top_status as ({latest}) '
+        'select r.customer_id, r.net_revenue, t.top_status from mart.customer_revenue r '
+        'join top_status t on t.customer_id = r.customer_id'
+    )
+    assert ('mixed-grain' in rules(shop.check(sql))) is repeats
 
 
 def test_an_amount_the_project_adds_up_repeated_on_finer_rows_is_a_mixed_grain(
@@ -2366,6 +3441,16 @@ def test_a_join_a_presumed_key_makes_safe_is_noted(stripe: Graph) -> None:
         'the join u.id = c.customer_id is taken not to repeat rows because the stripe ontology pack '
         'presumes customer.id unique; nothing has tested it'
     )
+
+
+def test_an_average_grouped_by_a_key_only_a_pack_presumes_is_still_a_fan_out(stripe: Graph) -> None:
+    """Nothing in the project shows a charge id unique, or never NULL: grouped by it, a group may
+    hold several charges, whose copies an average weighs by how often the join repeats each."""
+    sql = (
+        'select c.id, avg(c.amount) from stripe.charge c '
+        'join stripe.invoice i on i.customer_id = c.customer_id group by c.id'
+    )
+    assert only(check_sql(stripe, sql), 'fan-out').severity == 'warning'
 
 
 def test_a_relationship_only_a_pack_gives_is_labelled_so(stripe: Graph) -> None:

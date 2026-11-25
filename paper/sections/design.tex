@@ -397,10 +397,12 @@ with the commands each step needs.
 runs can still be wrong. \cmd{konstruct check-sql} reads a query without running it and composes
 each aggregated output column down to source columns, with the filters on its way, as the graph's
 columns are composed. It reports a measure that leaves out a filter its approved definition
-requires or computes it differently, a column of a retired term, a sum, count or average over a
-join that repeats the rows it aggregates, judged from the keys, tests and relationships of the
-ontology, and names the project does not have. Each finding carries its fix, and where a fix
-changes only the measure the result carries the corrected query. A match by name alone is never
+requires or computes it differently, a measure named for one term that reads only other terms'
+columns, a result in cents of a column the project reads in whole units, a column of a retired
+term, a sum, count or average over a join that repeats the rows it aggregates, judged from the
+keys, tests and relationships of the ontology and from the grain at which a definition binds a
+value, and names the project does not have. Each finding carries its fix, and where a fix changes
+only the measure the result carries the corrected query. A match by name alone is never
 an error, since an agent told that a correct query is wrong will break it. With
 \cmd{--history}, the same checks run over a warehouse's query history and count the queries,
 runs and people that compute an approved measure differently from its definition.

@@ -1938,6 +1938,9 @@ CHECK_SQL_CASES = [
         'presumed-key',
         'select sum(c.amount) from stripe.charge c join stripe.customer u on u.id = c.customer_id',
     ),
+    ('conflicting-column', 'select sum(p.amount) as order_total from raw.payments p'),
+    # Against a shop whose raw amounts are in cents.
+    ('minor-units', 'select sum(tax_paid) from raw.orders'),
     ('unknown-relation', 'select * from raw.orderz'),
     ('unknown-column', 'select amount_total from raw.orders'),
     ('unparsed', 'select sum(amount from raw.orders'),
@@ -1964,6 +1967,16 @@ def test_every_check_sql_rule_has_a_case() -> None:
 
 PACK_RULES = frozenset({'presumed-key'})
 """The rules whose case runs against tables an ontology pack binds."""
+ITEMS_RULES = frozenset({'minor-units'})
+"""The rules whose case runs against the shop whose raw amounts are in cents."""
+
+
+@pytest.fixture(scope='module')
+def check_sql_items(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    from konstruct.analysis.checksql import Checker
+    from tests.test_checksql import make_items
+
+    return Checker(make_items(tmp_path_factory.mktemp('check_sql_items')))
 
 
 @pytest.fixture(scope='module')
@@ -1982,8 +1995,13 @@ def check_sql_stripe(tmp_path_factory: pytest.TempPathFactory) -> Any:
 
 
 @pytest.mark.parametrize(('rule', 'sql'), CHECK_SQL_CASES)
-def test_check_sql_finds_each_rule(check_sql_shop: Any, check_sql_stripe: Any, rule: str, sql: str) -> None:
-    result = (check_sql_stripe if rule in PACK_RULES else check_sql_shop).check(sql)
+def test_check_sql_finds_each_rule(
+    check_sql_shop: Any, check_sql_stripe: Any, check_sql_items: Any, rule: str, sql: str
+) -> None:
+    checker = (
+        check_sql_stripe if rule in PACK_RULES else check_sql_items if rule in ITEMS_RULES else check_sql_shop
+    )
+    result = checker.check(sql)
     assert [f.rule for f in result.findings] == [rule], str(result)
 
 

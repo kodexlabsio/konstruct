@@ -20,11 +20,16 @@ checks:
   computes it differently, leaves out a filter the column applies or excludes rows the column
   keeps; a measure recomputed that a column already holds; a column of a retired term. A term
   matches only an output named exactly for it or a declared synonym, and a match by name alone is
-  never an error;
+  never an error; a measure named for a term that reads only other terms' columns;
+  a column that computes a measure term's formula over some of its rows needs the term's filters;
+* **units**: a result still in the minor units of a currency (cents) of a column the project reads
+  in whole units, and a filter comparing such a column with the value a definition requires of it
+  in whole units;
 * **joins**: a sum, count or average over a join that repeats the rows it aggregates (from the
-  keys, unique tests, composite and grouped keys and relationships of the derived ontology); a
-  result that repeats a measure of a coarser grain on every row of a finer one; two related
-  relations joined on columns their relationship does not use; a join nothing vouches for;
+  keys, unique tests, composite and grouped keys and relationships of the derived ontology), unless
+  a measure's definition binds a copy of the value on rows of the grain it repeats on; a result that repeats a measure of a coarser grain on every row of a
+  finer one; two related relations joined on columns their relationship does not use; a join
+  nothing vouches for;
 * **names**: a relation or column the project does not have.
 
 Each finding carries its fix. Where a fix changes the measure and no other column of the result
@@ -43,11 +48,13 @@ from __future__ import annotations
 import difflib
 import hashlib
 import hmac
+import math
 import re
 import secrets
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import sqlglot
@@ -72,7 +79,14 @@ from konstruct.core.sql import (
     without_readings,
 )
 from konstruct.inputs.usage import HistoryQuery, QueryHistory
-from konstruct.semantics.ontology import Relationship, derivation, entity_name, id_like, name_matches
+from konstruct.semantics.ontology import (
+    Relationship,
+    derivation,
+    enforced_key,
+    entity_name,
+    id_like,
+    name_matches,
+)
 
 if TYPE_CHECKING:
     from konstruct.interfaces.layout import Style
@@ -84,8 +98,10 @@ RULES: dict[str, str] = {
     'formula-differs': 'A column computes a measure differently from the column that holds it.',
     'recomputes-measure': 'A column recomputes a measure that a column of the project already holds.',
     'retired-column': 'The query reads a column bound to a retired term.',
+    'conflicting-column': "A measure named for a term reads only other terms' columns.",
     'fan-out': 'A sum, count or average runs over a join that repeats the rows it aggregates.',
     'mixed-grain': 'The result repeats a measure of a coarser grain on every row of a finer one.',
+    'minor-units': 'A result in hundredths (cents) of the unit the project reads its column in.',
     'join-off-relationship': 'Two related relations are joined on columns their relationship does not use.',
     'unknown-join': 'A join that no relationship or unique key in the project vouches for.',
     'presumed-key': 'A join the check took as safe because an ontology pack presumes a column unique.',
@@ -103,6 +119,7 @@ _FILTER_LABELS = ('WHERE', 'HAVING', 'QUALIFY')
 _QUALIFY_ERRORS: tuple[type[Exception], ...] = (*PARSE_ERRORS, KeyError, IndexError, AttributeError)
 _ANALYSIS_ERRORS: tuple[type[Exception], ...] = (*_QUALIFY_ERRORS, AssertionError)
 _NOT_ADDITIVE = (exp.Min, exp.Max)
+_RANGES = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.Between)
 _MOST_NAMED = 20
 """A name more columns than this share is too generic to stand for one idea."""
 _VERBS = {'SUM': 'adds', 'AVG': 'averages', 'COUNT': 'counts'}
@@ -113,6 +130,19 @@ _AGGREGATE_CALL = re.compile(
     re.IGNORECASE,
 )
 _WINDOW = re.compile(r'\bOVER\s*\(', re.IGNORECASE)
+_MINOR_WORDS = frozenset({'cent', 'cents', 'pence', 'penny', 'pennies', 'minor'})
+"""Words of a column name that say it holds minor units of a currency."""
+_FRACTIONS = {100: 'hundredths', 1000: 'thousandths'}
+"""The scales a column in minor units is read at, with what its values are of the whole unit."""
+_COMPARISONS: dict[type[exp.Expr], type[exp.Expr]] = {
+    exp.GT: exp.LT,
+    exp.GTE: exp.LTE,
+    exp.LT: exp.GT,
+    exp.LTE: exp.GTE,
+    exp.EQ: exp.EQ,
+    exp.NEQ: exp.NEQ,
+}
+"""Each comparison, with the one it becomes when its sides swap."""
 
 
 @dataclass
@@ -319,7 +349,21 @@ class _Fan:
     evidence: str
     pre_aggregate: str | None = None
     severity: str = 'warning'
+    certain: bool = False
+    """Whether the SQL itself repeats the rows (an UNNEST), rather than nothing showing it does not."""
     """``info`` when only the absence of a known key on the other side suggests it."""
+
+
+@dataclass
+class _Minor:
+    """How a column in minor units of a currency is read in whole units."""
+
+    scale: int
+    """What the project divides it by."""
+    reader: Node
+    """A column of the project that reads it divided by ``scale``."""
+    evidence: list[str]
+    """Why it is in minor units: how the project reads it, and what names it or holds it as money."""
 
 
 @dataclass
@@ -330,6 +374,9 @@ class _ScopeInfo:
     """Output columns that pass a graph column through unchanged."""
     fanned: dict[str, _Fan] = field(default_factory=dict)
     """Output columns whose rows repeat, with why."""
+    grouped: list[frozenset[str]] = field(default_factory=list)
+    """The sets of ``unique`` that a DISTINCT or a GROUP BY makes unique, which hold one row for
+    NULL too (both put NULLs together), so that IS NOT DISTINCT FROM on them matches one row."""
 
 
 @dataclass
@@ -340,7 +387,7 @@ class _Join:
     left_column: str
     right: str
     right_column: str
-    node: exp.EQ
+    node: exp.Expr
     join: int | None
     """The index of the join whose ON clause holds it, or None for the WHERE clause."""
     conjunct: int
@@ -400,6 +447,8 @@ class Checker:
         dialect = graph.meta.get('dialect')
         self.dialect = dialect if isinstance(dialect, str) else None
         self.sqlglot = Dialect.get_or_raise(self.dialect)
+        # Where a / b never truncates, SUM(x / 100) and SUM(x) / 100 are one formula.
+        self.exact = self.dialect is not None and not self.sqlglot.TYPED_DIVISION
         catalog, schema = graph.meta.get('default_catalog'), graph.meta.get('default_schema')
         self.default_catalog = catalog if isinstance(catalog, str) and catalog else None
         self.default_db = schema if isinstance(schema, str) and schema else None
@@ -434,9 +483,13 @@ class Checker:
         self._untold: dict[str, bool] = {}
         self._forms: dict[str, _Form] = {}
         self._keys: dict[str, list[frozenset[str]]] = {}
+        self._filled: dict[str, list[frozenset[str]]] = {}
         self._names: dict[str, list[tuple[int, Node]]] | None = None
         self._named: dict[str, list[Node]] = {}
         self._additive: set[str] | None = None
+        self._carriers: dict[str, list[Node]] = {}
+        self._slices: dict[str, list[tuple[_Term, Node, list[_Condition]]]] = {}
+        self._minor: dict[str, _Minor | None] = {}
         measures = {m.name for m in self.ontology.measures if not m.expression}
         self.terms = self._terms(measures)
         self._term_nodes = {t.node.id: t for t in self.terms}
@@ -576,15 +629,15 @@ class Checker:
             ]
             found += [frozenset(k) for k in self.derived.composite.get(relation.id, [])]
             grouped = self._grouped(relation)
-            if grouped is not None and grouped not in found:
-                found.append(grouped)
+            if grouped is not None and grouped[0] not in found:
+                found.append(grouped[0])
             self._keys[relation.id] = found
         return found
 
-    def _grouped(self, relation: Node) -> frozenset[str] | None:
+    def _grouped(self, relation: Node) -> tuple[frozenset[str], frozenset[str]] | None:
         """The output columns ``relation`` groups by, when it is built by one grouped query whose
-        grouping columns all pass through. Grouping by a unique key of a source and other columns
-        of that same source is grouping by the key."""
+        grouping columns all pass through: the key they make, and all of them. Grouping by a unique
+        key of a source and other columns of that same source is grouping by the key."""
         # Two readings of a relation grouped by the same key group it by that key.
         groups = sorted(
             {
@@ -597,7 +650,7 @@ class Checker:
             return None
         tree = self.parse(f'SELECT 1 GROUP BY {groups[0].removeprefix("GROUP BY: ")}')
         group = tree.args.get('group') if isinstance(tree, exp.Select) else None
-        if group is None or not group.expressions:
+        if group is None or not group.expressions or _subtotals(group):
             return None
         passed = {self.origin(c.id): c.name.lower() for c in self.graph.columns_of(relation.id)}
         items: list[tuple[Node, str]] = []
@@ -619,8 +672,30 @@ class Checker:
                 return None
         for node, name in items:
             if node.id in self.unique and all(n.parent == node.parent for n, _ in items):
-                return frozenset({name})
-        return frozenset(grouping)
+                return frozenset({name}), frozenset(grouping)
+        return frozenset(grouping), frozenset(grouping)
+
+    def filled_keys(self, relation: Node) -> list[frozenset[str]]:
+        """The keys of ``relation`` that hold one row each and no row holds NULL in: a unique
+        column a ``not_null`` test or an enforced primary key also covers, an enforced composite
+        primary key, and every column its one grouped query groups by (which keeps one row for
+        NULL). A key only an ontology pack presumes is not one."""
+        found = self._filled.get(relation.id)
+        if found is None:
+            not_null = self.derived.ontology.tests.not_null
+            primary = enforced_key(self.graph, relation)
+            found = [
+                frozenset({c.name.lower()})
+                for c in self.graph.columns_of(relation.id)
+                if c.id in self.derived.unique and (c.id in not_null or c.name.lower() in primary)
+            ]
+            if len(primary) > 1:
+                found.append(frozenset(primary))
+            grouped = self._grouped(relation)
+            if grouped is not None and grouped[1] not in found:
+                found.append(grouped[1])
+            self._filled[relation.id] = found
+        return found
 
     def read_schema(self, tree: exp.Expr) -> dict[str, dict[str, str]]:
         """The columns of the relations ``tree`` reads: a schema of every relation in a large project
@@ -663,6 +738,300 @@ class Checker:
         if isinstance(expression, str) and _TOP_AGGREGATE.match(expression):
             return True
         return column.id in self.additive() or self.origin(column.id) in self.additive()
+
+    def null_group(self, condition: _Condition, column: Node, groups: set[str]) -> bool:
+        """Whether ``condition`` only drops the group of NULLs of the column a grouped ``column``
+        is grouped by (``WHERE k IS NOT NULL ... GROUP BY k``), and the query groups its result by
+        that column too (``groups``, by origin): every other group keeps the same rows, so the
+        query's groups other than NULL's hold the column's values. A query that adds up across
+        the groups adds the NULL group's rows too, and needs the filter."""
+        tree = condition.tree
+        while isinstance(tree, exp.Paren):
+            tree = tree.this
+        if isinstance(tree, exp.Not) and isinstance(tree.this, exp.Is):
+            test = tree.this
+        elif isinstance(tree, exp.Is) and isinstance(tree.expression, exp.Not):
+            test = exp.Is(this=tree.this, expression=tree.expression.this)
+        else:
+            return False
+        if not (isinstance(test.this, exp.Column) and isinstance(test.expression, exp.Null)):
+            return False
+        node = condition.columns.get(test.this.sql(dialect=self.sqlglot))
+        relation = self.graph.parent_of(column)
+        grouped = self.group_origins(relation) if relation is not None else None
+        return (
+            node is not None
+            and grouped is not None
+            and self.origin(node.id) in grouped
+            and self.origin(node.id) in groups
+        )
+
+    def truth(self, tree: exp.Expr) -> exp.Expr:
+        """A boolean compared with TRUE or FALSE as the boolean or its NOT, and NOT NOT x as x,
+        where the dialect has a boolean type: there ``x = FALSE`` and ``NOT x`` are NULL where ``x``
+        is, so they keep the same rows. In MySQL, SQLite or SQL Server a flag is a number, which
+        ``WHERE x`` tests for nonzero and ``x = TRUE`` for 1, so they stay apart; so does
+        ``x IS TRUE``, since NOT (x IS TRUE) keeps the rows where x is NULL."""
+        if self.dialect not in _BOOLEAN_DIALECTS:
+            return tree
+        negated, inner = False, tree
+        while isinstance(inner, (exp.Not, exp.Paren)):
+            negated, inner = negated ^ isinstance(inner, exp.Not), inner.this
+        if isinstance(inner, (exp.EQ, exp.NEQ)):
+            for tested, value in ((inner.this, inner.expression), (inner.expression, inner.this)):
+                if isinstance(value, exp.Boolean) and not isinstance(tested, exp.Boolean):
+                    if (value.this is True) == isinstance(inner, exp.NEQ):
+                        negated = not negated
+                    return exp.Not(this=tested) if negated else tested
+        if isinstance(inner, (exp.Column, exp.Var)):
+            return exp.Not(this=inner) if negated else inner
+        return tree
+
+    def declared(self, column: Node) -> bool:
+        """Whether the definition of a measure binds ``column`` itself: people, not a model of the
+        project, say it is an amount to add up on its rows. A model that sums a value repeated on
+        finer rows can be as wrong as a query that does, and a term that only names the column
+        (``kind: term``) says nothing of adding it up, so only a measure shows that the value adds
+        up at that grain."""
+        return any(t.measure and t.status != 'retired' for t in self.bound_to.get(column.id, []))
+
+    def key_origins(self, relation: Node) -> frozenset[str]:
+        """The columns whose values the unique columns of ``relation`` copy: two relations with a
+        key of the same origin hold one row per row of the same thing."""
+        return frozenset(
+            self.origin(c.id)
+            for c in self.graph.columns_of(relation.id)
+            if frozenset({c.name.lower()}) in self.relation_keys(relation)
+        )
+
+    def carriers(self, column: Node) -> list[Node]:
+        """The columns of the project that hold ``column``'s value on each row of another
+        relation, computed row by row from it (never aggregated or windowed on the way), and that
+        a definition says is a measure there (:meth:`declared`): order items' copy of a product's
+        price, which revenue sums once per item."""
+        found = self._carriers.get(column.id)
+        if found is None:
+            found, seen, stack = [], {column.id}, [column.id]
+            while stack:
+                for edge in self.graph.in_edges(stack.pop(), 'derived_from'):
+                    reader = self.graph.nodes.get(edge.source)
+                    if reader is None or reader.id in seen or self._aggregated(reader.id, set()):
+                        continue
+                    seen.add(reader.id)
+                    stack.append(reader.id)
+                    if self.declared(reader):
+                        found.append(reader)
+            self._carriers[column.id] = found
+        return found
+
+    def measured_at(self, column: Node, keys: frozenset[str]) -> Node | None:
+        """A column the project adds up that repeats ``column``'s value on the rows of a relation
+        keyed by a column of origin in ``keys``: summed once per such row, the value counts as the
+        project's own measure counts it."""
+        for carrier in self.carriers(column):
+            relation = self.graph.parent_of(carrier)
+            if relation is not None and self.key_origins(relation) & keys:
+                return carrier
+        return None
+
+    def group_origins(self, relation: Node) -> frozenset[str] | None:
+        """The origins of the columns ``relation``'s SQL groups by, when it groups once."""
+        groups = {
+            c.split(': ', 1)[1]
+            for c in map(str, relation.attrs.get('conditions', []) or [])
+            if c.startswith('GROUP BY') and ': ' in c
+        }
+        tree = self.parse(f'SELECT 1 GROUP BY {next(iter(groups))}') if len(groups) == 1 else None
+        group = tree.args.get('group') if isinstance(tree, exp.Select) else None
+        if group is None:
+            return None
+        nodes = [self.resolved(c) if isinstance(c, exp.Column) else None for c in group.expressions]
+        return frozenset(self.origin(n.id) for n in nodes if n is not None) if all(nodes) else None
+
+    def summed_at(self, form: _Form, groups: frozenset[str], keys: frozenset[str]) -> Node | None:
+        """A column a definition binds (:meth:`declared`) that holds the same aggregate of the same
+        columns as ``form``, grouped by columns of the same origins ``groups``, on the rows of a
+        relation keyed by a column of origin in ``keys``: the supply cost of each item's product,
+        which order_items sums over the product's supplies and repeats on each item."""
+        if form.formula is None or not form.complete or not form.sources:
+            return None
+        function = _aggregate_of(form.formula, self.dialect)
+        seen: set[str] = set(form.sources)
+        stack = sorted(form.sources)
+        while stack:
+            for edge in self.graph.in_edges(stack.pop(), 'derived_from'):
+                reader = self.graph.nodes.get(edge.source)
+                if reader is None or reader.id in seen:
+                    continue
+                seen.add(reader.id)
+                stack.append(reader.id)
+                relation = self.graph.parent_of(reader)
+                if relation is None or not self.declared(reader) or not self.key_origins(relation) & keys:
+                    continue
+                theirs = self.form(None, reader)
+                if (
+                    theirs.complete
+                    and theirs.sources == form.sources
+                    and not theirs.conditions
+                    and theirs.formula is not None
+                    and _aggregate_of(theirs.formula, self.dialect) == function
+                    and self.group_origins(relation) == groups
+                ):
+                    return reader
+        return None
+
+    def slices(self, column: Node) -> list[tuple[_Term, Node, list[_Condition]]]:
+        """The measure terms ``column`` computes over some of their rows: a column of a term that
+        it computes the same way from the same columns, with conditions of its own as well as every
+        condition of the term's (the card payments of an order amount), each with that column and
+        the conditions it adds. Such a column is the measure for one slice of its rows, so the
+        filters the term requires hold for it too; one whose own conditions are on a column the
+        term filters (the amount of returned orders, where the term keeps completed ones) picks
+        other rows than the term does, and is another idea."""
+        found = self._slices.get(column.id)
+        if found is not None:
+            return found
+        found = []
+        mine = self.form(None, column) if isinstance(column.attrs.get('expression'), str) else None
+        if mine is not None and mine.formula is not None and mine.complete and mine.conditions:
+            own = {c.key: c for c in [*mine.conditions, *self.held_filters(column)]}
+            for term in self.terms:
+                if not term.measure or term.status == 'retired' or column in term.bound:
+                    continue
+                required = {self.origin(n.id) for c in self.required(term) for n in c.columns.values()}
+                if required & {self.origin(n.id) for c in own.values() for n in c.columns.values()}:
+                    continue
+                for root in term.roots:
+                    theirs = self.form(None, root)
+                    held = {c.key for c in [*theirs.conditions, *self.held_filters(root)]}
+                    extra = [c for k, c in own.items() if k not in held]
+                    if (
+                        theirs.complete
+                        and theirs.formula == mine.formula
+                        and theirs.sources == mine.sources
+                        and held <= set(own)
+                        and extra
+                    ):
+                        found.append((term, root, extra))
+                        break
+        self._slices[column.id] = found
+        return found
+
+    def scale(self, column: Node) -> float | None:
+        """What ``column`` divides the one column it reads by, when that is all it computes
+        (``amount / 100``, cast or rounded or not)."""
+        expression = column.attrs.get('expression')
+        tree = self.parse(expression) if isinstance(expression, str) else None
+        tree = _strip(tree) if tree is not None else None
+        if not (isinstance(tree, exp.Div) and isinstance(_strip(tree.this), exp.Column)):
+            return None
+        return _number(tree.expression)
+
+    def minor(self, column: Node) -> _Minor | None:
+        """How ``column`` is read in whole units, when it holds minor units of a currency: every
+        column of the project that reads it divided by a constant divides it by the same one, and
+        either the column, or a copy of it, is named for minor units (``tax_paid_cents``), or a term
+        that is an amount of money (``unit: currency``) is computed from one of those columns."""
+        if column.id in self._minor:
+            return self._minor[column.id]
+        found: _Minor | None = None
+        label = self.graph.label
+        scaled: list[tuple[Node, float]] = []
+        copies: list[Node] = []
+        for edge in self.graph.in_edges(column.id, 'derived_from'):
+            reader = self.graph.nodes.get(edge.source)
+            if reader is None or len(self.graph.out_edges(reader.id, 'derived_from')) != 1:
+                continue
+            if edge.attrs.get('transform') == 'direct':
+                copies.append(reader)
+            elif (scale := self.scale(reader)) is not None:
+                scaled.append((reader, scale))
+        scales = {scale for _, scale in scaled}
+        if len(scales) == 1 and next(iter(scales)) in _FRACTIONS:
+            readers = {r.id for r, _ in scaled}
+            named = [c for c in [column, *copies] if _minor_named(c.name)]
+            money = [
+                t
+                for t in self.terms
+                if t.status != 'retired'
+                and t.node.attrs.get('unit') == 'currency'
+                and any(self.carries(b, r, set()) for b in t.bound for r in readers)
+            ]
+            if named or money:
+                reader, scale = scaled[0][0], int(scaled[0][1])
+                evidence = [f'{label(reader)} = {label(column)} / {scale}']
+                evidence += [
+                    f'{label(c)} copies {label(column)}'
+                    if c is not column
+                    else f'{label(c)} is named for minor units'
+                    for c in named
+                ]
+                evidence += [f'{t.name!r} ({t.where}) is an amount of money computed from it' for t in money]
+                found = _Minor(scale, reader, evidence)
+        self._minor[column.id] = found
+        return found
+
+    def carries(self, column: Node, target: str, walking: set[str]) -> bool:
+        """Whether ``column``'s value carries the units of the column ``target``, at any distance:
+        it adds, picks or aggregates ``target``'s values, or scales them by a constant. A column
+        that multiplies it by another column (a subtotal times a discount rate) holds the other
+        column's units, so a rate is not an amount of money for the amount it scales."""
+        if column.id == target:
+            return True
+        if column.id in walking:
+            return False
+        walking.add(column.id)
+        expression = column.attrs.get('expression')
+        tree = self.parse(expression) if isinstance(expression, str) else None
+        for edge in self.graph.out_edges(column.id, 'derived_from'):
+            read = self.graph.nodes.get(edge.target)
+            if read is None or (read.id != target and target not in self.upstream(read.id)):
+                continue
+            if tree is not None and not _carries(tree, read.name or ''):
+                continue
+            if tree is None and edge.attrs.get('transform') != 'direct':
+                continue
+            if self.carries(read, target, walking):
+                return True
+        return False
+
+    def whole(self, column: Node) -> tuple[str, int] | None:
+        """The column in minor units that ``column`` reads in whole units, with its scale: one that
+        computes nothing but it, divided by its scale (``order_total / 100``)."""
+        form = self.form(None, column) if isinstance(column.attrs.get('expression'), str) else None
+        tree = self.parse(form.formula) if form is not None and form.formula is not None else None
+        if form is None or tree is None or len(form.sources) != 1:
+            return None
+        [source] = form.sources
+        node = self.graph.nodes.get(source)
+        held = self.minor(node) if node is not None else None
+
+        def only(c: exp.Column) -> bool:
+            found = self.resolved(c)
+            return found is not None and found.id == source
+
+        if held is None or _units(tree, only, held.scale) != 0:
+            return None
+        return source, held.scale
+
+    def divides(self, column: Node, source: str, scale: int) -> bool:
+        """Whether ``column`` is the integer or decimal column ``source`` divided by ``scale`` and
+        nothing else, where ``/`` never truncates: only then is ``column >= 20`` the same filter as
+        ``source >= 20 * scale``. A cast, a rounding or a division that truncates moves the
+        boundary (``CAST(1960 / 100 AS INT)`` is 20)."""
+        expression = column.attrs.get('expression')
+        tree = self.parse(expression) if self.exact and isinstance(expression, str) else None
+        while isinstance(tree, exp.Paren):
+            tree = tree.this
+        if not isinstance(tree, exp.Div) or _number(tree.expression) != scale:
+            return False
+        read = tree.this
+        while isinstance(read, exp.Paren):
+            read = read.this
+        node = self.resolved(read) if isinstance(read, exp.Column) else None
+        kind = (node.data_type or '').upper() if node is not None else ''
+        exact = kind.startswith(('DECIMAL', 'NUMERIC', 'NUMBER', 'INT')) or kind.endswith(('INT', 'INTEGER'))
+        return node is not None and node.id == source and exact
 
     def describe(self, column: Node) -> str:
         """A column's label with what vouches for it: its term's status and its verified edges."""
@@ -744,9 +1113,11 @@ class Checker:
         timed = {c for c, t in types.items() if t.startswith(('TIMESTAMP', 'DATETIME', 'TIME'))}
         untimed = {c for c, t in types.items() if t not in ('', 'UNKNOWN') and c not in dated | timed}
         normal = normal_condition(
-            tree.copy().transform(swap, copy=False), self.sqlglot, dated, timed, untimed
+            self.truth(tree.copy().transform(swap, copy=False)), self.sqlglot, dated, timed, untimed
         )
-        opposite = normal_condition(exp.Not(this=normal.copy()), self.sqlglot, dated, timed, untimed)
+        opposite = normal_condition(
+            self.truth(exp.Not(this=normal.copy())), self.sqlglot, dated, timed, untimed
+        )
         return _Condition(
             self.short(tree),
             normal.sql(dialect=self.sqlglot),
@@ -980,8 +1351,10 @@ class Checker:
         composed = self.composer.compose(node)
         found = _Form(None, composed.sources, composed.complete)
         if composed.tree is not None:
-            formula, condition = _formula(composed.tree)
-            found.formula = formula.sql(dialect=self.sqlglot)
+            formula, condition = _formula(composed.tree, self.exact)
+            # Function names in one case: a dialect that keeps them as written (BigQuery,
+            # ClickHouse) would otherwise make SUM and sum two formulas.
+            found.formula = formula.sql(dialect=self.sqlglot, normalize_functions='upper')
             # The sources of the value, not of the condition taken out of it, which is compared as
             # a filter.
             read = [self.resolved(c) for c in formula.find_all(exp.Column)]
@@ -1009,6 +1382,8 @@ def reachable(
     equalities: list[tuple[str, str, str, str]],
     unique: dict[str, list[frozenset[str]]],
     fixed: dict[str, set[str]] | None = None,
+    null_safe: list[tuple[str, str, str, str]] | None = None,
+    grouped: dict[str, list[frozenset[str]]] | None = None,
 ) -> dict[str, set[str]]:
     """For each source of a join, the sources each of its rows matches at most one row of.
 
@@ -1018,11 +1393,19 @@ def reachable(
     row of a group, as are the columns equated to them. Within a group, a row of ``a`` matches at
     most one row of ``b`` when the columns of ``b`` it is equated to, with those fixed, cover a unique
     set of ``b``, and through ``b`` at most one row of whatever ``b`` matches at most one of. A source
-    that reaches every other keeps its grain: the join repeats none of its rows within a group."""
+    that reaches every other keeps its grain: the join repeats none of its rows within a group.
+
+    ``null_safe`` are the ``IS NOT DISTINCT FROM`` equalities, which also match NULL to NULL: they
+    cover only the sets of ``grouped``, those a DISTINCT or a GROUP BY makes unique, which keep a
+    single row for NULL; a unique test lets many rows hold NULL."""
     matched: dict[tuple[str, str], set[str]] = defaultdict(set)
     for left, left_column, right, right_column in equalities:
         matched[(left, right)].add(right_column)
         matched[(right, left)].add(left_column)
+    loose: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for left, left_column, right, right_column in null_safe or []:
+        loose[(left, right)].add(right_column)
+        loose[(right, left)].add(left_column)
     constant: dict[str, set[str]] = defaultdict(set)
     for alias, columns in (fixed or {}).items():
         constant[alias] |= columns
@@ -1040,7 +1423,10 @@ def reachable(
 
     def at_most_one(a: str, b: str) -> bool:
         columns = matched.get((a, b), set()) | constant[b]
-        return any(u <= columns for u in unique.get(b, []))
+        if any(u <= columns for u in unique.get(b, [])):
+            return True
+        columns = columns | loose.get((a, b), set())
+        return any(u <= columns for u in (grouped or {}).get(b, []))
 
     found = {}
     for alias in aliases:
@@ -1078,6 +1464,193 @@ def _excludes(condition: _Condition) -> bool:
         inner = tree.this
         return not (isinstance(inner, exp.Is) and isinstance(inner.expression, exp.Null))
     return False
+
+
+def _minor_named(name: str | None) -> bool:
+    return bool(name) and bool(_MINOR_WORDS & set(re.split(r'[^a-z0-9]+', (name or '').lower())))
+
+
+def _number(node: exp.Expr | None) -> float | None:
+    """The value of a numeric literal, cast or not."""
+    if isinstance(node, (exp.Paren, exp.Cast)):
+        return _number(node.this)
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return float(node.name)
+        except ValueError:
+            return None
+    return None
+
+
+def _compared(condition: _Condition, dialect: Dialect) -> tuple[Node, type[exp.Expr], float] | None:
+    """A filter that compares one column with a number, as the column, the comparison with the
+    column on its left, and the number."""
+    tree = condition.tree
+    while isinstance(tree, exp.Paren):
+        tree = tree.this
+    kind = type(tree)
+    if kind not in _COMPARISONS:
+        return None
+    for column, other, compared in (
+        (tree.this, tree.expression, kind),
+        (tree.expression, tree.this, _COMPARISONS[kind]),
+    ):
+        value = _number(other)
+        if isinstance(column, exp.Column) and value is not None:
+            node = condition.columns.get(column.sql(dialect=dialect))
+            return (node, compared, value) if node is not None else None
+    return None
+
+
+def _carries(node: exp.Expr, name: str) -> bool:
+    """Whether an expression's value is in the units of the column ``name``: the column, a sum or
+    difference with it, an aggregate, cast or pick of it, or it scaled by a constant."""
+    if isinstance(node, exp.Column):
+        return node.name.lower() == name.lower()
+    if isinstance(node, exp.Count):
+        return False
+    if isinstance(node, exp.Mul):
+        for factor, rest in ((node.this, node.expression), (node.expression, node.this)):
+            if _number(factor) is not None:
+                return _carries(rest, name)
+        return False
+    if isinstance(node, exp.Div):
+        return _carries(node.this, name)
+    if isinstance(node, exp.Case):
+        branches = [i.args.get('true') for i in node.args.get('ifs') or []] + [node.args.get('default')]
+        return any(_carries(b, name) for b in branches if isinstance(b, exp.Expr))
+    if isinstance(node, exp.If):
+        return any(
+            _carries(b, name) for b in (node.args.get('true'), node.args.get('false')) if b is not None
+        )
+    if isinstance(node, (exp.Add, exp.Sub, exp.Coalesce)):
+        return any(
+            _carries(b, name) for b in (node.this, node.expression, *node.expressions) if b is not None
+        )
+    if isinstance(
+        node,
+        (exp.Paren, exp.Alias, exp.Cast, exp.Round, exp.Abs, exp.Neg, exp.Filter, exp.Window, exp.AggFunc),
+    ):
+        return isinstance(node.this, exp.Expr) and _carries(node.this, name)
+    return False
+
+
+_BOOLEAN_DIALECTS = frozenset(
+    {
+        'athena',
+        'bigquery',
+        'databricks',
+        'duckdb',
+        'hive',
+        'postgres',
+        'presto',
+        'redshift',
+        'snowflake',
+        'spark',
+        'trino',
+    }
+)
+"""Dialects whose booleans are a type of their own, not numbers."""
+_CONSTANT_PARTS = (
+    exp.Literal,
+    exp.Boolean,
+    exp.Null,
+    exp.Paren,
+    exp.Neg,
+    exp.Cast,
+    exp.TryCast,
+    exp.DataType,
+    exp.DataTypeParam,
+    exp.Add,
+    exp.Sub,
+    exp.Mul,
+    exp.Div,
+    exp.Mod,
+    exp.DPipe,
+    exp.Concat,
+    exp.Interval,
+    exp.Var,
+)
+
+
+def _constant(expression: exp.Expr) -> bool:
+    """Whether a SELECT item is a literal, or a cast, sum, product or concatenation of literals:
+    the same on every row. A function is not, even of literals: ``uuid()``, ``random()``,
+    ``now()`` and a user's function can differ from row to row."""
+    return all(isinstance(node, _CONSTANT_PARTS) for node in _output(expression).walk())
+
+
+def _figure(value: float) -> str:
+    """A number as people write it: 2000, 19.99."""
+    return f'{round(value, 6):f}'.rstrip('0').rstrip('.')
+
+
+def _units(node: exp.Expr, minor: Callable[[exp.Column], bool], scale: int) -> int | None:
+    """The power of the minor unit in a value: 1 for a column in minor units and for what adds,
+    averages or picks among its values, 0 once it is divided by ``scale``, by an amount in minor units
+    (a ratio) or for a count, and None where the units do not combine (cents added to a count) or
+    the check does not follow them."""
+    if isinstance(node, exp.Column):
+        return 1 if minor(node) else 0
+    if isinstance(node, (exp.Literal, exp.Null, exp.Boolean, exp.Count)):
+        return 0
+    if isinstance(node, exp.Div) and _number(node.expression) is not None:
+        # A chain of constant divisors divides by their product: x / 10 / 10 is x / 100.
+        divisor, base = 1.0, node
+        while isinstance(base, exp.Div) and (value := _number(base.expression)) is not None:
+            divisor, base = divisor * value, base.this
+        units = _units(base, minor, scale)
+        return units - 1 if units is not None and units > 0 and math.isclose(divisor, scale) else units
+    if isinstance(node, (exp.Div, exp.Mul)):
+        left, right = _units(node.this, minor, scale), _units(node.expression, minor, scale)
+        if left is None or right is None:
+            return None
+        if isinstance(node, exp.Div):
+            return left - right
+        factor = next((v for side in (node.this, node.expression) if (v := _number(side)) is not None), None)
+        return left + right - (1 if factor is not None and factor * scale == 1 and left + right > 0 else 0)
+    if isinstance(node, (exp.Add, exp.Sub)):
+        left, right = _units(node.this, minor, scale), _units(node.expression, minor, scale)
+        return left if left == right else None
+    branches: list[Any] | None = None
+    if isinstance(node, exp.Coalesce):
+        branches = [node.this, *node.expressions]
+    elif isinstance(node, exp.Case):
+        branches = [i.args.get('true') for i in node.args.get('ifs') or []] + [node.args.get('default')]
+    elif isinstance(node, exp.If):
+        branches = [node.args.get('true'), node.args.get('false')]
+    if branches is not None:
+        # A constant branch (COALESCE(x, 0), ELSE 0) is in whatever units the others are.
+        found = {_units(b, minor, scale) for b in branches if isinstance(b, exp.Expr) and _number(b) is None}
+        return found.pop() if len(found) == 1 else None
+    if isinstance(
+        node, (exp.Filter, exp.Window, exp.Paren, exp.Alias, exp.Round, exp.Abs, exp.Neg, exp.Cast)
+    ):
+        return _units(node.this, minor, scale)
+    if isinstance(node, exp.WithinGroup) and isinstance(node.this, (exp.PercentileCont, exp.PercentileDisc)):
+        order = node.expression
+        ordered = order.expressions if isinstance(order, exp.Order) else []
+        return _units(ordered[0].this, minor, scale) if len(ordered) == 1 else None
+    if isinstance(
+        node,
+        (
+            exp.Sum,
+            exp.Avg,
+            exp.Max,
+            exp.Min,
+            exp.AnyValue,
+            exp.Median,
+            exp.Floor,
+            exp.Ceil,
+            exp.PercentileCont,
+            exp.PercentileDisc,
+            exp.Quantile,
+            exp.ApproxQuantile,
+        ),
+    ):
+        # A percentile, median or quantile of amounts is one of the amounts.
+        return _units(node.this, minor, scale)
+    return None if any(minor(c) for c in node.find_all(exp.Column)) else 0
 
 
 # Formulas: what a measure computes, without what does not change its value
@@ -1133,11 +1706,13 @@ def _collapse(tree: exp.Expr) -> exp.Expr:
     return tree.transform(flatten, copy=False)
 
 
-def _formula(tree: exp.Expr) -> tuple[exp.Expr, exp.Expr | None]:
+def _formula(tree: exp.Expr, exact: bool | None = None) -> tuple[exp.Expr, exp.Expr | None]:
     """A formula without its value-preserving wrappers and, when it is one aggregate that counts
     only some rows (``SUM(x) FILTER (WHERE c)``, ``SUM(CASE WHEN c THEN x ELSE 0 END)``,
     ``COUNT(CASE WHEN c THEN 1 END)``, ``SUM(IF(c, 1, 0))``), the aggregate over every row and the
-    condition ``c``, which is a filter on the rows it reads."""
+    condition ``c``, which is a filter on the rows it reads. To be compared, with ``exact`` given,
+    the constant factors of sums and averages are taken out of them (:func:`_linear`); as people
+    read it, without."""
     tree = _collapse(_strip(tree.copy()).transform(_strip, copy=False))
     condition: exp.Expr | None = None
     if isinstance(tree, exp.Filter) and isinstance(tree.this, exp.AggFunc):
@@ -1149,7 +1724,75 @@ def _formula(tree: exp.Expr) -> tuple[exp.Expr, exp.Expr | None]:
         if picked is not None:
             tree, when = picked
             condition = when if condition is None else exp.and_(condition, when)
-    return _collapse(tree), condition
+    tree = _collapse(tree)
+    return (tree if exact is None else _linear(tree, exact)), condition
+
+
+def _linear(tree: exp.Expr, exact: bool) -> exp.Expr:
+    """A formula with each constant factor of a sum or an average taken out of it, which changes
+    nothing: ``SUM(x * 2)`` as ``2 * SUM(x)``, and where ``/`` never truncates (``exact``),
+    ``SUM(x / 100)`` as ``SUM(x) / 100``, with ``0.01 * x`` written ``x / 100`` and each number
+    written one way (``100.0`` as ``100``)."""
+
+    def number(node: exp.Expr) -> exp.Expr:
+        if exact and isinstance(node, exp.Literal) and not node.is_string:
+            value = _decimal(node)
+            if value is not None:
+                return exp.Literal.number(format(value.normalize(), 'f'))
+        return node
+
+    def divided(node: exp.Expr) -> exp.Expr:
+        if exact and isinstance(node, exp.Mul):
+            for factor, rest in ((node.this, node.expression), (node.expression, node.this)):
+                value = _decimal(factor)
+                if value is not None and 0 < value < 1 and (1 / value) == (1 / value).to_integral_value():
+                    return exp.Div(this=rest.copy(), expression=exp.Literal.number(format(1 / value, 'f')))
+        return node
+
+    def pull(node: exp.Expr) -> exp.Expr:
+        if isinstance(node, (exp.Sum, exp.Avg)) and not isinstance(node.this, exp.Distinct):
+            inner = _strip(node.this) if isinstance(node.this, exp.Expr) else None
+            if exact and isinstance(inner, exp.Div) and _decimal(inner.expression) is not None:
+                return exp.Div(this=type(node)(this=inner.this.copy()), expression=inner.expression.copy())
+            if isinstance(inner, exp.Mul):
+                for factor, rest in ((inner.this, inner.expression), (inner.expression, inner.this)):
+                    if _decimal(factor) is not None:
+                        return exp.Mul(this=factor.copy(), expression=type(node)(this=rest.copy()))
+        return node
+
+    tree = tree.transform(number).transform(divided)
+    for _ in range(10):  # each pass takes one factor out of each aggregate
+        pulled = tree.transform(pull)
+        if pulled == tree:
+            break
+        tree = pulled
+    return tree
+
+
+def _decimal(node: exp.Expr | None) -> Decimal | None:
+    """The exact value of a numeric literal."""
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return Decimal(node.name)
+        except ArithmeticError:
+            return None
+    return None
+
+
+def _aggregate_of(formula: str | None, dialect: str | None) -> str | None:
+    """The aggregate a formula applies last, through a constant factor: ``SUM`` for ``SUM(x) / 100``."""
+    try:
+        tree = sqlglot.parse_one(formula, read=dialect) if formula else None
+    except PARSE_ERRORS:
+        return None
+    while isinstance(tree, (exp.Paren, exp.Div, exp.Mul)):
+        if isinstance(tree, exp.Paren) or _decimal(tree.expression) is not None:
+            tree = tree.this
+        elif isinstance(tree, exp.Mul) and _decimal(tree.this) is not None:
+            tree = tree.expression
+        else:
+            break
+    return top_function(tree.sql(dialect=dialect), dialect) if tree is not None else None
 
 
 def _conditional(agg: exp.AggFunc) -> tuple[exp.Expr, exp.Expr] | None:
@@ -1266,6 +1909,71 @@ def _windowed(select: exp.Select) -> Iterator[tuple[exp.Window, exp.AggFunc]]:
                 yield window, inner
 
 
+def _partition(window: exp.Window, select: exp.Select) -> list[exp.Expr] | None:
+    """The PARTITION BY ``window`` runs over, through the named windows it builds on (``OVER w``
+    or ``OVER (w ORDER BY x)`` with ``WINDOW w AS (PARTITION BY k)``), or None when it names one
+    ``select`` does not define."""
+    partition = list(window.args.get('partition_by') or [])
+    named = window.args.get('alias')
+    seen: set[str] = set()
+    while isinstance(named, exp.Identifier):
+        name = named.name.lower()
+        base = next(
+            (
+                w
+                for w in select.args.get('windows') or []
+                if isinstance(w, exp.Window) and w.name.lower() == name
+            ),
+            None,
+        )
+        if base is None or name in seen or partition:
+            # A window that names another cannot add its own PARTITION BY.
+            return None
+        seen.add(name)
+        partition = list(base.args.get('partition_by') or [])
+        named = base.args.get('alias')
+    return partition
+
+
+def _subtotals(group: exp.Group) -> bool:
+    """Whether a GROUP BY adds rows that span its groups: ROLLUP, CUBE, GROUPING SETS, MySQL's
+    ``WITH ROLLUP`` and ClickHouse's ``WITH TOTALS``, whose rows hold many values of a column."""
+    return any(group.args.get(k) for k in ('rollup', 'cube', 'grouping_sets', 'totals')) or any(
+        isinstance(i, (exp.Rollup, exp.Cube, exp.GroupingSets)) for i in group.expressions
+    )
+
+
+def _valued(agg: exp.AggFunc, select: exp.Select) -> list[exp.Column]:
+    """The columns of ``select`` whose values ``agg`` adds up: not those of a CASE or IF that only
+    choose which rows count (``SUM(CASE WHEN c.region = 'EU' THEN o.amount END)`` adds up only
+    ``o.amount``), unless the value is a constant, when those choose what is counted."""
+    found: list[exp.Column] = []
+    stack: list[exp.Expr] = [agg.this] if isinstance(agg.this, exp.Expr) else []
+    while stack:
+        node = stack.pop()
+        if isinstance(node, exp.Case):
+            stack += [
+                b.args['true'] for b in node.args.get('ifs') or [] if isinstance(b.args.get('true'), exp.Expr)
+            ]
+            stack += [d] if isinstance(d := node.args.get('default'), exp.Expr) else []
+        elif isinstance(node, exp.If):
+            stack += [v for v in (node.args.get('true'), node.args.get('false')) if isinstance(v, exp.Expr)]
+        elif isinstance(node, exp.Column):
+            found.append(node)
+        else:
+            stack += list(node.iter_expressions())
+    found = [c for c in found if _owner(c) is select]
+    return found or _own_columns(agg, select)
+
+
+def _listing(select: exp.Select) -> list[exp.Expr]:
+    """The items of ``select`` that UNNEST or EXPLODE an array in the SELECT list, which repeat
+    each row once per element after WHERE, GROUP BY, window functions and QUALIFY have run."""
+    return [
+        e for e in select.expressions if any(_owner(x) is select for x in e.find_all(exp.Explode, exp.Unnest))
+    ]
+
+
 def _owner(node: exp.Expr) -> exp.Expr | None:
     return node.find_ancestor(exp.Select)
 
@@ -1289,6 +1997,17 @@ def _unnest(node: exp.Expr | None) -> exp.Expr | None:
     while isinstance(node, exp.Subquery):
         node = node.this
     return node
+
+
+def _joined(source: exp.Expr) -> set[str]:
+    """The names a join brings in: the alias of what it joins, or for a join in parentheses
+    (``LEFT JOIN (a JOIN b ON ...) ON ...``), which has none, the names of each source in it."""
+    inner = source.this
+    if isinstance(source, exp.Subquery) and not source.alias and isinstance(inner, (exp.Table, exp.Subquery)):
+        found = _joined(inner)
+    else:
+        found = {source.alias_or_name}
+    return found.union(*(_joined(j.this) for j in source.args.get('joins') or []))
 
 
 def _branches(scope: Scope) -> list[Scope]:
@@ -1323,6 +2042,7 @@ class _Run:
         self.infos: dict[int, _ScopeInfo] = {}
         self.laterals: dict[int, Scope] = {}
         self.called: dict[str, list[str]] = {}
+        self.placed: dict[tuple[str, str, str], str | None] = {}
         self.canon = Canonical(checker.sqlglot, checker.default_catalog, checker.default_db)
         self.schema = MappingSchema({}, dialect=checker.sqlglot)
 
@@ -1443,6 +2163,7 @@ class _Run:
             return
         for site in sites:
             self.measure(site)
+            self.units(site)
 
     # Names
 
@@ -1881,17 +2602,32 @@ class _Run:
         columns of the project it is named like."""
         checker = self.checker
         bound: dict[str, _Term] = {}
+        sliced: dict[str, str] = {}
         for node in site.reads:
-            for term in self._held_by(node):
+            held = self._held_by(node)
+            for term in held:
                 if term.status != 'retired':
                     bound.setdefault(term.name, term)
+            for term, root, extra in [] if held else checker.slices(node):
+                if term.name not in bound:
+                    bound[term.name] = term
+                    sliced[term.name] = (
+                        f'{self.graph.label(node)} computes {term.name!r} as {self.graph.label(root)} does, '
+                        f'over the rows where {" and ".join(c.text for c in extra)}'
+                    )
         for term in bound.values():
             if term.measure:
+                # Read as a slice of the term's column, the term is the formula's, not a binding's.
+                severity = _capped(term.severity) if term.name in sliced else term.severity
                 for condition in checker.required(term):
-                    self.missing(condition, term, site, term.severity, None)
+                    self.missing(condition, term, site, severity, None, sliced.get(term.name))
         named = [t for t in checker.terms_named(site.output) if t.name not in bound]
         for term in named:
             verdict = self.compare(site, term.roots, term) if term.measure else None
+            # A formula compared with the term's says how it differs; one that cannot be compared
+            # is checked for reading other terms' columns instead.
+            if verdict is None and self.conflicting(site, term):
+                continue
             severity = term.severity if verdict == 'same' else _capped(term.severity)
             for condition in checker.required(term):
                 self.missing(condition, term, site, severity, None)
@@ -1903,6 +2639,68 @@ class _Run:
         if same:
             self.compare(site, same, None)
 
+    def conflicting(self, site: _Site, term: _Term) -> bool:
+        """Report a measure named for ``term`` that reads none of its columns, nor a column they
+        are computed from or one computed from them, and reads only columns of other terms, or ones
+        their columns are computed from: ``revenue`` added up from the order total."""
+        checker, label = self.checker, self.graph.label
+        if not term.bound or not site.reads:
+            return False
+        mine = {n.id for n in site.reads}.union(*(checker.upstream(n.id) for n in site.reads))
+        own = {c.id for c in term.bound}.union(*(checker.upstream(c.id) for c in term.bound))
+        if mine & own:
+            return False
+        unit = term.node.attrs.get('unit')
+        held_by = {
+            read.id: [
+                (other, held)
+                for other in checker.terms
+                if other is not term and other.status != 'retired'
+                for held in other.bound
+                if read.id == held.id or read.id in checker.upstream(held.id)
+            ]
+            for read in site.reads
+        }
+        # A column no other term holds may be how this term is computed another way (the order
+        # total less its tax, for revenue): only a measure made of other terms' columns alone is
+        # computed from them.
+        if not all(held_by.values()):
+            return False
+        for read in site.reads:
+            holding = held_by[read.id]
+            # Of the terms that hold the column, the one most like this term: an amount of the same
+            # unit, then one that does not filter its rows.
+            for other, held in sorted(
+                holding,
+                key=lambda h: (
+                    h[0].node.attrs.get('unit') != unit,
+                    bool(h[0].node.attrs.get('filters')),
+                    h[0].name,
+                ),
+            )[:1]:
+                columns = ', '.join(sorted(label(c) for c in term.bound))
+                self.add(
+                    Finding(
+                        'conflicting-column',
+                        _capped(term.severity),
+                        f'{site.output} is named for {term.name!r}, but reads {label(read)}, which holds '
+                        f'{other.name!r}, not {term.name!r} ({columns})',
+                        f'Compute {term.name!r} from {", ".join(checker.describe(c) for c in term.roots)}, or '
+                        'name the column for what it computes.',
+                        column=_shown(site.output),
+                        term=term.name,
+                        detail=f'reads {label(read)}',
+                        evidence=[
+                            f'{term.name!r} ({term.where}) is {columns}',
+                            f'{other.name!r} ({other.where}) is {label(held)}',
+                        ],
+                    ),
+                    site.output,
+                    term.name,
+                )
+                return True
+        return False
+
     def compare(self, site: _Site, candidates: list[Node], term: _Term | None) -> str | None:
         """Compare a measure with the columns that hold the idea it is named for: ``same`` when one
         computes it the same way from the same sources, ``differs`` when none does, None when they
@@ -1911,6 +2709,34 @@ class _Run:
         mine = site.form
         if mine.formula is None or not mine.complete:
             return None
+        if term is not None and len(term.roots) > 1:
+            # A term bound to the columns it is computed from (gross profit: price and cost) is
+            # not computed as any one of them; a measure that reads several of them is not compared.
+            sources = [
+                checker.form(None, r).sources
+                if isinstance(r.attrs.get('expression'), str)
+                else frozenset({r.id})
+                for r in term.roots
+            ]
+            apart = all(not (a & b) for i, a in enumerate(sources) for b in sources[i + 1 :])
+            if apart and sum(1 for s in sources if s & mine.sources) > 1:
+                bound = ', '.join(sorted(graph.label(r) for r in term.roots))
+                self.add(
+                    Finding(
+                        'formula-differs',
+                        'info',
+                        f'{site.output} computes {term.name!r} from several of the columns it is bound to '
+                        f'({bound}), and nothing says how they combine, so the formula was not compared',
+                        f'Check {site.shown or site.output} against the definition of {term.name!r} by hand.',
+                        column=_shown(site.output),
+                        term=term.name,
+                        detail=site.shown,
+                        evidence=[f'{term.name!r} ({term.where}) is bound to {bound}'],
+                    ),
+                    site.output,
+                    term.name,
+                )
+                return None
         compared: list[tuple[Node, _Form]] = []
         for candidate in sorted(candidates, key=graph.label):
             if not isinstance(candidate.attrs.get('expression'), str):
@@ -1929,11 +2755,16 @@ class _Run:
             self.differs(site, compared, term, idea)
             return 'differs'
         present = site.rows.conditions
+        groups = self.result_groups(site)
         verdicts = []
         for candidate, theirs in same:
-            conditions = {p.key: p for p in [*checker.held_filters(candidate), *theirs.conditions]}
+            held = [*checker.held_filters(candidate), *theirs.conditions]
+            # Dropping the NULL group of the result's own groups changes no other group, written
+            # in the query or not.
+            dropped = {p.key for p in held if checker.null_group(p, candidate, groups)}
+            conditions = {p.key: p for p in held if p.key not in dropped}
             missing = [p for k, p in conditions.items() if k not in present]
-            extra = [p for k, p in present.items() if p.written and k not in conditions]
+            extra = [p for k, p in present.items() if p.written and k not in conditions and k not in dropped]
             verdicts.append((len(missing) + len(extra), graph.label(candidate), candidate, missing, extra))
         _, _, candidate, missing, extra = min(verdicts, key=lambda v: (v[0], v[1]))
         severity = term.severity if term is not None else 'warning'
@@ -2021,8 +2852,8 @@ class _Run:
             differences.append(f'reads {", ".join(only_mine)}, which {label(candidate)} does not')
         if only_theirs:
             differences.append(f'leaves out {", ".join(only_theirs)}')
-        top_mine = top_function(mine.formula, checker.dialect)
-        top_theirs = top_function(theirs.formula, checker.dialect)
+        top_mine = _aggregate_of(mine.formula, checker.dialect)
+        top_theirs = _aggregate_of(theirs.formula, checker.dialect)
         if top_mine != top_theirs:
             differences.append(f'aggregates with {top_mine or "no aggregate"} against {top_theirs or "none"}')
         held = ', '.join(checker.describe(c) for c, _ in compared)
@@ -2042,13 +2873,181 @@ class _Run:
             idea,
         )
 
+    def units(self, site: _Site) -> None:
+        """A measure whose result is still in the minor units of a currency (cents) that the project
+        reads in whole units, unless its name says it is in minor units; and a filter that compares a
+        column in minor units with the value a definition requires of the column that reads it in
+        whole units, as if it were in whole units."""
+        checker, label = self.checker, self.graph.label
+        tree = checker.parse(site.form.formula) if site.form.formula is not None else None
+        read = (
+            [n for c in tree.find_all(exp.Column) if (n := checker.resolved(c)) is not None] if tree else []
+        )
+        minors = {n.id: m for n in read if (m := checker.minor(n)) is not None}
+        scales = {m.scale for m in minors.values()}
+        if tree is not None and len(scales) == 1 and not _minor_named(site.output):
+            scale = scales.pop()
+
+            def minor(column: exp.Column) -> bool:
+                node = checker.resolved(column)
+                return node is not None and node.id in minors
+
+            if (_units(tree, minor, scale) or 0) > 0:
+                column = next(n for n in read if n.id in minors)
+                held = minors[column.id]
+                fraction = _FRACTIONS[scale]
+                name = _shown(site.output)
+                text = site.core.sql(dialect=checker.sqlglot)
+                self.add(
+                    Finding(
+                        'minor-units',
+                        'warning',
+                        f'{name or text} is in {fraction}: {label(column)} holds {fraction} of the unit '
+                        f'{label(held.reader)} reads it in, and the query does not divide it by {scale}',
+                        f'Divide {text} by {scale}, or read {label(held.reader)}.',
+                        column=name,
+                        detail=f'{label(column)} in {fraction}',
+                        evidence=held.evidence,
+                    ),
+                    site.output,
+                    str(id(site.scope)),
+                )
+        for condition in site.rows.conditions.values():
+            if condition.written:
+                self.threshold(condition)
+
+    def not_null(self, condition: _Condition, present: dict[str, _Condition]) -> bool:
+        """Whether ``condition`` is ``x IS NOT NULL`` and the query applies, on the same column, a
+        filter that is never true where ``x`` is NULL: a comparison, IN, LIKE or BETWEEN with ``x``
+        itself as an operand, negated or not, in a WHERE, HAVING or QUALIFY or in an inner join's
+        ON, on the relations the measure's own columns come from. Such a filter keeps no row whose
+        ``x`` is NULL. A test of ``x`` inside an OR, a COALESCE or a CASE, or with IS DISTINCT
+        FROM, can be true there, so it does not count."""
+        checker = self.checker
+        tree = condition.tree
+        while isinstance(tree, exp.Paren):
+            tree = tree.this
+        if not (isinstance(tree, exp.Not) and isinstance(tree.this, exp.Is)):
+            return False
+        test = tree.this
+        if not (isinstance(test.this, exp.Column) and isinstance(test.expression, exp.Null)):
+            return False
+        node = condition.columns.get(test.this.sql(dialect=checker.sqlglot))
+        if node is None:
+            return False
+        wanted = checker.origin(node.id)
+        rejecting = (
+            exp.EQ,
+            exp.NEQ,
+            exp.GT,
+            exp.GTE,
+            exp.LT,
+            exp.LTE,
+            exp.In,
+            exp.Like,
+            exp.ILike,
+            exp.Between,
+        )
+        for applied in present.values():
+            label = applied.label.upper()
+            # Only a filter of the measure's own rows: one on a row tied to them (another order of
+            # the customer, the first of a deduplicated subquery) keeps the measure's NULLs.
+            if not (applied.written and applied.own) or not (
+                label in _FILTER_LABELS or label in ('JOIN ON', 'INNER JOIN ON')
+            ):
+                continue
+            part = applied.tree
+            while isinstance(part, (exp.Paren, exp.Not)):
+                part = part.this
+            if not isinstance(part, rejecting):
+                continue
+            operands = [part.this] + ([] if isinstance(part, (exp.In, exp.Between)) else [part.expression])
+            for operand in operands:
+                while isinstance(operand, (exp.Paren, exp.Cast)):
+                    operand = operand.this
+                found = (
+                    applied.columns.get(operand.sql(dialect=checker.sqlglot))
+                    if isinstance(operand, exp.Column)
+                    else None
+                )
+                if found is not None and checker.origin(found.id) == wanted:
+                    return True
+        return False
+
+    def scaled(self, condition: _Condition, present: dict[str, _Condition]) -> bool:
+        """Whether the query applies ``condition``, a comparison of a column in whole units with a
+        number, to the column in minor units it is read from, on the measure's own rows, scaled:
+        ``order_total >= 2000`` on cents for ``order_total >= 20`` on dollars."""
+        checker = self.checker
+        wanted = _compared(condition, checker.sqlglot)
+        whole = checker.whole(wanted[0]) if wanted is not None else None
+        if wanted is None or whole is None:
+            return False
+        if not checker.divides(wanted[0], *whole):
+            return False
+        for applied in present.values():
+            mine = _compared(applied, checker.sqlglot) if applied.written and applied.own else None
+            if (
+                mine is not None
+                and mine[0].id == whole[0]
+                and mine[1] is wanted[1]
+                and math.isclose(mine[2], wanted[2] * whole[1])
+            ):
+                return True
+        return False
+
+    def threshold(self, condition: _Condition) -> None:
+        """Report a filter that compares a column in minor units with the very value a term's
+        filter requires of the column that reads it in whole units: ``order_total >= 20`` on cents,
+        where large orders are those of 20 dollars or more."""
+        checker, label = self.checker, self.graph.label
+        mine = _compared(condition, checker.sqlglot)
+        held = checker.minor(mine[0]) if mine is not None else None
+        if mine is None or held is None:
+            return
+        column, kind, value = mine
+        for term in checker.terms:
+            for required in checker.required(term) if term.status != 'retired' else []:
+                theirs = _compared(required, checker.sqlglot)
+                if theirs is None or theirs[1] is not kind or theirs[2] != value:
+                    continue
+                target = theirs[0]
+                if checker.whole(target) != (column.id, held.scale):
+                    continue  # the definition's column is in the same units as the query's
+                fraction = _FRACTIONS[held.scale]
+                self.add(
+                    Finding(
+                        'minor-units',
+                        'warning',
+                        f'the query compares {label(column)}, in {fraction}, with {_figure(value)}, the value '
+                        f'{term.name!r} requires of {label(target)} = {label(column)} / {held.scale}',
+                        f'Compare {label(column)} with {_figure(value * held.scale)}, or compare '
+                        f'{label(target)} with {_figure(value)}.',
+                        term=term.name,
+                        detail=f'{condition.text} in {fraction}',
+                        evidence=[f'required by {required.source}', *held.evidence],
+                    ),
+                    condition.key,
+                    term.name,
+                )
+                return
+
     def missing(
-        self, condition: _Condition, term: _Term | None, site: _Site, severity: str, held: Node | None
+        self,
+        condition: _Condition,
+        term: _Term | None,
+        site: _Site,
+        severity: str,
+        held: Node | None,
+        because: str | None = None,
     ) -> None:
-        """Report ``condition`` if the rows the measure reads are not filtered by it."""
+        """Report ``condition`` if the rows the measure reads are not filtered by it; ``because``
+        says why the term applies, when the query reads none of its columns."""
         present = site.rows.conditions
         contradicted = [p for p in present.values() if p.written and p.key == condition.opposite]
-        if condition.key in present and not contradicted:
+        if (
+            condition.key in present or self.scaled(condition, present) or self.not_null(condition, present)
+        ) and not contradicted:
             return
         name = term.name if term is not None else site.output
         if ('missing-filter', name, condition.key, site.output, str(id(site.scope))) in self.seen:
@@ -2088,7 +3087,15 @@ class _Run:
                 f'{condition.text}'
             )
             evidence = [f'{condition.label} in {condition.source}'] if condition.source else []
-        if similar:
+        if because:
+            evidence.append(because)
+        if because and (similar or origins & self.grouped(site)):
+            # A slice of a term's column that the query itself filters or groups by the term's
+            # filter column: the query chose its rows, so only a note, and nothing to rewrite.
+            message += '; the query chooses its rows by that column itself'
+            severity = 'info'
+            similar = similar or [condition]
+        elif similar:
             message += f'; it filters the same column with {similar[0].text}'
             severity = _capped(severity)
         elif origins & site.rows.nearby:
@@ -2096,7 +3103,13 @@ class _Run:
             # follow (an anti-join, say): likely deliberate, so only a note.
             message += '; the query filters that column elsewhere, on rows tied to these'
             severity = 'info'
-        rewrite = self.place(condition, site) if condition.label == 'WHERE' and not similar else None
+        rewrite = None
+        if condition.label == 'WHERE' and not similar:
+            # Two terms that require one filter of one measure share the change, made once.
+            placing = (str(id(site.scope)), site.output, condition.key)
+            if placing not in self.placed:
+                self.placed[placing] = self.place(condition, site)
+            rewrite = self.placed[placing]
         fix = f'Add {condition.text} to the query.' if rewrite is None else f'Apply the filter: {rewrite}.'
         if held is None and unshown is not None:
             fix = f'Run konstruct build again, then check the query again. If it still reports this: {fix}'
@@ -2160,6 +3173,45 @@ class _Run:
 
     # Joins
 
+    def grouped(self, site: _Site) -> set[str]:
+        """The origins of the columns the measure's query groups by."""
+        select = site.scope.expression
+        group = select.args.get('group') if isinstance(select, exp.Select) else None
+        found: set[str] = set()
+        for item in group.expressions if group is not None else []:
+            if (
+                isinstance(item, exp.Literal)
+                and item.is_int
+                and 0 < int(item.name) <= len(select.expressions)
+            ):
+                item = _strip(_output(select.expressions[int(item.name) - 1]))
+            for column in item.find_all(exp.Column) if isinstance(item, exp.Expr) else []:
+                node = self.physical(site.scope, column)
+                if node is not None:
+                    found.add(self.checker.origin(node.id))
+        return found
+
+    def result_groups(self, site: _Site) -> set[str]:
+        """The origins of the columns the result is grouped by, one group per value, when the
+        measure's own query is the result: grouped by the column itself, not a function of it, and
+        without subtotal rows."""
+        select = site.scope.expression
+        group = select.args.get('group') if isinstance(select, exp.Select) else None
+        if not isinstance(group, exp.Group) or _subtotals(group) or self.readers.get(id(site.scope)):
+            return set()
+        found: set[str] = set()
+        for item in group.expressions:
+            if (
+                isinstance(item, exp.Literal)
+                and item.is_int
+                and 0 < int(item.name) <= len(select.expressions)
+            ):
+                item = _output(select.expressions[int(item.name) - 1])
+            node = self.physical(site.scope, item) if isinstance(item, exp.Column) else None
+            if node is not None:
+                found.add(self.checker.origin(node.id))
+        return found
+
     def physical(self, scope: Scope, column: exp.Column) -> Node | None:
         source = scope.sources.get(column.table)
         if isinstance(source, exp.Table):
@@ -2184,6 +3236,7 @@ class _Run:
         aliases = list(scope.selected_sources)
         sources = {a: scope.selected_sources[a][1] for a in aliases}
         unique: dict[str, list[frozenset[str]]] = {}
+        grouped: dict[str, list[frozenset[str]]] = {}
         names: dict[str, str] = {}
         for alias, source in sources.items():
             relation = self.relation_of(source)
@@ -2192,6 +3245,7 @@ class _Run:
                 names[alias] = graph.label(relation)
             elif isinstance(source, Scope) and id(source) in infos:
                 unique[alias] = infos[id(source)].unique
+                grouped[alias] = infos[id(source)].grouped
                 names[alias] = f'the subquery {alias}'
             else:
                 unique[alias] = []
@@ -2206,7 +3260,7 @@ class _Run:
             if isinstance(node, (exp.Unnest, exp.TableFromRows))
             or (isinstance(node, exp.Lateral) and not isinstance(node.this, exp.Subquery))
         }
-        for item in group.expressions if isinstance(group, exp.Group) else []:
+        for item in group.expressions if isinstance(group, exp.Group) and not _subtotals(group) else []:
             if isinstance(item, exp.Column) and item.table in sources:
                 fixed[item.table].add(item.name.lower())
             elif len(tables := {c.table for c in item.find_all(exp.Column)}) == 1 and tables <= unnested:
@@ -2235,9 +3289,33 @@ class _Run:
             a: self.checker.names_for(r) for a, src in sources.items() if (r := self.relation_of(src))
         }
         counted = [a for a in aliases if a not in anti and a not in exploded]
-        kept = [e for e in equalities if e.left in counted and e.right in counted]
+        joins = select.args.get('joins') or []
+
+        def pairing(e: _Join) -> bool:
+            # A LEFT or FULL join keeps every row of the sources before it: an equality in its ON
+            # between two of them pairs nothing.
+            join = joins[e.join] if e.join is not None and e.join < len(joins) else None
+            return (
+                join is None
+                or str(join.side or '').upper() not in ('LEFT', 'FULL')
+                or bool(_joined(join.this) & {e.left, e.right})
+            )
+
+        kept = [e for e in equalities if e.left in counted and e.right in counted and pairing(e)]
+        safe = [
+            e
+            for e in self.equalities(select, set(aliases), exp.NullSafeEQ)
+            if e.left in counted and e.right in counted and pairing(e)
+        ]
+        loose = [(e.left, e.left_column, e.right, e.right_column) for e in safe]
+        pairs = [(e.left, e.left_column, e.right, e.right_column) for e in kept]
         reach = reachable(
-            counted, [(e.left, e.left_column, e.right, e.right_column) for e in kept], reaching, fixed
+            counted,
+            pairs,
+            reaching,
+            fixed,
+            loose,
+            grouped,
         )
         fans: dict[str, _Fan] = {}
         preserved: list[str] = []
@@ -2247,12 +3325,13 @@ class _Run:
                 preserved.append(alias)
                 continue
             others = [a for a in counted if a not in reached]
-            fan = self.fan(scope, alias, reached, others, kept, unique, names)
+            fan = self.fan(scope, alias, reached, others, kept, unique, names, safe, grouped)
             if fan is None and repeating:
                 fan = _Fan(
                     names[alias],
                     repeating[0],
                     f'{repeating[0]} unnests an array, so each {names[alias]} row repeats once per element',
+                    certain=True,
                 )
             if fan is not None:
                 fans[alias] = fan
@@ -2269,11 +3348,16 @@ class _Run:
         for window, agg in [] if group is not None or aggregates else _windowed(select):
             # Within a window's partition its columns are fixed, as a group's are.
             partition = {**fixed}
-            for item in window.args.get('partition_by') or []:
+            for item in _partition(window, select) or []:
                 if isinstance(item, exp.Column) and item.table in sources:
                     partition[item.table] = partition.get(item.table, set()) | {item.name.lower()}
             over = reachable(
-                counted, [(e.left, e.left_column, e.right, e.right_column) for e in kept], reaching, partition
+                counted,
+                pairs,
+                reaching,
+                partition,
+                loose,
+                grouped,
             )
             spread = [a for a in repeating if not partition.get(a)]
             windowed = {
@@ -2283,30 +3367,37 @@ class _Run:
                 if (f := fans.get(a)) is not None
             }
             self.aggregate(scope, select, agg, windowed, [a for a in counted if len(over[a]) == len(counted)])
+        listed = _listing(select)
         if group is not None or aggregates:
             for agg in aggregates:
                 self.aggregate(scope, select, agg, fans, preserved)
+            if listed:
+                # An UNNEST in the SELECT list runs after the grouping: each group's row repeats
+                # once per element, so the groups make no key.
+                for expression in select.expressions:
+                    info.fanned[expression.alias_or_name.lower()] = _Fan(
+                        'group',
+                        'unnested element',
+                        f'{listed[0].alias_or_name} unnests an array in the SELECT list, so each group '
+                        'repeats once per element',
+                        certain=True,
+                    )
+                return info
             info.unique = self.grouped_unique(select)
+            info.grouped = list(info.unique)
             return info
-        listed = [
-            e
-            for e in select.expressions
-            if any(_owner(x) is select for x in e.find_all(exp.Explode, exp.Unnest))
-        ]
         if listed:
             # An UNNEST in the SELECT list repeats each row once per element of the array.
             for alias in counted:
-                fans.setdefault(
-                    alias,
-                    _Fan(
-                        names[alias],
-                        'unnested element',
-                        f'{listed[0].alias_or_name} unnests an array in the SELECT list, so each {names[alias]} row '
-                        'repeats once per element',
-                    ),
+                fans[alias] = _Fan(
+                    names[alias],
+                    'unnested element',
+                    f'{listed[0].alias_or_name} unnests an array in the SELECT list, so each {names[alias]} row '
+                    'repeats once per element',
+                    certain=True,
                 )
         distinct = select.args.get('distinct') is not None
-        if distinct:
+        if distinct and not listed:
             # Rows made distinct on a key of a source no longer repeat that source.
             for alias in list(fans):
                 if any(self.outputs(select, alias, keys) is not None for keys in unique.get(alias, [])):
@@ -2321,7 +3412,9 @@ class _Run:
                 if fan is not None:
                     info.fanned.setdefault(name, fan)
         if distinct:
-            info.unique = [frozenset(e.alias_or_name.lower() for e in select.expressions)]
+            # A column the same on every row (a constant) tells no two rows apart.
+            info.unique = [frozenset(e.alias_or_name.lower() for e in select.expressions if not _constant(e))]
+            info.grouped = list(info.unique)
         limit = select.args.get('limit')
         if (
             isinstance(limit, exp.Limit)
@@ -2329,14 +3422,105 @@ class _Run:
             and limit.expression.name == '1'
         ):
             info.unique = [frozenset()]  # at most one row
-        for alias in preserved:
+        # An UNNEST in the SELECT list runs after DISTINCT ON, QUALIFY and WHERE, so it repeats the
+        # rows they keep: only its whole output, made DISTINCT, is unique.
+        for alias in [] if listed else preserved:
             for keys in unique.get(alias, []):
                 mapped = self.outputs(select, alias, keys)
                 if mapped is not None and mapped not in info.unique:
                     info.unique.append(mapped)
+        for keys in [] if listed else self.first_rows(select, sources):
+            if keys not in info.unique:
+                info.unique.append(keys)
+            # A partition of NULL is one partition, so its first row is one row too.
+            if keys not in info.grouped:
+                info.grouped.append(keys)
         if is_root:
             self.grain(info)
         return info
+
+    def first_rows(self, select: exp.Select, sources: dict[str, Any]) -> list[frozenset[str]]:
+        """The output columns ``select`` keeps one row per value of, by keeping the first row of
+        each partition: ``QUALIFY ROW_NUMBER() OVER (PARTITION BY k ...) = 1``, or ``WHERE rn = 1``
+        over a single subquery whose ``rn`` is that ROW_NUMBER(). RANK() and DENSE_RANK() keep
+        every row that ties, so they show nothing."""
+        found: list[frozenset[str]] = []
+        clauses = [select.args.get('qualify')]
+        if len(sources) == 1 and not select.args.get('joins'):
+            clauses.append(select.args.get('where'))
+        for clause in clauses:
+            if not isinstance(clause, (exp.Where, exp.Qualify)):
+                continue
+            for part in split_conjuncts(clause.this):
+                kind = type(part)
+                if kind not in _COMPARISONS:
+                    continue
+                for ranked, bound, compared in (
+                    (part.this, part.expression, kind),
+                    (part.expression, part.this, _COMPARISONS[kind]),
+                ):
+                    value = _number(bound)
+                    first = (compared is exp.EQ and value == 1) or (compared is exp.LTE and value == 1)
+                    first = first or (compared is exp.LT and value == 2)
+                    if not first:
+                        continue
+                    keys = self.partition(select, sources, ranked)
+                    if keys is not None and keys not in found:
+                        found.append(keys)
+        return found
+
+    def partition(
+        self, select: exp.Select, sources: dict[str, Any], ranked: exp.Expr
+    ) -> frozenset[str] | None:
+        """The output columns of ``select`` that pass through the PARTITION BY of the ROW_NUMBER()
+        that ``ranked`` is, or reads from the select's single subquery."""
+        window: exp.Expr | None = ranked
+        inner: exp.Select | None = None
+        alias = ''
+        if isinstance(ranked, exp.Column):
+            own = next(
+                (e for e in select.expressions if e.alias_or_name.lower() == ranked.name.lower()), None
+            )
+            source = sources.get(ranked.table)
+            if ranked.table and isinstance(source, Scope) and isinstance(source.expression, exp.Select):
+                inner, alias = source.expression, ranked.table
+                if _listing(inner):
+                    return None  # its ROW_NUMBER numbers the rows before they repeat per element
+                window = next(
+                    (_output(e) for e in inner.expressions if e.alias_or_name.lower() == ranked.name.lower()),
+                    None,
+                )
+            elif own is not None and not ranked.table:
+                window = _output(own)
+        if not (isinstance(window, exp.Window) and isinstance(window.this, exp.RowNumber)):
+            return None
+        partition = _partition(window, inner if inner is not None else select)
+        if partition is None:
+            return None
+        names: set[str] = set()
+        for column in partition:
+            if not isinstance(column, exp.Column):
+                return None
+            if inner is None:
+                mapped = self.outputs(select, column.table, frozenset({column.name.lower()}))
+            else:
+                # The subquery's output that passes the partition column through, then the
+                # select's output that passes that one through.
+                passed = next(
+                    (
+                        e.alias_or_name.lower()
+                        for e in inner.expressions
+                        if isinstance(value := _output(e), exp.Column)
+                        and value.table == column.table
+                        and value.name.lower() == column.name.lower()
+                    ),
+                    None,
+                )
+                mapped = self.outputs(select, alias, frozenset({passed})) if passed is not None else None
+            if mapped is None:
+                return None
+            names |= mapped
+        return frozenset(names)
 
     def outputs(self, select: exp.Select, alias: str, keys: frozenset[str]) -> frozenset[str] | None:
         """The output names that pass ``alias``'s ``keys`` through, or None if one is not selected."""
@@ -2361,6 +3545,18 @@ class _Run:
         group = select.args.get('group')
         if group is None:
             return [frozenset()]  # an aggregate without GROUP BY returns one row
+        if _subtotals(group):
+            return []  # subtotal rows repeat the values of the columns they roll up
+        if group.args.get('all'):
+            # GROUP BY ALL groups by every item that is not an aggregate; one in a subquery of the
+            # item is computed once per group, so the item is still a grouping item.
+            return [
+                frozenset(
+                    e.alias_or_name.lower()
+                    for e in select.expressions
+                    if not any(_owner(a) is select for a in _output(e).find_all(exp.AggFunc, exp.Window))
+                )
+            ]
         names = set()
         for item in group.expressions:
             name = next(
@@ -2372,7 +3568,9 @@ class _Run:
             names.add(name)
         return [frozenset(names)]
 
-    def equalities(self, select: exp.Select, aliases: set[str]) -> list[_Join]:
+    def equalities(self, select: exp.Select, aliases: set[str], kind: type[exp.Expr] = exp.EQ) -> list[_Join]:
+        """The equalities (or, with ``kind``, the ``IS NOT DISTINCT FROM`` comparisons) between
+        columns of two sources in the ON and WHERE clauses."""
         found = []
         clauses: list[tuple[int | None, exp.Expr | None]] = [
             (index, join.args.get('on')) for index, join in enumerate(select.args.get('joins') or [])
@@ -2383,7 +3581,7 @@ class _Run:
             if not isinstance(clause, exp.Expr):
                 continue
             for position, part in enumerate(split_conjuncts(clause)):
-                if not isinstance(part, exp.EQ):
+                if not isinstance(part, kind):
                     continue
                 left, right = part.this, part.expression
                 if (
@@ -2480,13 +3678,66 @@ class _Run:
         equalities: list[_Join],
         unique: dict[str, list[frozenset[str]]],
         names: dict[str, str],
+        null_safe: list[_Join] | None = None,
+        grouped: dict[str, list[frozenset[str]]] | None = None,
     ) -> _Fan | None:
-        """Why ``alias``'s rows repeat, when the project gives evidence that they do."""
+        """Why ``alias``'s rows repeat, when the project gives evidence that they do. A source
+        joined on every column of one of its unique keys to the other sources matches at most one
+        of its rows for each combination of theirs, so it repeats nothing they do not: such sources
+        are set aside one at a time, each against the sources still left, which then fix it. Only
+        the equalities of an inner join's ON or of the WHERE clause fix a row: an outer join keeps
+        the rows its ON does not match."""
         graph = self.graph
-        for other in others:
+        left = set(reached) | set(others)
+        select = scope.expression
+        joins = (select.args.get('joins') or []) if isinstance(select, exp.Select) else []
+
+        def inner(eq: _Join) -> bool:
+            if eq.join is None:
+                return True
+            join = joins[eq.join] if eq.join < len(joins) else None
+            return join is not None and not join.side and str(join.kind or '').upper() in ('', 'INNER')
+
+        fixing = [eq for eq in equalities if inner(eq)]
+        fixing_safe = [eq for eq in null_safe or [] if inner(eq)]
+
+        def joined(joins: list[_Join], source: str) -> set[str]:
+            return {
+                eq.right_column if eq.right == source else eq.left_column
+                for eq in joins
+                if source in (eq.left, eq.right) and ({eq.left, eq.right} - {source}) <= left
+            }
+
+        def connected() -> bool:
+            seen, stack = {alias}, [alias]
+            while stack:
+                current = stack.pop()
+                for eq in [*equalities, *(null_safe or [])]:
+                    for a, b in ((eq.left, eq.right), (eq.right, eq.left)):
+                        if a == current and b in left and b not in seen:
+                            seen.add(b)
+                            stack.append(b)
+            return seen == left
+
+        changed = True
+        while changed:
+            changed = False
+            for other in [o for o in others if o in left]:
+                left.discard(other)
+                strict = joined(fixing, other)
+                covered = any(k and k <= strict for k in unique.get(other, [])) or any(
+                    k and k <= strict | joined(fixing_safe, other) for k in (grouped or {}).get(other, [])
+                )
+                # Set aside, it must leave no source joined to the others through it alone.
+                if covered and connected():
+                    changed = True
+                else:
+                    left.add(other)
+        for other in [o for o in others if o in left]:
             pairs = [
                 (eq.left_column, eq.right_column) if eq.right == other else (eq.right_column, eq.left_column)
-                for eq in equalities
+                # A join on IS NOT DISTINCT FROM alone is a join too.
+                for eq in [*equalities, *(null_safe or [])]
                 if other in (eq.left, eq.right) and ({eq.left, eq.right} - {other}) & reached
             ]
             if not pairs:
@@ -2508,6 +3759,24 @@ class _Run:
                         f'{names[other]} rows can match one {names[alias]} row',
                         f'{names[other]} to one row per {", ".join(columns)}',
                     )
+            source = scope.sources.get(other)
+            held = self.infos.get(id(source)) if isinstance(source, Scope) else None
+            spread = next(
+                (
+                    f
+                    for c in columns
+                    if held is not None and (f := held.fanned.get(c)) is not None and f.certain
+                ),
+                None,
+            )
+            if spread is not None:
+                # The subquery's own SQL repeats the rows its join column comes from.
+                return _Fan(
+                    names[alias],
+                    names[other],
+                    f'{spread.evidence}, so many {names[other]} rows can match one {names[alias]} row',
+                    f'{names[other]} to one row per {", ".join(columns)}',
+                )
             keys = sorted((sorted(k) for k in unique.get(other, []) if k), key=lambda k: (len(k), k))
             if keys:
                 key = ', '.join(keys[0])
@@ -2528,7 +3797,108 @@ class _Run:
                     f'{names[other]} to one row per {", ".join(columns)}',
                     severity='info',
                 )
+        # Each condition between sources, with whether it pairs their rows: a LEFT or FULL join's ON
+        # pairs only the rows of the source it joins, and keeps every row of the others.
+        conditions: list[tuple[exp.Expr, bool]] = []
+        where = select.args.get('where') if isinstance(select, exp.Select) else None
+        for clause, by in [
+            *((j.args.get('on'), j) for j in joins),
+            (where.this if isinstance(where, exp.Where) else None, None),
+        ]:
+            outer = by is not None and str(by.side or '').upper() in ('LEFT', 'FULL')
+            for part in split_conjuncts(clause) if isinstance(clause, exp.Expr) else []:
+                tables = {c.table for c in part.find_all(exp.Column)}
+                if len(tables) > 1:
+                    conditions.append((part, not outer or bool(_joined(by.this) & tables)))
+        for other in [o for o in others if o in left]:
+            touching = [
+                (p, pairs) for p, pairs in conditions if other in {c.table for c in p.find_all(exp.Column)}
+            ]
+            paired = [p for p, pairs in touching if pairs]
+            if any(isinstance(p, (exp.EQ, exp.NullSafeEQ)) for p in paired):
+                continue  # joined on an equality the check cannot read as a key, as before
+            if any(isinstance(p, _RANGES) for p in paired) or len(paired) < len(touching):
+                # Joined on a range alone, or on a condition that pairs nothing, any number of its
+                # rows can match.
+                return _Fan(
+                    names[alias],
+                    names[other],
+                    f'{names[other]} is joined on no equality that pairs its rows, so many of them can match '
+                    f'one {names[alias]} row',
+                )
         return None
+
+    def fixed_by_group(self, scope: Scope, select: exp.Select, alias: str) -> bool:
+        """Whether the GROUP BY holds a key of the source ``alias`` that no row holds NULL in among
+        its columns, so that each group reads one of its rows, however often the join repeats it:
+        an average of the copies of one value is that value. A unique test lets many rows hold
+        NULL, which one group would mix, so only the keys of :meth:`Checker.filled_keys` count, or
+        those a GROUP BY or DISTINCT makes, which keep one row for NULL; and a key only an ontology
+        pack presumes counts for nothing here."""
+        group = select.args.get('group')
+        if not isinstance(group, exp.Group) or _subtotals(group):
+            return False
+        names = {
+            item.name.lower()
+            for item in group.expressions
+            if isinstance(item, exp.Column) and item.table == alias
+        }
+        source = scope.sources.get(alias)
+        relation = self.relation_of(source)
+        if relation is not None:
+            keys = self.checker.filled_keys(relation)
+        else:
+            info = self.infos.get(id(source)) if isinstance(source, Scope) else None
+            keys = info.grouped if info is not None else []
+        return any(key and key <= names for key in keys)
+
+    def measured(self, scope: Scope, column: exp.Column, node: Node | None, alias: str) -> bool:
+        """Whether the project adds up the value ``column`` reads once per row of the source
+        ``alias`` keeps the grain of, as summing it over this join does: a column it repeats on
+        those rows (:meth:`Checker.measured_at`), or, for a CTE's aggregate grouped by its key, a
+        column that holds the same aggregate grouped by the same columns
+        (:meth:`Checker.summed_at`)."""
+        keys = self.key_origins(scope, alias)
+        if not keys:
+            return False
+        if node is not None:
+            return self.checker.measured_at(node, keys) is not None
+        source = scope.sources.get(column.table)
+        if not isinstance(source, Scope) or not isinstance(source.expression, exp.Select):
+            return False
+        select = source.expression
+        value = next(
+            (
+                _strip(_output(e))
+                for e in select.expressions
+                if e.alias_or_name.lower() == column.name.lower()
+            ),
+            None,
+        )
+        group = select.args.get('group')
+        if value is None or group is None or not any(True for _ in _aggregates(select)):
+            return False
+        grouped = [self.physical(source, c) if isinstance(c, exp.Column) else None for c in group.expressions]
+        if not grouped or not all(grouped):
+            return False
+        tree = self.canon.expression(value, source, self.schema)
+        groups = frozenset(self.checker.origin(n.id) for n in grouped if n is not None)
+        return self.checker.summed_at(self.checker.form(tree), groups, keys) is not None
+
+    def key_origins(self, scope: Scope, alias: str) -> frozenset[str]:
+        """The origins of the unique columns of one source of ``scope``."""
+        source = scope.sources.get(alias)
+        relation = self.relation_of(source)
+        if relation is not None:
+            return self.checker.key_origins(relation)
+        info = self.infos.get(id(source)) if isinstance(source, Scope) else None
+        if info is None:
+            return frozenset()
+        return frozenset(
+            self.checker.origin(node.id)
+            for keys in info.unique
+            if len(keys) == 1 and (node := info.physical.get(next(iter(keys)))) is not None
+        )
 
     def presumed(self, scope: Scope, alias: str, column: str) -> tuple[Node, str] | None:
         """The column ``alias.column`` with the pack that presumes it unique, when only a pack
@@ -2589,7 +3959,7 @@ class _Run:
         ):
             self.count_rows(agg, fans, preserved, self.called)
             return
-        for column in _own_columns(agg, select):
+        for column in _valued(agg, select):
             fan = fans.get(column.table)
             source = scope.sources.get(column.table)
             if fan is None and isinstance(source, Scope) and id(source) in self.infos:
@@ -2597,6 +3967,10 @@ class _Run:
             if fan is None:
                 continue
             node = self.physical(scope, column)
+            if any(self.measured(scope, column, node, alias) for alias in preserved):
+                continue
+            if isinstance(agg, exp.Avg) and self.fixed_by_group(scope, select, column.table):
+                continue
             what = self.graph.label(node) if node is not None else f'{column.table}.{column.name}'
             function = agg.key.upper()
             text = agg.sql(dialect=self.checker.sqlglot)
