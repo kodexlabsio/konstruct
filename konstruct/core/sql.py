@@ -2168,8 +2168,10 @@ class Canonical:
 
     def column(self, table: exp.Table, name: str, path: str = '') -> str:
         """How the column ``name`` of ``table``, read through the CTE references ``path`` names, is
-        named in canonical text: by its relation (see :meth:`relation`)."""
-        return f'{self.relation(table, path)}.{sql_part(name, self.dialect)}'
+        named in canonical text: by its relation (see :meth:`relation`), and alone for a table
+        function's, whose rows are of no relation, as the rows of an UNNEST or VALUES are not."""
+        column = sql_part(name, self.dialect)
+        return f'{self.relation(table, path)}.{column}' if table.name else column
 
     def segment(self, reference: exp.Expr) -> str:
         """The path segment of ``reference``, a reference to a CTE, if the CTE is referenced more
@@ -2741,7 +2743,8 @@ def _references(
             source = sources.of(column, scope)
             fields = _fields_read(column)
             if isinstance(source, exp.Table):
-                add(table_key(source, default_catalog, default_db), '.'.join((column.name, *fields)))
+                if source.name:  # a table function's rows are of no relation
+                    add(table_key(source, default_catalog, default_db), '.'.join((column.name, *fields)))
             elif isinstance(source, Scope):
                 try:
                     traced = tracer.trace(column.name, source, schema)

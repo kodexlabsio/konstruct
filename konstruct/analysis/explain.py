@@ -304,10 +304,23 @@ def _read_as(tree: exp.Expr, path: str) -> exp.Expr:
     is what the join means."""
     for column in tree.find_all(exp.Column):
         table = column.args.get('table')
-        if table is not None:
-            relation, reading = split_reading(table.name)
-            column.set('table', exp.to_identifier(reading_key(relation, reading + path), quoted=True))
+        if table is None and _bound(column):
+            continue
+        # A column of no relation (of a table function, VALUES or an UNNEST) is named as read
+        # through the reading too (``"#(base#1)".amount``): it is the reading's rows that differ.
+        relation, reading = split_reading(table.name) if table is not None else ('', '')
+        column.set('table', exp.to_identifier(reading_key(relation, reading + path), quoted=True))
     return tree
+
+
+def _bound(column: exp.Column) -> bool:
+    """Whether ``column`` is a parameter of a lambda around it (``x`` in ``x -> x + 1``)."""
+    node = column.find_ancestor(exp.Lambda)
+    while node is not None:
+        if any(p.name == column.name for p in node.expressions):
+            return True
+        node = node.find_ancestor(exp.Lambda)
+    return False
 
 
 class ConditionTerms(NamedTuple):
