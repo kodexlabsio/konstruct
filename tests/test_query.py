@@ -50,8 +50,9 @@ def test_impact_of_a_staging_column(project: Project) -> None:
         'orders.bank_transfer_amount',
         'orders.gift_card_amount',
         'customer_ltv.lifetime_value',
+        'finance_orders.order_value',
     }
-    assert labels(walk.relations) == ['customers', 'orders']
+    assert labels(walk.relations) == ['customers', 'finance_orders', 'orders']
     assert labels(walk.joins_and_filters) == ['customer_ltv']
     assert labels(walk.exposures) == ['customer_dashboard']
     assert set(labels(walk.tasks)) == {
@@ -61,10 +62,10 @@ def test_impact_of_a_staging_column(project: Project) -> None:
     assert 'not_null_orders_amount' in labels(walk.tests)
     ltv = next(c for c in walk.columns if c.label == 'customer_ltv.lifetime_value')
     assert (ltv.depth, ltv.transform, ltv.through) == (2, 'direct', 'jaffle_shop_daily.build_customer_ltv')
-    assert walk.total == 7 + 2 + 1 + 5 + 1 + 2 + 2
+    assert walk.total == 8 + 3 + 1 + 5 + 1 + 2 + 2
     assert (
         walk.summary()
-        == '7 columns, 3 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.'
+        == '8 columns, 4 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.'
     )
 
 
@@ -119,7 +120,7 @@ def test_search_and_list(project: Project) -> None:
     assert project.search('payments', kinds=['seed']).results[0].label == 'raw_payments'
     assert str(project.search('zzz')) == "Nothing matches 'zzz'."
     models = labels(project.list(['model']).items)
-    assert models == ['customers', 'orders', 'stg_customers', 'stg_orders', 'stg_payments']
+    assert models == ['customers', 'finance_orders', 'orders', 'stg_customers', 'stg_orders', 'stg_payments']
     everything = project.list()
     assert {i.kind for i in everything.items} == {'model', 'seed', 'table'}
     assert str(project.list(['snapshot'])) == 'No snapshot nodes.'

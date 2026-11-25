@@ -188,7 +188,10 @@ def test_runs_the_gate_after_an_edit(
     assert main(['hook', 'post-edit']) == 0
     answer = json.loads(capsys.readouterr().out)
     assert answer['decision'] == 'block'
-    assert 'breaking: stg_payments.amount is removed but still read by customers, orders' in answer['reason']
+    assert (
+        'breaking: stg_payments.amount is removed but still read by customers, finance_orders, orders'
+        in answer['reason']
+    )
     assert answer['reason'].endswith(f'\n\n{UNTRUSTED_CONTENT}')
     # The user's graph is left as it was; the hook builds into its own directory.
     assert (repo / 'konstruct-out' / 'graph.json').read_bytes() == graph

@@ -8,7 +8,7 @@ Built <time> from `<root>` by Konstruct <version> in <seconds>s. SQL dialect: du
 |-------|-------|
 | dbt projects | 1 |
 | warehouses | 1 |
-| dbt models | 5 |
+| dbt models | 6 |
 | airflow dags | 1 |
 | dagster assets | 0 |
 | dagster ops | 0 |
@@ -17,28 +17,28 @@ Built <time> from `<root>` by Konstruct <version> in <seconds>s. SQL dialect: du
 
 | Node kind | Count |
 |-----------|-------|
-| column | 44 |
+| column | 48 |
 | dag | 1 |
 | exposure | 1 |
-| model | 5 |
+| model | 6 |
 | seed | 3 |
 | table | 1 |
 | task | 6 |
 | term | 6 |
-| test | 24 |
+| test | 26 |
 
 | Edge kind | Count |
 |-----------|-------|
-| contains | 44 |
+| contains | 48 |
 | defines | 8 |
-| derived_from | 36 |
-| feeds | 21 |
+| derived_from | 40 |
+| feeds | 28 |
 | precedes | 5 |
 | relates_to | 3 |
-| runs | 38 |
-| tests | 27 |
+| runs | 40 |
+| tests | 29 |
 
-Column lineage covers 32 of 32 columns of models and SQL-built tables (100%).
+Column lineage covers 36 of 36 columns of models and SQL-built tables (100%).
 
 ## Most used columns
 
@@ -46,16 +46,16 @@ Columns with the most direct dependants (derived columns and joins).
 
 | Column | Dependants |
 |--------|------------|
-| `stg_payments.amount` | 6 |
-| `stg_orders.order_id` | 4 |
+| `stg_payments.amount` | 7 |
+| `stg_orders.order_id` | 6 |
+| `stg_orders.order_date` | 5 |
+| `stg_orders.customer_id` | 4 |
 | `stg_payments.payment_method` | 4 |
-| `stg_orders.order_date` | 3 |
+| `stg_payments.order_id` | 3 |
 | `customers.customer_lifetime_value` | 2 |
 | `customers.number_of_orders` | 2 |
 | `stg_customers.customer_id` | 2 |
-| `stg_orders.customer_id` | 2 |
-| `stg_payments.order_id` | 2 |
-| `customers.customer_id` | 1 |
+| `stg_orders.status` | 2 |
 
 ## Business terms
 

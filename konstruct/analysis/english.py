@@ -1151,7 +1151,9 @@ def _grain(graph: Graph, column: Node, terms: list[Term], ontology: Ontology | N
     for entity in ontology.entities:
         if label in entity.relations:
             key = next((k for k in entity.keys if k.startswith(f'{label}.')), entity.key)
-            evidence = next((e for e in entity.evidence if key in e), None)
+            # The key as a whole name: orders.order_id is not the key finance_orders.order_id names.
+            named = re.compile(rf'(?<![\w.]){re.escape(key)}(?![\w.])')
+            evidence = next((e for e in entity.evidence if named.search(e)), None)
             because = f', by the {evidence}' if evidence else ''
             return f'one row per {entity.name}: {key} is its key{because}'
     return None

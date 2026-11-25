@@ -10,9 +10,9 @@ Results (seed 1729):
 
 | Project | Models | Claimed column edges | Confirmed | Influences via joins and filters | Unexplained |
 |---------|--------|----------------------|-----------|----------------------------------|-------------|
-| `examples/jaffle_shop` | 6 | 36 | 36 (100%) | 33 | 0 |
+| `examples/jaffle_shop` | 7 | 40 | 40 (100%) | 39 | 0 |
 | dbt Labs' jaffle-shop (pinned commit) | 13 | 87 | 87 (100%) | 61 | 0 |
-| `examples/jaffle_shop` on Postgres (built with dbt-postgres) | 5 | 31 | 31 (100%) | not counted | 0 |
+| `examples/jaffle_shop` on Postgres (built with dbt-postgres) | 6 | 35 | 35 (100%) | not counted | 0 |
 | 300 generated queries on generated data (differential test) | 300 | not counted | not counted | not counted | 0 |
 
 The tests also make sure the verifier catches wrong lineage, not just confirms right lineage: a deleted edge is reported as unexplained, a fabricated edge as not exercised, and a deleted filter reference as an unexplained change in row count. Two further results:
@@ -28,7 +28,7 @@ The same run checks the [ontology](ontology.md) against the data. Each key of an
 ```text
 $ konstruct verify
 ...
-Ontology: 5 of 5 keys confirmed, 0 failed, 0 not checked; 2 of 2 relationships confirmed, 0 failed, 0 not checked.
+Ontology: 6 of 6 keys confirmed, 0 failed, 0 not checked; 2 of 2 relationships confirmed, 0 failed, 0 not checked.
 ```
 
 With `-m`, only the keys and relationships whose tables are all among the named models are checked, nothing outside them is read, and what earlier runs found of the others is kept. `--no-ontology` leaves the checks out. They read each table whole: on a table of 1,000,000 orders referring to 100,000 customers, checking the two keys and the relationship takes 0.12 s on DuckDB and 0.38 s on Postgres, and on 10,000,000 orders 0.96 s and 5.4 s (`uv run python .kodex/scripts/integrity_benchmark.py 1000000`, with `--postgres URL` for Postgres); `verify.json` gives the time each run took as `ontology_seconds`.

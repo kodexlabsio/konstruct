@@ -55,6 +55,7 @@ def test_openlineage_events_match_the_specification(project: Project) -> None:
         'jaffle_shop.main.stg_payments',
         'jaffle_shop.main.customers',
         'jaffle_shop.main.orders',
+        'jaffle_shop.main.finance_orders',
         'jaffle_shop.reporting.customer_ltv',
     }
     job_event = validator('JobEvent')

@@ -169,10 +169,20 @@ def test_terms_group_columns_named_differently(tmp_path: Path) -> None:
 
 @pytest.mark.dbt
 def test_no_noise_on_the_example(jaffle_built_graph: Path, tmp_path: Path) -> None:
+    """The example's one conflict is the one it was given: finance_orders leaves out returned
+    orders, which orders.amount counts. Copies (customer_ltv.lifetime_value) and columns that
+    differ only in grain are not conflicts."""
     copy = tmp_path / 'jaffle_shop'
     shutil.copytree(jaffle_built_graph / 'konstruct-out', copy / 'konstruct-out')
     result = Project(copy).conflicts()
-    assert result.conflicts == []
+    [conflict] = result.conflicts
+    assert (conflict.idea, conflict.a.label, conflict.b.label) == (
+        'Order amount',
+        'finance_orders.order_value',
+        'orders.amount',
+    )
+    assert [(d.kind, d.side) for d in conflict.differences] == [('filter', 'a'), ('join', 'a'), ('join', 'b')]
+    assert conflict.differences[0].path == 'models/finance_orders.sql'
     assert result.candidates > 10
 
 

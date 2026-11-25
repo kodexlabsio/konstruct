@@ -199,7 +199,7 @@ def test_impact_of_a_relation_is_a_tree_of_relations(jaffle_built_graph: Path) -
     text = str(Project(jaffle_built_graph).impact('stg_orders'))
     assert '\nLineage\n  stg_orders ' in text
     assert re.search(r'^  \|  `- customer_ltv +table +via jaffle_shop_daily\.build_customer_ltv$', text, re.M)
-    assert '\nColumns (9)\n' in text
+    assert '\nColumns (12)\n' in text
 
 
 # SQL

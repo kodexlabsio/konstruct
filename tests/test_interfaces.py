@@ -680,6 +680,9 @@ def test_exit_statuses(
             patch.setattr(cli, 'cmd_list', lambda args, console: (_ for _ in ()).throw(KeyboardInterrupt))
             return status('-C', str(small), 'list')
 
+    quiet = tmp_path / 'quiet'  # one measure, so nothing to conflict with
+    quiet.mkdir()
+    (quiet / 'orders.sql').write_text('create table shop.orders as select 1 as amount')
     outcomes = {
         'build': status('build', str(small), '--no-warehouse'),
         'build --strict with warnings': status('build', str(small), '--no-warehouse', '--strict'),
@@ -710,7 +713,7 @@ def test_exit_statuses(
             '-C', str(revenue), 'conflicts', '--no-write', '--fail-on-conflict'
         ),
         'conflicts --fail-on-conflict finds none': status(
-            '-C', str(jaffle_built_graph), 'conflicts', '--no-write', '--fail-on-conflict'
+            '-C', str(quiet), 'conflicts', '--no-write', '--fail-on-conflict'
         ),
         'ontology with a broken rule': status('-C', str(misbound), 'ontology'),
         'ontology --strict with a broken rule': status('-C', str(misbound), 'ontology', '--strict'),

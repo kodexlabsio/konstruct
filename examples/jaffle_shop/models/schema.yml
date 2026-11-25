@@ -82,3 +82,22 @@ models:
         description: Amount of the order (AUD) paid for by gift card
         tests:
           - not_null
+
+  - name: finance_orders
+    description: Orders as finance reports them, without the orders returned or awaiting return
+
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+        description: This is a unique identifier for an order
+
+      - name: customer_id
+        description: Foreign key to the customers table
+
+      - name: order_date
+        description: Date (UTC) that the order was placed
+
+      - name: order_value
+        description: Total payments (AUD) on the order, for orders not returned or awaiting return

@@ -248,11 +248,12 @@ def test_revenue_in_other_words_finds_the_revenue_measures(example: Graph, quest
 
 @pytest.mark.dbt
 def test_each_result_means_most_of_the_question(example: Graph) -> None:
-    # The order amount is the sales, and its order's status says which were returned; the
-    # definition of a completed order says not returned. Lifetime value means sales but nothing
-    # about refunds, so it is not an answer.
+    # finance_orders.order_value is the payments on orders not returned, which is the answer; the
+    # order amount is the sales, and its order's status says which were returned; the definition
+    # of a completed order says not returned. Lifetime value means sales but nothing about
+    # refunds, so it is not an answer.
     found = labels(semantic.search(example, 'net sales after refunds', limit=10))
-    assert set(found[:2]) == {'Order amount', 'Completed order'}
+    assert set(found[:3]) == {'finance_orders.order_value', 'Order amount', 'Completed order'}
     assert 'Customer lifetime value' not in found
     assert semantic.search(example, 'net sales').results == []
 

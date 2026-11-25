@@ -9,3 +9,6 @@ konstruct changes to the original:
 - Added four tests to models/staging/schema.yml: not_null and relationships tests on
   stg_payments.order_id (to stg_orders.order_id) and on stg_orders.customer_id (to
   stg_customers.customer_id).
+- Added models/finance_orders.sql and its entry in models/schema.yml: the payments on each order
+  that was not returned, a second definition of the order amount that differs from orders.amount
+  on the data, for `konstruct verify --conflicts` to find.

@@ -168,7 +168,7 @@ def test_map_keyboard_filters_and_list(jaffle_built_graph: Path, open_map: Any) 
     page = open_map(jaffle_built_graph / 'konstruct-out' / 'graph.html')
     canvas = page.locator('#map')
     assert canvas.get_attribute('role') == 'application'
-    assert canvas.get_attribute('aria-label') == 'Map of the project, 16 nodes'
+    assert canvas.get_attribute('aria-label') == 'Map of the project, 17 nodes'
     assert canvas.get_attribute('aria-describedby') == 'map-help'
     assert 'Enter opens the page' in page.inner_text('#map-help')
     page.focus('#map')
@@ -205,7 +205,7 @@ def test_map_keyboard_filters_and_list(jaffle_built_graph: Path, open_map: Any) 
     page.keyboard.press('Shift+Tab')
     assert page.evaluate(active) == '1'
     page.keyboard.press('End')
-    page.wait_for_function(f'() => ({active})() === "15"')
+    page.wait_for_function(f'() => ({active})() === "16"')
     page.keyboard.press('Shift+Tab')
     page.keyboard.press('Shift+Tab')
     assert page.evaluate('() => document.activeElement.id') == 'map'
@@ -219,7 +219,7 @@ def test_map_keyboard_filters_and_list(jaffle_built_graph: Path, open_map: Any) 
     assert page.locator('.map-scroller li').count() < before
     assert 'dbt_run_marts' not in page.inner_text('.map-scroller')
     shown = page.inner_text('.map-list .map-count')
-    assert shown.endswith('of 16 nodes shown') and int(shown.split()[0]) < 16
+    assert shown.endswith('of 17 nodes shown') and int(shown.split()[0]) < 17
 
     # The list locates a node on the map; its link opens the page.
     page.click('.map-scroller li:has-text("customers") button.locate')

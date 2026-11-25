@@ -10,7 +10,7 @@ project = konstruct.Project('path/to/repo')
 project.build(update=True)
 
 walk = project.impact('stg_payments.amount')
-print(walk.summary())  # 7 columns, 3 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.
+print(walk.summary())  # 8 columns, 4 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.
 for column in walk.columns:
     print(column.depth, column.label, column.transform, column.path)
 ```
@@ -192,7 +192,7 @@ if change.breaking:
 print(change.selection.command())  # dbt build --select <only what changed>
 
 result = project.verify(seed=1729)
-print(result.totals())  # {'claimed': 36, 'confirmed': 36, ...}
+print(result.totals())  # {'claimed': 40, 'confirmed': 40, ...}
 
 tests = project.mutate(models=['orders'], max_mutants=10)
 print(tests.score)  # killed / (killed + survived)

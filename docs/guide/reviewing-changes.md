@@ -36,7 +36,7 @@ models/staging/stg_payments.sql  (model stg_payments, modified)
   changed  amount
              was  jaffle_shop.main.raw_payments.amount / 100
              now  jaffle_shop.main.raw_payments.amount / 100.0 * 1.2
-           affects 7 columns, 3 relations, 5 tests, 1 exposure and 2 tasks downstream (exposures:
+           affects 8 columns, 4 relations, 5 tests, 1 exposure and 2 tasks downstream (exposures:
            customer_dashboard)
   removed  payment_method
            BREAKS orders, which still reads it

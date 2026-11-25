@@ -336,7 +336,7 @@ def test_the_example_ontology(jaffle_built_graph: Path) -> None:
     assert set(entities) == {'customer', 'order', 'payment'}
     assert entities['customer'].relations == ['customers', 'stg_customers']
     assert entities['customer'].term == 'Customer'
-    assert entities['order'].relations == ['orders', 'stg_orders']
+    assert entities['order'].relations == ['finance_orders', 'orders', 'stg_orders']
     measures = {m.name: m for m in ontology.measures}
     assert set(measures) == {'Customer lifetime value', 'Order amount'}
     ltv = measures['Customer lifetime value']
@@ -662,9 +662,13 @@ def test_the_example_ontology_is_the_same_in_any_order(jaffle_built_graph: Path)
 def test_impact_and_trace_name_the_business_entities_they_reach(jaffle_built_graph: Path) -> None:
     project = Project(jaffle_built_graph)
     impact = project.impact('stg_payments.amount')
-    assert impact.entities == {'customer': ['customers'], 'order': ['orders'], 'payment': ['stg_payments']}
+    assert impact.entities == {
+        'customer': ['customers'],
+        'order': ['finance_orders', 'orders'],
+        'payment': ['stg_payments'],
+    }
     assert '\nBusiness entities (3)\n  customer  customers\n' in str(impact)
-    assert impact.to_dict()['entities']['order'] == ['orders']
+    assert impact.to_dict()['entities']['order'] == ['finance_orders', 'orders']
     trace = project.trace('customers.customer_lifetime_value')
     assert set(trace.entities) == {'customer', 'payment'}
     assert Project(jaffle_built_graph).impact('raw_customers').entities == {

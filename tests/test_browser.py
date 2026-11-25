@@ -115,7 +115,7 @@ def test_overview_and_model_page(jaffle_built_graph: Path, open_page: Any) -> No
     assert page.inner_text('#page h1') == 'jaffle_shop'
     assert page.title() == 'jaffle_shop · Konstruct'
     stats = page.inner_text('#stats')
-    assert '44\ncolumns' in stats and '5\nmodels' in stats
+    assert '48\ncolumns' in stats and '6\nmodels' in stats
     assert 'Column lineage' in page.inner_text('#page')
 
     # The project tree opens the model's page, with its lineage docked beneath it.
@@ -197,6 +197,7 @@ def test_links_selectors_and_full_screen(jaffle_built_graph: Path, open_page: An
     assert sorted(graph_ids(page)) == [
         'exposure.jaffle_shop.customer_dashboard',
         'model.jaffle_shop.customers',
+        'model.jaffle_shop.finance_orders',
         'model.jaffle_shop.orders',
         'model.jaffle_shop.stg_orders',
         'table.jaffle_shop.reporting.customer_ltv',
@@ -288,8 +289,8 @@ def test_columns_theme_language_and_export(jaffle_built_graph: Path, open_page: 
     page = open_page(jaffle_built_graph / 'konstruct-out' / 'graph.html', '#/lineage', accept_downloads=True)
     page.wait_for_selector('#nodes [data-id]')
     page.click('#columns')
-    assert page.locator('.row[data-col]').count() == 44
-    assert page.locator('.edge.column').count() == 36
+    assert page.locator('.row[data-col]').count() == 48
+    assert page.locator('.edge.column').count() == 40
     page.click('#columns')
     page.click("[data-toggle='model.jaffle_shop.customers']")
     assert page.locator('.row[data-col]').count() == 8

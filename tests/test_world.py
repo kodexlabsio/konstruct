@@ -314,8 +314,12 @@ def test_the_example_without_definitions_proposes_its_metrics(undefined_jaffle: 
         'one row per customer',
         'sum',
     )
-    assert by_name['order amount'].formula == 'SUM(raw_payments.amount / 100)'
-    assert by_name['order amount'].grain == 'one row per order'
+    # finance_orders.order_value has the same SQL at the same grain, so the two are one proposal,
+    # named after either column.
+    order = next(m for m in every if 'orders.amount' in {c.column for c in m.columns})
+    assert {c.column for c in order.columns} == {'orders.amount', 'finance_orders.order_value'}
+    assert order.formula == 'SUM(raw_payments.amount / 100)'
+    assert order.grain == 'one row per order'
     assert by_name['number of orders'].aggregation == 'count'
     assert by_name['payment count'].formula == 'COUNT(DISTINCT stg_payments.payment_id)'
     assert by_name['payment amount'].grain == 'one row per payment'
