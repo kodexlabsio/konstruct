@@ -22,17 +22,19 @@ MODELS = 300
 COLUMNS = 15
 
 
-def make_project(root: Path, models: int = MODELS, columns_per_model: int = COLUMNS) -> None:
+def make_project(
+    root: Path, models: int = MODELS, columns_per_model: int = COLUMNS, database: str = 'wh'
+) -> None:
     """A dbt project of ``models`` models in layers (each joins two earlier models through CTEs),
-    its manifest and catalog, and Airflow DAGs that run it in groups of 50. Also used by
-    .kodex/scripts/benchmark.py."""
+    its manifest and catalog, and Airflow DAGs that run it in groups of 50, in ``database``. Also
+    used by .kodex/scripts/benchmark.py."""
     (root / 'models').mkdir(parents=True)
     (root / 'dbt_project.yml').write_text('name: big\nprofile: big\n')
     nodes: dict[str, Any] = {}
     catalog: dict[str, Any] = {}
 
     def relation(name: str) -> str:
-        return f'"wh"."analytics"."{name}"'
+        return f'"{database}"."analytics"."{name}"'
 
     for index in range(models):
         name = f'm{index:03}'
@@ -61,7 +63,7 @@ def make_project(root: Path, models: int = MODELS, columns_per_model: int = COLU
             'name': name,
             'alias': name,
             'package_name': 'big',
-            'database': 'wh',
+            'database': database,
             'schema': 'analytics',
             'relation_name': relation(name),
             'original_file_path': f'models/{name}.sql',

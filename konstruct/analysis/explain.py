@@ -32,7 +32,7 @@ from sqlglot.dialects.dialect import Dialect
 
 from konstruct.core import jsonio
 from konstruct.core.graph import RELATION_KINDS, Graph, Node, reading_key, split_reading
-from konstruct.core.sql import PARSE_ERRORS
+from konstruct.core.sql import PARSE_ERRORS, needs_quotes
 
 if TYPE_CHECKING:
     from konstruct.interfaces.layout import Style
@@ -48,6 +48,20 @@ _TERM_LISTS = {
 # that makes rows.
 _LITERAL_CLAUSES = ('UNION', 'INTERSECT', 'EXCEPT', 'LIMIT', 'OFFSET', 'ROWS FROM')
 _QUALIFIED_COLUMN = re.compile(r'[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*){1,3}')
+
+
+@functools.lru_cache(maxsize=16)
+def quoted_names(quote: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """For a dialect that quotes names with ``quote``: a part of a name, plain or quoted as
+    canonical text quotes one that needs it (``"ds6-module-2"``), and a qualified column of such
+    parts anywhere in a text (two to four parts), for the fast paths that build or slot a column
+    without the parser."""
+    q = re.escape(quote)
+    part = rf'[A-Za-z_][A-Za-z0-9_$]*|{q}(?:[^{q}]|{q}{q})+{q}'
+    column = rf'(?<![\w.${q}])(?:{part})(?:\.(?:{part})){{1,3}}(?![\w.${q}(])'
+    return re.compile(part), re.compile(column)
+
+
 MAX_COMPOSED = 4000
 """Stop substituting once the composed formula is longer than this many characters."""
 
@@ -153,6 +167,9 @@ class _Namer:
         self.cache: dict[str, Node | None] = {}
         self.texts: dict[str, str] = {}
         self.qualified = False
+        # The character this dialect quotes names with, where it is no string's.
+        start, end = self.sqlglot.IDENTIFIER_START, self.sqlglot.IDENTIFIER_END
+        self.quote = start if start == end and start not in self.sqlglot.tokenizer_class.QUOTES else None
 
     def relation(self, key: str) -> Node | None:
         if key not in self.cache:
@@ -163,14 +180,24 @@ class _Namer:
         """``relation.name`` as a column: the relation's short label, or with ``qualified``, its full
         relation key, which stays unambiguous where two relations share a label. ``reading`` names
         one reading of a relation a query reads more than once (see :func:`split_reading`)."""
-        if self.qualified and relation.relation:
-            *prefix, table = relation.relation.split('.')
-        else:
-            prefix, table = [], self.graph.label(relation)
-        named = reading_key(table, reading)
-        return exp.column(
-            name, exp.to_identifier(named, quoted='#' in named), *reversed(prefix), quoted=False
+        *prefix, table = (
+            relation.relation if self.qualified and relation.relation else self.graph.label(relation)
+        ).split('.')
+        parts = [self.identifier(part) for part in prefix]
+        # The parts before the schema of a name of more than three (a project, a catalog) are one
+        # catalog, printed with its dots.
+        catalog = exp.Dot.build(parts[:-1]) if len(parts) > 2 else parts[0] if len(parts) == 2 else None
+        return exp.Column(
+            # A nested field's path (customer.country) is printed as it is.
+            this=exp.to_identifier(name, quoted='.' not in name and needs_quotes(name, self.sqlglot)),
+            table=self.identifier(reading_key(table, reading)),
+            db=parts[-1] if parts else None,
+            catalog=catalog,
         )
+
+    def identifier(self, part: str) -> exp.Identifier:
+        """One part of a name, quoted where the dialect would not read it back as one name."""
+        return exp.to_identifier(part, quoted=needs_quotes(part, self.sqlglot))
 
     def path(self, relation: Node, reading: str) -> str:
         """The part of a reading of a relation upstream of ``relation``'s reading ``reading`` that
@@ -203,6 +230,17 @@ class _Namer:
         if _QUALIFIED_COLUMN.fullmatch(sql):
             *prefix, name = sql.split('.')
             return exp.column(name, *reversed(prefix), quoted=False)
+        if self.quote is not None and self.quote in sql:
+            part, column = quoted_names(self.quote)
+            if column.fullmatch(sql):
+                q = self.quote
+                parts = [
+                    exp.Identifier(this=p[1:-1].replace(q + q, q), quoted=True)
+                    if p.startswith(q)
+                    else exp.Identifier(this=p, quoted=False)
+                    for p in reversed(part.findall(sql))
+                ]
+                return exp.Column(**dict(zip(('this', 'table', 'db', 'catalog'), parts, strict=False)))
         try:
             tree: exp.Expr = sqlglot.parse_one(sql, read=self.sqlglot)
             # Oracle's parser can leave the root attached to a parent, which would keep the

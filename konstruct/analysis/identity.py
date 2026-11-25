@@ -50,7 +50,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from konstruct import _core
-from konstruct.analysis.explain import Explainer, composed_from, short_sql
+from konstruct.analysis.explain import Explainer, composed_from, quoted_names, short_sql
 from konstruct.core.graph import RELATION_KINDS, Graph, Node
 from konstruct.core.sql import PARSE_ERRORS
 from konstruct.semantics.ossie import TOKENS
@@ -729,9 +729,13 @@ class Formulas:
         return None if missing else _Shape(text.split(_SLOT), emitter.labels)
 
     def _template(self, expression: str) -> tuple[_Shape, list[str]] | None:
-        """The shape of an expression with no quoted text, from the expression with its
-        qualified columns replaced by placeholders, and the columns' text in order."""
-        if not _QUOTES.isdisjoint(expression):
+        """The shape of an expression with no quoted text but quoted names, from the expression
+        with its qualified columns replaced by placeholders, and the columns' text in order."""
+        assert self.explainer is not None
+        quote = self.explainer.namer.quote
+        # A name quoted as canonical text quotes one that needs it is slotted as a plain one is.
+        quoted = quote == '"' and '"' in expression
+        if not (_QUOTES - {'"'} if quoted else _QUOTES).isdisjoint(expression):
             return None
         texts: list[str] = []
 
@@ -739,9 +743,10 @@ class Formulas:
             texts.append(match.group(0))
             return f'__k{len(texts) - 1}'
 
-        template = _QUALIFIED.sub(placeholder, expression)
+        template = (quoted_names(quote)[1] if quoted and quote else _QUALIFIED).sub(placeholder, expression)
+        if quoted and '"' in template:
+            return None
         if template not in self.shapes:
-            assert self.explainer is not None
             tree = self.explainer.namer.parse(template)
 
             def slot(item: exp.Column) -> int | None:

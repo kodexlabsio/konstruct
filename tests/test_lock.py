@@ -1313,6 +1313,22 @@ def test_a_new_canonical_form_fails_once(repositories: tuple[Path, Path]) -> Non
     assert check(graph, marketing, history=False).passed
 
 
+def test_a_new_canonical_form_folds_the_sources_it_names(repositories: tuple[Path, Path]) -> None:
+    """A form that names a relation differently names the formula's sources differently too
+    (``ds6-module-2`` was printed bare and composed to no source at all): that is the form's
+    change, re-locked once after review, not the producer's, pin by pin."""
+    _, marketing = repositories
+    graph = build(marketing)
+    lock(graph, marketing)
+    text = (marketing / FILE_NAME).read_text()
+    old = re.sub(r'sources = \[[^\]]*\]', 'sources = []', text.replace(CANONICAL, 'konstruct-0/sqlglot-1.0'))
+    assert old != text.replace(CANONICAL, 'konstruct-0/sqlglot-1.0')
+    (marketing / FILE_NAME).write_text(old)
+    result = check(graph, marketing, history=False)
+    assert result.changes == [] and result.relock == 2 and not result.passed
+    assert 're-lock after review' in result.summary()
+
+
 def test_a_new_canonical_form_folds_only_what_it_prints(repositories: tuple[Path, Path]) -> None:
     """Only a formula or a condition can read differently in another canonical form: a removed
     column, a new type and a changed definition fail as they would in the same form."""
@@ -1771,6 +1787,37 @@ def test_the_gate_names_the_consumer_whose_pin_a_change_alters(tmp_path: Path) -
     [broken] = producer.gate(base='HEAD', update=False).findings
     assert broken.rule == 'consumer-pin-changed'
     assert broken.message.startswith('the lockfile of dash cannot be checked: ')
+
+
+def test_the_gate_names_a_pin_a_change_alters_under_another_canonical_form(tmp_path: Path) -> None:
+    """A consumer's lockfile written in another canonical form reads every changed pin as maybe
+    the form's: a change that alters a pinned column still fails the gate, saying so, rather than
+    passing because its difference is set aside."""
+    finance, dash = tmp_path / 'finance', tmp_path / 'dash'
+    finance.mkdir()
+    dash.mkdir()
+    (finance / 'ltv.sql').write_text(LTV)
+    (finance / 'konstruct.toml').write_text('dialect = "duckdb"\nrepositories = ["../dash"]\n')
+    (finance / '.gitignore').write_text('konstruct-out/\n')
+    (dash / 'report.sql').write_text(REPORT)
+    (dash / 'konstruct.toml').write_text('dialect = "duckdb"\nrepositories = ["../finance"]\n')
+    git(finance, 'init', '-q', '-b', 'main')
+    commit(finance, 'Add lifetime value', 'Ada')
+    lock(build(dash), dash)
+    text = (dash / FILE_NAME).read_text()
+    (dash / FILE_NAME).write_text(text.replace(CANONICAL, 'konstruct-0/sqlglot-1.0'))
+    producer = Project(finance)
+    (finance / 'ltv.sql').write_text(LTV.replace('sum(amount)', 'sum(amount) * 2'))
+    producer.build(warehouses=False, run_dbt=False)
+    [finding] = [
+        f for f in producer.gate(base='HEAD', update=False).findings if f.rule == 'consumer-pin-changed'
+    ]
+    assert finding.message == (
+        'dash pins main.ltv.total in its konstruct.lock, and the change alters it; the lockfile was written '
+        'with canonical form konstruct-0/sqlglot-1.0, which this Konstruct does not write, so how the pin '
+        'changed cannot be told apart from the change of form'
+    )
+    assert finding.fix.endswith('who re-lock after review with `konstruct lock --update`.')
 
 
 def test_the_consumer_check_reads_no_lockfile_when_the_change_alters_no_column(

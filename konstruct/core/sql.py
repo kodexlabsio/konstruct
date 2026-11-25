@@ -1433,7 +1433,9 @@ def _branch_items(query: exp.SetOperation, term: exp.Expr) -> dict[str, list[exp
     return found
 
 
-_ATOM = re.compile(r'[\w."`$#\[\]]+(?:\.\*)?')
+_PART = r'(?:[\w$#]+|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\])'
+# A name, which needs no brackets inside another expression: its parts, each quoted or not.
+_ATOM = re.compile(rf'{_PART}(?:\.{_PART})*(?:\.\*)?')
 
 
 _TOKEN = re.compile(r'__kreading\d+__')
@@ -1580,18 +1582,47 @@ def without_readings(text: str, dialect: DialectType = None) -> str:
         if reading:
             escaped = reading_key(relation)
             identifier.set('this', escaped)
-            identifier.set('quoted', '#' in escaped)
+            identifier.set('quoted', needs_quotes(escaped, dialect))
     return tree.sql(dialect=dialect)
 
 
-def _sql_name(name: str, dialect: DialectType) -> str:
-    """A name in canonical text (see :func:`reading_key`) as SQL: each part with a ``#`` quoted."""
-    if '#' not in name:
-        return name
-    return '.'.join(
-        exp.to_identifier(part, quoted=True).sql(dialect=dialect) if '#' in part else part
-        for part in name.split('.')
+@functools.lru_cache(maxsize=16384)
+def needs_quotes(part: str, dialect: DialectType) -> bool:
+    """Whether ``part``, one part of a name in canonical text, is quoted there: where it has a
+    ``#``, which names a reading (see :func:`reading_key`), or where ``dialect`` would not read it
+    back, alone, as a column of that name. ``ds6-module-2`` reads as a subtraction, ``2024`` and
+    ``true`` as literals, ``end`` as a keyword: a column of a table function is named alone, so a
+    part must read back as itself there as well as after a relation."""
+    if '#' in part:
+        return True
+    # The words the dialect's printer quotes itself, as a name may stand where only a name can.
+    if part.lower() in Dialect.get_or_raise(dialect).generator_class.RESERVED_KEYWORDS:
+        return True
+    try:
+        tree = sqlglot.parse_one(part, read=dialect)
+    except PARSE_ERRORS:
+        return True
+    return not (
+        isinstance(tree, exp.Column)
+        and not tree.table
+        and isinstance(tree.this, exp.Identifier)
+        and not tree.this.quoted
+        and tree.name == part
     )
+
+
+@functools.lru_cache(maxsize=16384)
+def sql_part(part: str, dialect: DialectType) -> str:
+    """One part of a name in canonical text as SQL: quoted as ``dialect`` quotes where it needs it
+    (see :func:`needs_quotes`), and as it is otherwise."""
+    return exp.to_identifier(part, quoted=True).sql(dialect=dialect) if needs_quotes(part, dialect) else part
+
+
+@functools.lru_cache(maxsize=16384)
+def _sql_name(name: str, dialect: DialectType) -> str:
+    """A name in canonical text (see :func:`reading_key`), a relation key or one with a column, as
+    SQL: each part as :func:`sql_part` prints it."""
+    return '.'.join(sql_part(part, dialect) for part in name.split('.'))
 
 
 def _unquoted(name: str) -> str:
@@ -2128,12 +2159,17 @@ class Canonical:
         by a token for this reading, named later (see :meth:`name_readings`)."""
         key = table_key(table, self.default_catalog, self.default_db)
         if id(table) not in self.repeated:
-            return _sql_name(reading_key(key), self.dialect) if '#' in key else key
+            return _sql_name(reading_key(key), self.dialect)
         token = self.tokens.get((path, id(table)))
         if token is None:
             token = self.tokens[path, id(table)] = f'__kreading{len(self.tokens)}__'
             self.relations[token] = key
         return token
+
+    def column(self, table: exp.Table, name: str, path: str = '') -> str:
+        """How the column ``name`` of ``table``, read through the CTE references ``path`` names, is
+        named in canonical text: by its relation (see :meth:`relation`)."""
+        return f'{self.relation(table, path)}.{sql_part(name, self.dialect)}'
 
     def segment(self, reference: exp.Expr) -> str:
         """The path segment of ``reference``, a reference to a CTE, if the CTE is referenced more
@@ -2302,7 +2338,7 @@ class Canonical:
         return _TOKEN.sub(lambda m: self._printed(self.relations.get(m.group(), m.group())), text)
 
     def _printed(self, key: str) -> str:
-        return _sql_name(reading_key(key), self.dialect) if '#' in key else key
+        return _sql_name(reading_key(key), self.dialect)
 
     def rename(self, text: str) -> str:
         """``text`` with each token in it named, and the branches of a set operation, and the terms
@@ -2335,7 +2371,7 @@ class Canonical:
     def _expand(self, node: LineageNode, path: str = '') -> str:
         expression = node.expression
         if isinstance(expression, exp.Table):
-            return f'{self.relation(expression, path)}.{_plain(node.name.rsplit(".", 1)[-1])}'
+            return self.column(expression, _plain(node.name.rsplit('.', 1)[-1]), path)
         if isinstance(node.source, exp.SetOperation) and node.downstream:
             branches = [self.node(child, path) for child in node.downstream]
             if not isinstance(node.source, exp.Except):
@@ -2347,7 +2383,9 @@ class Canonical:
             # A star that could not be expanded, over several relations: each could supply the column
             # asked for, as in the column's sources. One that replaces or renames columns may not pass
             # the column on as it is, so its formula keeps the relation's star.
-            asked = '*' if _renames(node.source) else _plain(node.name.rsplit('.', 1)[-1])
+            asked = (
+                '*' if _renames(node.source) else sql_part(_plain(node.name.rsplit('.', 1)[-1]), self.dialect)
+            )
             return ', '.join(
                 f'{self.relation(child.expression, path)}.{asked}'
                 if isinstance(child.expression, exp.Table) and child.name == '*'
@@ -2368,8 +2406,7 @@ class Canonical:
             if child is not None:
                 return _inline(self.node(child, path + self.through(scope, item)))
             if len(star_tables) == 1 and isinstance(star_tables[0].expression, exp.Table):
-                relation = self.relation(star_tables[0].expression, path)
-                return exp.Var(this=f'{relation}.{item.name.lower()}')
+                return exp.Var(this=self.column(star_tables[0].expression, item.name.lower(), path))
             return item
 
         # The lineage node's expression belongs to the analysed statement, so rather than copying
@@ -2614,7 +2651,7 @@ class Canonical:
             resolver = self.sources or _Sources(scope)
             source = resolver.of(item, scope) if item.table else single
             if isinstance(source, exp.Table):
-                return exp.Var(this=f'{self.relation(source)}.{item.name.lower()}')
+                return exp.Var(this=self.column(source, item.name.lower()))
             if isinstance(source, Scope):
                 traced = self.trace(item.name, source, schema)
                 if traced is None:

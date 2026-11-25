@@ -117,7 +117,7 @@ if TYPE_CHECKING:
 FILE_NAME = files.LOCK
 FORMAT = 1
 """The layout of the file: which keys it has and what they hold."""
-CANONICAL_FORM = 5
+CANONICAL_FORM = 6
 """How Konstruct prints the formulas and conditions it fingerprints. Raise it with any change
 that prints one differently (a new normalisation, a core that is not sqlglot's printer)."""
 CANONICAL = f'konstruct-{CANONICAL_FORM}/sqlglot-{".".join(package_version("sqlglot").split(".")[:2])}'
@@ -133,8 +133,9 @@ _MEANING = ('definition', 'grain', 'columns', 'filters', 'unit', 'currency', 'ex
 _FINGERPRINT = re.compile(r'sha256:[0-9a-f]{64}')
 _SHA256 = re.compile(r'[0-9a-f]{64}')
 _VERSION = re.compile(r'~\d+$')
-# The reasons a canonical form can give, as they compare printed text.
-_PRINTED = ('formula', 'conditions', 'upstream')
+# The reasons a canonical form can give, as they compare printed text: a form that names a
+# relation differently names the formula's sources differently too.
+_PRINTED = ('formula', 'conditions', 'sources', 'upstream')
 # Where the canonical form can differ from the composed text: a comparison, an IN list, AND and
 # OR, a decimal.
 _NORMALISED = re.compile(r'=|<|>|\bIN\b|\bOR\b|\bAND\b|\d\.\d*0\b', re.IGNORECASE)
@@ -1517,7 +1518,7 @@ def lock(
             fresh.type = fresh.type or old.type
             result.kept.append(key)
             result.lockfile.pins.append(fresh)
-    # Only formulas and conditions are printed in the canonical form: a pin kept for its type,
+    # Only formulas, conditions and sources are printed in the canonical form: a pin kept for its type,
     # or for a column no longer built, reads the same in either.
     if existing is not None and existing.canonical != CANONICAL and printed:
         raise LockError(
@@ -1650,11 +1651,12 @@ class PinChange:
 
     def unprint(self) -> bool:
         """Set aside what differs only as a canonical form can print it (a formula, a condition,
-        a column upstream), keeping the rest; whether there was any."""
+        a source, a column upstream), keeping the rest; whether there was any."""
         printed = [r for r in self.reasons if r in _PRINTED]
         if printed:
             self.reasons = [r for r in self.reasons if r not in _PRINTED]
             self.formula_after, self.conditions_added, self.conditions_removed = None, [], []
+            self.sources_added, self.sources_removed = [], []
             if 'unknown' not in self.reasons:
                 self.formula_before = None
         return bool(printed)
@@ -1752,6 +1754,8 @@ class LockCheck:
     relock: int = 0
     """With a canonical form this Konstruct does not write, how many pins read differently: they
     fail the check once, as a whole, rather than one by one."""
+    reprinted: list[str] = field(default_factory=list)
+    """Those pins' columns, whose changes cannot be told apart from the change of form."""
 
     @property
     def passed(self) -> bool:
@@ -1863,11 +1867,12 @@ def check(
             change.changed_by = attribute(change, old, node)
         result.changes.append(change)
     if lockfile.canonical != CANONICAL:
-        # Only formulas and conditions are printed in the canonical form, so only their
+        # Only formulas, conditions and sources are printed in the canonical form, so only their
         # differences may be the form's: they fail once, as a whole. The rest fail as they are.
         for change in result.changes:
             if change.unprint():
                 result.relock += 1
+                result.reprinted.append(change.column)
         result.changes = [c for c in result.changes if c.reasons]
         if not result.relock:
             result.notes.append(

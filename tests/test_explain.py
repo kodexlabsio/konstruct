@@ -568,6 +568,46 @@ def test_each_reading_of_a_model_read_twice_composes_down_as_its_own(tmp_path: P
     assert pairs.conditions == ['GROUP BY: "base#1".id', 'JOIN ON: "base#2".customer_id = "base#1".id']
 
 
+def test_a_database_whose_name_needs_quotes_composes_down_to_its_source(tmp_path: Path) -> None:
+    """A database named ``ds6-module-2`` is quoted wherever the formula names it: printed bare, it
+    reads back as a subtraction, which names no column, so the formula has no sources."""
+    from konstruct.analysis.explain import Explainer
+
+    (tmp_path / 'stg.sql').write_text(
+        'create table main.stg as select price * 2 as price, id from "ds6-module-2".ingestion.items'
+    )
+    (tmp_path / 'pairs.sql').write_text(
+        'create table main.pairs as select a.id, sum(a.price - b.price) as gap from main.stg a '
+        'join main.stg b on b.id = a.id group by a.id'
+    )
+    project = Project(tmp_path)
+    graph = project.build(dialect='duckdb', warehouses=False, run_dbt=False).graph
+    result = project.explain('pairs.gap')
+    assert result.composed == 'SUM(("items#(stg#1)".price * 2) - ("items#(stg#2)".price * 2))'
+    assert result.sources == ['items.price']
+    composed = Explainer(graph, qualified=True).composed_text(graph.nodes['table.main.pairs#gap'])
+    assert composed == (
+        'SUM(("ds6-module-2".ingestion."items#(main.stg#1)".price * 2)'
+        ' - ("ds6-module-2".ingestion."items#(main.stg#2)".price * 2))'
+    )
+
+
+@pytest.mark.parametrize('dialect', ['duckdb', 'snowflake', 'bigquery', 'tsql'])
+def test_a_quoted_name_is_read_as_the_parser_reads_it(dialect: str) -> None:
+    """The fast path that builds a qualified column without the parser reads quoted parts too, and
+    reads them as the parser does."""
+    import sqlglot
+
+    from konstruct.analysis.explain import _Namer
+    from konstruct.core.graph import Graph
+    from konstruct.core.sql import _sql_name
+
+    namer = _Namer(Graph(), dialect)
+    for name in ['ds6-module-2.ingestion.orders#1.order-id', 'db.main.a"b.x', 'db.main.t.2024', 'm.t.x']:
+        text = _sql_name(name, dialect)
+        assert namer.parse(text) == sqlglot.parse_one(text, read=dialect), text
+
+
 JOINED_ON_TRUE = (
     'create table main.pairs as select a.id, b.amount from raw.orders a left join raw.orders b on true '
     'left join raw.orders c on c.customer_id = b.customer_id'

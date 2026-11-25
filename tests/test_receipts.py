@@ -406,8 +406,8 @@ def test_a_receipt_printed_in_another_canonical_form(tmp_path: Path) -> None:
     assert checked.status == 'holds' and checked.changes == []
     assert checked.notes == [
         'issued with canonical form konstruct-0/sqlglot-1.0, which this Konstruct does not print '
-        f'({CANONICAL}): 1 column read differently in this form and was not compared on formula or '
-        'conditions'
+        f'({CANONICAL}): 1 column read differently in this form and was not compared on formula, '
+        'conditions or sources'
     ]
     edit(tmp_path / 'shop' / 'ltv.sql', ', count(*) as orders', '')
     rebuild(project)

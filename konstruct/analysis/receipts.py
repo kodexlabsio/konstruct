@@ -547,7 +547,7 @@ def check(
 
 
 def _set_aside_printing(checked: CheckedReceipt, canonical: str) -> None:
-    """Under a canonical form this Konstruct does not print, a formula or condition that reads
+    """Under a canonical form this Konstruct does not print, a formula, condition or source that reads
     differently may differ only in how it is printed: those differences are set aside, as the
     lockfile check sets them aside, and the rest are compared."""
     printed = sum(1 for change in checked.changes if change.unprint())
@@ -556,7 +556,7 @@ def _set_aside_printing(checked: CheckedReceipt, canonical: str) -> None:
         checked.notes.append(
             f'issued with canonical form {canonical}, which this Konstruct does not print ({CANONICAL}): '
             f'{plural(printed, "column")} read differently in this form and {"was" if printed == 1 else "were"} '
-            'not compared on formula or conditions'
+            'not compared on formula, conditions or sources'
         )
 
 
