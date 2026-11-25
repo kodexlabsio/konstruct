@@ -18,7 +18,7 @@
     // svelte-ignore state_referenced_locally
     const n = model.node(id)!;
     const parent = n.parent ? model.node(n.parent) : undefined;
-    const relational = ['source', 'seed', 'snapshot', 'table', 'model'].includes(n.kind);
+    const relational = ['source', 'seed', 'snapshot', 'table', 'file', 'model'].includes(n.kind);
 
     function owner(): string {
         const o = attr<Owner | string>(n, 'owner');

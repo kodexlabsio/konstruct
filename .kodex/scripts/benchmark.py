@@ -40,6 +40,9 @@ over a relation with unknown columns, selecting 20 of its columns at the end; an
 the best of three ``--update`` builds of a project of 400 SQL files with no warehouse. It times
 statements that read one relation twice the same way, and both those and the chains also in CPU
 time, the least of 25 runs (10 for a chain), which other work on the machine does not inflate.
+It diffs a pull request that renames ten columns of a CSV file that 2,000 SQL files read, and one that
+only changes a README. It builds 500 SQL files that each read a tracked CSV file by its path, in a repository that tracks
+50,000 other files and in one that does not, and times the cold build of each.
 On the largest size it builds the scale project again in a database whose name needs quotes
 (``wh-1``) and in ``wh``, and times the cold build and, in CPU time, composing every column's
 formula and the identity test of every formula in each.
@@ -718,6 +721,85 @@ def measure_quoted(models: int) -> dict[str, float]:
     return found
 
 
+def data_files_project(root: Path, models: int, filler: int) -> None:
+    """``models`` SQL files that each read a CSV file the repository tracks by a literal path
+    (``read_csv('data/f<i>.csv')``, five columns), in a git repository that tracks ``filler``
+    other files as well, as a large repository does."""
+    (root / 'data').mkdir()
+    (root / 'pad').mkdir()
+    for i in range(models):
+        (root / 'data' / f'f{i}.csv').write_text('id,a,b,c,d\n1,2,3,4,5\n')
+        (root / f'm{i}.sql').write_text(
+            f"create table main.m{i} as select id, a, b from read_csv('data/f{i}.csv')\n"
+        )
+    for i in range(filler):
+        (root / 'pad' / f'p{i}.txt').write_text('x')
+    subprocess.run(['git', '-C', str(root), 'init', '-q'], check=True)
+    subprocess.run(['git', '-C', str(root), 'add', '-A'], check=True)
+
+
+def measure_data_files(models: int = 500, filler: int = 50_000) -> dict[str, float]:
+    """Seconds for a cold build of a project of SQL files that each read a tracked CSV file, in a
+    repository that tracks ``filler`` more files, and in one that tracks none besides: the cost of
+    the list of tracked files is the difference."""
+    found: dict[str, float] = {'data_file_models': models, 'data_file_tracked': filler + 2 * models}
+    for label, extra in (('small', 0), ('large', filler)):
+        with tempfile.TemporaryDirectory(prefix='konstruct-bench-data-') as directory:
+            root = Path(directory)
+            data_files_project(root, models, extra)
+            cold, _ = timed(Project(root).build, run_dbt=False, warehouses=False)
+        found[f'data_file_{label}_cold_build_s'] = round(cold, 2)
+    return found
+
+
+def data_file_fan(root: Path, models: int, columns: int = 20) -> None:
+    """A repository on ``main`` with one CSV file of ``columns`` columns and ``models`` SQL files that
+    each read five of them (and one in ten ``select *``), and a branch ``pr`` that renames the
+    header of ten columns in the CSV file, and one ``readme`` that only changes a README."""
+    (root / 'data').mkdir()
+    (root / 'data' / 'x.csv').write_text(
+        ','.join(f'c{j}' for j in range(columns)) + '\n' + '1,' * (columns - 1) + '1\n'
+    )
+    for i in range(models):
+        picked = ', '.join(f'c{(i + j) % columns}' for j in range(5))
+        select = '*' if i % 10 == 9 else picked
+        (root / f'm{i}.sql').write_text(
+            f"create table main.m{i} as select {select} from read_csv('data/x.csv')\n"
+        )
+    (root / 'README.md').write_text('readme\n')
+    git = ['git', '-C', str(root), '-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false']
+    subprocess.run(['git', '-C', str(root), 'init', '-q', '-b', 'main'], check=True)
+    subprocess.run([*git, 'add', '-A'], check=True)
+    subprocess.run([*git, 'commit', '-qm', 'base'], check=True)
+    subprocess.run([*git, 'checkout', '-qb', 'readme'], check=True)
+    (root / 'README.md').write_text('readme\nmore\n')
+    subprocess.run([*git, 'commit', '-qam', 'readme'], check=True)
+    subprocess.run([*git, 'checkout', '-qb', 'pr', 'main'], check=True)
+    renamed = [f'r{j}' if j < 10 else f'c{j}' for j in range(columns)]
+    (root / 'data' / 'x.csv').write_text(','.join(renamed) + '\n' + '1,' * (columns - 1) + '1\n')
+    subprocess.run([*git, 'commit', '-qam', 'rename ten headers'], check=True)
+
+
+def measure_data_file_fan(models: int = 2000) -> dict[str, float]:
+    """Seconds for the diff of a pull request that renames ten of the columns of a CSV file that
+    ``models`` SQL files read, and of one that only changes a README, on the same project."""
+    with tempfile.TemporaryDirectory(prefix='konstruct-bench-fan-') as directory:
+        root = Path(directory)
+        data_file_fan(root, models)
+        project = Project(root)
+        project.build(run_dbt=False, warehouses=False)
+        subprocess.run(['git', '-C', str(root), 'checkout', '-q', 'readme'], check=True)
+        readme, _ = timed(project.diff, base='main')
+        subprocess.run(['git', '-C', str(root), 'checkout', '-q', 'pr'], check=True)
+        renamed, change = timed(project.diff, base='main')
+    assert any(c.breaks for r in change.relations for c in r.columns)
+    return {
+        'fan_models': models,
+        'fan_readme_diff_s': round(readme, 2),
+        'fan_rename_diff_s': round(renamed, 2),
+    }
+
+
 def measure_sql_files(files: int = 400) -> dict[str, float]:
     """Seconds for a cold build and the best of three ``--update`` builds of a project of SQL files."""
     with tempfile.TemporaryDirectory(prefix='konstruct-bench-sql-') as directory:
@@ -879,6 +961,8 @@ def main() -> int:
     chains, chains_cpu = measure_star_chains() if rows else ({}, {})
     joined, joined_cpu = measure_self_joins() if rows else ({}, {})
     sql_files = measure_sql_files() if rows else {}
+    data_files = measure_data_files() if rows else {}
+    fan = measure_data_file_fan() if rows else {}
     quoted = measure_quoted(max(sizes)) if rows else {}
     dbt_read = measure_dbt_read(max(sizes)) if rows else {}
     machine = (
@@ -928,6 +1012,15 @@ def main() -> int:
             f'`--update` {sql_files["sql_update_s"]} s.'
         )
         print(
+            f'{data_files["data_file_models"]} SQL files that each read a tracked CSV file by its path: cold '
+            f'build {data_files["data_file_small_cold_build_s"]} s, and {data_files["data_file_large_cold_build_s"]} s '
+            f'in a repository that tracks {data_files["data_file_tracked"]:,} files.'
+        )
+        print(
+            f'The diff of a pull request that renames ten columns of a CSV file {fan["fan_models"]} SQL files read: '
+            f'{fan["fan_rename_diff_s"]} s, against {fan["fan_readme_diff_s"]} s for one that only changes a README.'
+        )
+        print(
             f'In a database whose name needs quotes (`wh-1`, against `wh`), {max(sizes)} models: cold build '
             f'{quoted["quoted_cold_build_s"]} s ({quoted["plain_cold_build_s"]} s); in CPU time, the least of '
             f'three runs, composing every formula {quoted["quoted_compose_s"]} s ({quoted["plain_compose_s"]} '
@@ -965,6 +1058,8 @@ def main() -> int:
             'star_chains_cpu_ms': chains_cpu,
             'self_joins_cpu_ms': joined_cpu,
             **sql_files,
+            **data_files,
+            **fan,
             **quoted,
         }
         args.json.write_text(json.dumps(data, indent=1))

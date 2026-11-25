@@ -24,6 +24,7 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import IO, cast
@@ -34,11 +35,25 @@ _REGULAR = (b'100644', b'100755')
 _LINK = b'120000'
 _HOPS = 40
 """The most links followed to reach a file, as the kernel allows."""
+LFS_POINTER = b'version https://git-lfs.github.com/spec/v1'
+"""What a Git LFS pointer starts with: the file's text is a pointer to the data, not the data."""
+_DATA_SUFFIXES = ('.csv', '.tsv', '.parquet')
+_POINTER_SIZE = 1024
+"""The most bytes of a Git LFS pointer, which is a few lines."""
+
+
+class Held(frozenset[str]):
+    """The files a commit holds under the project, as paths from it, that a build of the tree reads
+    as the files git tracks."""
+
+    unread: frozenset[str] = frozenset()
+    """The data files it holds that are not the data: a filter stores them as other text, or
+    they are a Git LFS pointer. A build of the tree does not read them, and notes a read of one."""
 
 
 def write_tree(
     top: Path, ref: str, prefix: Path, tree: Path, present: dict[str, bytes] | None = None
-) -> None:
+) -> Held:
     """Write the files under ``prefix`` of the commit ``ref`` names in the repository at ``top``
     into ``tree``, at the same paths: every regular file, and each symbolic link whose target,
     followed within the commit, is a regular file under ``prefix``.
@@ -47,6 +62,14 @@ def write_tree(
     wrote before, with the blob of each file it holds, and only what differs is written or
     removed, so writing the commits of a range one after another costs what changed between them.
     ``present`` is brought up to date.
+
+    Returns the files the commit itself holds under ``prefix``, as paths from it: the regular
+    files, not the links, which are written as the files they name. A build of the tree takes
+    these as the files git tracks (``Config.tracked``), which a tree with no ``.git`` cannot say.
+    A file whose name is not text (bytes that are not UTF-8) is written but is not one a query can
+    name, and a data file whose content a ``filter`` attribute changes in a working tree (Git LFS
+    keeps a pointer in the commit) is the stored text, not the data: neither is returned among the
+    files, and the data files of the second kind are in its ``unread``.
 
     Raises:
         konstruct.analysis.diff.DiffError: git cannot list or read the commit.
@@ -58,25 +81,34 @@ def write_tree(
     git = ['git', '--literal-pathspecs', '-C', str(top)]
     where = [] if str(prefix) == '.' else ['--', prefix.as_posix()]
     listing = subprocess.run(
-        [*git, 'ls-tree', '-r', '-z', '--full-tree', f'{ref}^{{commit}}', *where], capture_output=True
+        [*git, 'ls-tree', '-r', '-z', '-l', '--full-tree', f'{ref}^{{commit}}', *where], capture_output=True
     )
     if listing.returncode != 0:
         raise DiffError(f'git cannot list {ref}: {listing.stderr.decode(errors="replace").strip()}')
     scope = '' if str(prefix) == '.' else prefix.as_posix().rstrip('/') + '/'
     files: dict[str, bytes] = {}
+    sizes: dict[str, int] = {}
     links: dict[str, bytes] = {}
     for record in listing.stdout.split(b'\0'):
         info, _, raw = record.partition(b'\t')
         fields = info.split()
-        if len(fields) != 3 or fields[1] != b'blob':
+        if len(fields) != 4 or fields[1] != b'blob':
             continue
         name = raw.decode('utf-8', 'surrogateescape')
         if not _safe(name) or not name.startswith(scope):
             continue
         if fields[0] in _REGULAR:
             files[name] = fields[2]
+            sizes[name] = int(fields[3])
         elif fields[0] == _LINK:
             links[name] = fields[2]
+    data = [n for n in files if n.lower().endswith(_DATA_SUFFIXES) and _is_text(n)]
+    changed = filtered(top, ref, data)
+    small = {n: files[n] for n in data if sizes[n] <= _POINTER_SIZE and n not in changed}
+    pointed = _read(git, sorted(set(small.values())))
+    unread = {n for n in data if n in changed or (n in small and pointed[small[n]].startswith(LFS_POINTER))}
+    held = Held(name[len(scope) :] for name in files if _is_text(name) and name not in unread)
+    held.unread = frozenset(name[len(scope) :] for name in unread)
     read = _read(git, list(links.values()))
     targets = {name: read[blob].decode('utf-8', 'surrogateescape') for name, blob in links.items()}
     for name in links:
@@ -106,6 +138,50 @@ def write_tree(
         with target.open('xb') as handle:
             handle.write(contents[blob])
         present[name] = blob
+    return held
+
+
+def filtered(top: Path, ref: str, names: list[str]) -> set[str]:
+    """The ``names`` (paths from the repository's root) that a ``filter`` attribute of the commit
+    ``ref`` gives other content in a working tree than the blob the commit holds (Git LFS, a
+    smudge filter), so the blob is not the file. The commit's own attributes are read through an
+    index of it kept in a scratch file, which every git can do (``check-attr --source`` is
+    newer); every name where git cannot say, as a blob is not taken for a file that is not known
+    to be one."""
+    if not names:
+        return set()
+    with tempfile.TemporaryDirectory(prefix='konstruct-attr-') as scratch:
+        env = {**os.environ, 'GIT_INDEX_FILE': str(Path(scratch) / 'index')}
+        loaded = subprocess.run(
+            ['git', '-C', str(top), 'read-tree', f'{ref}^{{commit}}'],
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        listing = subprocess.run(
+            ['git', '-C', str(top), 'check-attr', '--cached', '-z', '--stdin', 'filter'],
+            input=b''.join(n.encode('utf-8') + b'\0' for n in names),
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+    if loaded.returncode != 0 or listing.returncode != 0:
+        return set(names)
+    fields = listing.stdout.split(b'\0')
+    return {
+        fields[i].decode('utf-8', 'replace')
+        for i in range(0, len(fields) - 2, 3)
+        if fields[i + 2] not in (b'unspecified', b'unset')
+    }
+
+
+def _is_text(name: str) -> bool:
+    """Whether ``name`` is UTF-8, as the name of a file in a pattern must be."""
+    try:
+        name.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _safe(name: str) -> bool:

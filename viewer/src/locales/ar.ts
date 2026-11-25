@@ -34,6 +34,7 @@ const messages: Catalogue = {
     'kind.seed': 'بذرة',
     'kind.snapshot': 'لقطة',
     'kind.table': 'جدول',
+    'kind.file': 'ملف',
     'kind.model': 'نموذج',
     'kind.task': 'مهمة',
     'kind.exposure': 'عرض',
@@ -49,6 +50,7 @@ const messages: Catalogue = {
     'noun.seed': '{count, plural, zero {بذرة} one {بذرة} two {بذرتان} few {بذور} many {بذرة} other {بذرة}}',
     'noun.snapshot':
         '{count, plural, zero {لقطة} one {لقطة} two {لقطتان} few {لقطات} many {لقطة} other {لقطة}}',
+    'noun.file': '{count, plural, zero {ملف} one {ملف} two {ملفان} few {ملفات} many {ملفًا} other {ملف}}',
     'noun.table':
         '{count, plural, zero {جدول} one {جدول} two {جدولان} few {جداول} many {جدولًا} other {جدول}}',
     'noun.model':

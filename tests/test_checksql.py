@@ -1989,12 +1989,13 @@ def test_a_table_function_s_columns_are_those_it_lists(two_projects: tuple[Check
         f"select p.price, o.order_id from read_csv('{csv}', columns = {{'sku': 'VARCHAR', 'price': 'INT', "
         "'valid_from': 'DATE'}) p join orders o using (sku) where o.ordered_at >= p.valid_from"
     )
-    assert checker.check(listed).findings == []
-    assert checker.check(listed.replace(', columns = {', ', types = {')).findings == []
+    # The file is a relation like another to the join check, which knows no key of it or of orders.
+    assert rules(checker.check(listed)) == ['unknown-join']
+    assert loud(checker.check(listed.replace(', columns = {', ', types = {'))) == []
     finding = only(checker.check(listed.replace('p.price', 'p.cost')), 'unknown-column')
     assert finding.severity == 'warning' and finding.message == 'read_csv(...) has no column cost'
     unqualified = listed.replace('p.price', 'price').replace('p.valid_from', 'valid_from')
-    assert checker.check(unqualified).findings == []
+    assert loud(checker.check(unqualified)) == []
     assert only(checker.check(unqualified.replace('select price', 'select cost')), 'unknown-column')
 
 

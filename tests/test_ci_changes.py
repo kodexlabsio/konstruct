@@ -150,7 +150,15 @@ PYTHON = {
 }
 RUST = {'rust', 'wheels'}
 GUARDS = PYTHON | RUST
-FUZZED = {'fuzz_sql', 'fuzz_python', 'fuzz_yaml', 'fuzz_ingestion', 'fuzz_jinja', 'fuzz_manifest'}
+FUZZED = {
+    'fuzz_sql',
+    'fuzz_python',
+    'fuzz_yaml',
+    'fuzz_ingestion',
+    'fuzz_jinja',
+    'fuzz_manifest',
+    'fuzz_datafile',
+}
 CODEQL = {'codeql_python', 'codeql_javascript', 'codeql_actions', 'codeql_rust'}
 
 

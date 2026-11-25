@@ -7,6 +7,7 @@ export type NodeKind =
     | 'model'
     | 'seed'
     | 'snapshot'
+    | 'file'
     | 'dag'
     | 'task'
     | 'test'

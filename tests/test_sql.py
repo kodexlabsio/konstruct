@@ -19,6 +19,11 @@ from konstruct.core.sql import (
     analyse,
     canonical_condition,
     dialect_for,
+    file_relation,
+    files_read,
+    may_read_files,
+    plain_read,
+    relations_named,
     strip_templating,
     without_readings,
 )
@@ -1511,26 +1516,196 @@ def test_every_name_in_canonical_text_reads_back_as_the_name_it_is(dialect: str)
 
 
 def test_a_column_of_a_table_function_is_named_without_a_relation() -> None:
-    """A table function's rows have no relation, as an UNNEST's or VALUES' have none: its column is
-    named alone, not as a column of the default schema (``db.main.country``), which reads back as a
-    relation ``main`` that a reading of the query would then be put on."""
+    """A table function's rows have no relation where it reads no files by a literal path, as an
+    UNNEST's or VALUES' have none: its column is named alone, not as a column of the default schema
+    (``db.main.country``), which reads back as a relation ``main`` that a reading of the query would
+    then be put on."""
     result = one(
-        "select a.country, a.n * 2 as n2 from read_parquet('x/*.parquet') a "
-        "join read_csv('y.csv') b on b.id = a.id",
+        "select a.country, a.n * 2 as n2 from read_parquet(getvariable('x')) a "
+        'join generate_series(1, 3) b(id) on b.id = a.id',
         schema={},
     )
     assert result.expressions == {'country': 'country', 'n2': 'n * 2'}
     assert all(relation for relation, _ in result.references)
-    assert one("select country from read_parquet('x/*.parquet')", schema={}).expressions == {
-        'country': 'country'
-    }
+    assert one('select country from read_parquet($path)', schema={}).expressions == {'country': 'country'}
     # Its conditions name it as its formula does, quoted where it would read back as a literal.
     made = one(
-        'select a.x, "2024" * 2 as y, "true" as t from read_parquet(\'p\') a where a.x > 1 and "end" = 1',
+        'select a.x, "2024" * 2 as y, "true" as t from read_parquet($p) a where a.x > 1 and "end" = 1',
         schema={},
     )
     assert made.expressions == {'x': 'x', 'y': '"2024" * 2', 't': '"true"'}
-    assert made.conditions == ["ROWS FROM: READ_PARQUET('p')", 'WHERE: x > 1 AND "end" = 1']
+    assert made.conditions == ['ROWS FROM: READ_PARQUET($p)', 'WHERE: x > 1 AND "end" = 1']
+
+
+SALES = 'file.parquet.data/sales/*%2eparquet'
+
+
+def test_a_file_read_by_a_literal_path_is_a_relation_of_its_own() -> None:
+    """``read_parquet('data/sales/*.parquet')`` reads files, which are a relation keyed by their
+    format and path: its columns are the sources of what the query computes from them."""
+    result = one(
+        "select country, sum(amount) from read_parquet('data/sales/*.parquet') group by 1", schema={}
+    )
+    assert result.reads == [SALES]
+    assert result.columns == {
+        'country': [src(SALES, 'country')],
+        '_col_1': [src(SALES, 'amount', 'transformed')],
+    }
+    # Written with the path as it is, not as the key escapes it.
+    assert result.expressions['_col_1'] == 'SUM(file.parquet."data/sales/*.parquet".amount)'
+    assert result.references == [(SALES, 'country')]
+    assert result.files == {
+        SALES: {
+            'format': 'parquet',
+            'paths': ['data/sales/*.parquet'],
+            'columns': [],
+            'complete': False,
+            'extra': False,
+        }
+    }
+    assert StatementLineage.from_dict(result.to_dict()) == result
+
+
+def test_an_absolute_path_is_one_key_whatever_its_slashes() -> None:
+    keys = {
+        k
+        for text in ('/data/x.csv', '//data//x.csv', '///data/x.csv')
+        for k in files_read(f"select a from read_csv('{text}')", dialect='duckdb')
+    }
+    assert keys == {'file.csv./data/x%2ecsv'}
+
+
+def test_two_reads_of_the_same_files_are_one_relation() -> None:
+    """The same files read twice, by two readers of one format or through ``./``, are one relation,
+    and a self-join of them names each reading."""
+    result = one(
+        "select a.id, b.amount from read_csv('x.csv') a join read_csv_auto('./x.csv') b on b.id = a.id",
+        schema={},
+    )
+    assert result.reads == ['file.csv.x%2ecsv']
+    assert result.columns == {
+        'id': [src('file.csv.x%2ecsv', 'id')],
+        'amount': [src('file.csv.x%2ecsv', 'amount')],
+    }
+    assert result.conditions == ['JOIN ON: file.csv."x.csv#1".id = file.csv."x.csv#2".id']
+
+
+def test_the_columns_a_csv_read_lists_are_its_columns() -> None:
+    """``read_csv(..., columns={...})`` lists every column the file has, with its type, so a star
+    expands to them; ``names=[...]`` names some, and others may follow."""
+    listed = one("select * from read_csv('x.csv', columns={'a': 'INT', 'B': 'VARCHAR'})", schema={})
+    assert listed.columns == {'a': [src('file.csv.x%2ecsv', 'a')], 'b': [src('file.csv.x%2ecsv', 'b')]}
+    assert listed.errors == []
+    assert listed.files['file.csv.x%2ecsv']['columns'] == [['a', 'INT'], ['B', 'VARCHAR']]
+    assert listed.files['file.csv.x%2ecsv']['complete'] is True
+    named = one("select a, c from read_csv(['x.csv', 'y.csv'], names=['a', 'b'], delim='|', header=false)")
+    read = named.files['file.csv.x%2ecsv,y%2ecsv']
+    assert read == {
+        'format': 'csv',
+        'paths': ['x.csv', 'y.csv'],
+        'columns': [['a', ''], ['b', '']],
+        'complete': False,
+        'extra': False,
+        'delimiter': '|',
+        'header': False,
+    }
+    assert named.columns == {
+        'a': [src('file.csv.x%2ecsv,y%2ecsv', 'a')],
+        'c': [src('file.csv.x%2ecsv,y%2ecsv', 'c')],
+    }
+
+
+@pytest.mark.parametrize(
+    'path', ["getvariable('p')", '$p', "'data/' || current_date", '\'{{ var("x") }}/x.parquet\'']
+)
+def test_a_path_that_is_not_a_literal_reads_no_relation(path: str) -> None:
+    result = one(f'select amount from read_parquet({path})', schema={})
+    assert (result.reads, result.files, result.columns) == ([], {}, {'amount': []})
+
+
+def test_a_local_path_is_taken_from_the_repository_root() -> None:
+    """A dbt project's reader finds a relative path from the project's folder; the relation is named
+    by the path from the repository's root. A URL or an absolute path is as written."""
+    [result] = analyse(
+        "select a.x, b.y, c.z from read_parquet('../data/a.parquet') a, read_parquet('s3://b/K/*.parquet') b, "
+        "read_json('/srv/c.json') c",
+        dialect='duckdb',
+        base='dbt',
+    )
+    assert sorted(r['paths'][0] for r in result.files.values()) == [
+        '/srv/c.json',
+        'data/a.parquet',
+        's3://b/K/*.parquet',
+    ]
+    assert sorted(result.files) == [
+        'file.json./srv/c%2ejson',
+        'file.parquet.data/a%2eparquet',
+        'file.parquet.s3://b/k/*%2eparquet',
+    ]
+
+
+def test_spark_paths_are_tables_as_they_were() -> None:
+    """A Spark path read has its table's key and kind, which graph.json has always given it: files
+    are a relation only for the table functions that read them."""
+    [result] = analyse('select a, sum(b) as b from parquet.`/data/x` group by a', dialect='databricks')
+    assert result.reads == ['parquet./data/x'] and result.files == {}
+    [table] = analyse('select a from delta.events', dialect='databricks')
+    assert (table.reads, table.files) == (['delta.events'], {})
+
+
+@pytest.mark.parametrize(
+    'options',
+    [
+        "names=[lower('A'), 'b']",
+        "names=getvariable('n')",
+        "columns=getvariable('c')",
+        "columns={'a': 'INT', lower('b'): 'INT'}",
+        'header=(1=0)',
+        "header=getvariable('h')",
+        "delim=getvariable('d')",
+        'sep=chr(9)',
+    ],
+)
+def test_an_option_that_is_not_a_literal_leaves_the_columns_unknown(options: str) -> None:
+    """DuckDB computes the option, so the file's header may not be what the call reads."""
+    table = sqlglot.parse_one(f"select * from read_csv('data/x.csv', {options})", read='duckdb').find(
+        exp.Table
+    )
+    assert table is not None
+    found = file_relation(table, 'duckdb')
+    assert found is not None and not plain_read(found[1])
+
+
+@pytest.mark.parametrize(
+    'options', ['', 'header=true', "names=['a','b']", "delim=';'", 'ignore_errors=true', "types={'a': 'INT'}"]
+)
+def test_an_option_that_is_a_literal_keeps_what_the_read_says(options: str) -> None:
+    sql = f"select * from read_csv('data/x.csv'{', ' + options if options else ''})"
+    table = sqlglot.parse_one(sql, read='duckdb').find(exp.Table)
+    assert table is not None
+    found = file_relation(table, 'duckdb')
+    assert found is not None
+    assert plain_read(found[1]) is (
+        options in ('', 'header=true', 'ignore_errors=true', "types={'a': 'INT'}")
+    )
+
+
+def test_only_the_table_functions_that_read_files_may_read_them() -> None:
+    assert may_read_files("select * from read_csv('x.csv')")
+    assert may_read_files("select * from PARQUET_SCAN('x')")
+    assert not may_read_files('select * from read_events()')
+    assert not may_read_files('select * from t, lateral get_scan(t)')
+
+
+def test_the_relations_named_include_the_files_read() -> None:
+    assert relations_named("select * from read_parquet('x.parquet') join t using (id)", dialect='duckdb') == [
+        'file.parquet.x%2eparquet',
+        't',
+    ]
+    assert files_read('select 1', dialect='duckdb') == {}
+    assert list(files_read("select * from read_csv('a/b.csv')", dialect='duckdb', base='p')) == [
+        'file.csv.p/a/b%2ecsv'
+    ]
 
 
 def test_a_cte_read_by_two_others_names_each_reference_and_moving_a_filter_between_them_shows() -> None:

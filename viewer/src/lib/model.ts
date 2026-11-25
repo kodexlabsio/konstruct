@@ -8,11 +8,12 @@ export const VIEW_KINDS: readonly NodeKind[] = [
     'seed',
     'snapshot',
     'table',
+    'file',
     'model',
     'task',
     'exposure',
 ];
-export const RELATION_KINDS: readonly NodeKind[] = ['source', 'seed', 'snapshot', 'table', 'model'];
+export const RELATION_KINDS: readonly NodeKind[] = ['source', 'seed', 'snapshot', 'table', 'file', 'model'];
 /** Kinds with a page of their own. */
 export const PAGE_KINDS: readonly NodeKind[] = [...VIEW_KINDS, 'column', 'dag', 'test', 'term'];
 

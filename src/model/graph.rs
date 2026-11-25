@@ -30,7 +30,8 @@ use super::file::{File, OpenError};
 use super::node::{Edge, Node, Step};
 
 /// The node kinds that are relations.
-pub const RELATION_KINDS: [&str; 5] = ["source", "table", "model", "seed", "snapshot"];
+/// A `file` is the files a table function reads by their path (`read_parquet('x/*.parquet')`).
+pub const RELATION_KINDS: [&str; 6] = ["source", "table", "model", "seed", "snapshot", "file"];
 
 /// When several nodes describe one physical relation (a seed and the dbt source that reads it),
 /// SQL that names the relation resolves to the first kind in this order.
@@ -41,6 +42,7 @@ pub fn priority(kind: &str) -> u8 {
         "snapshot" => 2,
         "seed" => 3,
         "table" => 4,
+        "file" => 5,
         _ => 9,
     }
 }
@@ -1186,8 +1188,8 @@ impl Graph {
     }
 
     /// Whether something in the graph builds `relation`: a model, seed or snapshot, a file of
-    /// its own, a task, or SQL that gives its columns expressions. A source, or a table the
-    /// graph only reads, is not built.
+    /// its own, a task, or SQL that gives its columns expressions. A source, or a table or files
+    /// the graph only reads, is not built.
     fn built(&self, py: Python<'_>, relation: &Bound<'_, Node>) -> PyResult<bool> {
         let this = relation.borrow();
         if !is_relation_kind(py, &this) || kind_is(py, &this, "source") {

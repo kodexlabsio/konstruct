@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { computeFocus, NO_FOCUS } from '../src/lib/focus';
 import { bounds, computeLayers, computeOrder, curve, place, W, wrapHeight } from '../src/lib/layout';
-import { byName, GraphModel } from '../src/lib/model';
+import { byName, GraphModel, PAGE_KINDS, RELATION_KINDS, VIEW_KINDS } from '../src/lib/model';
 import type { GraphData, GraphNode } from '../src/lib/types';
 import { graph } from './fixture';
 
@@ -284,5 +284,21 @@ describe('ordering', () => {
             underLocale(locale, () => [...nodes].sort(byName).map(n => n.id));
         expect(order('sv')).toEqual(order('en'));
         expect(order('en')).toEqual(['model.p.B3', 'model.p.a2', 'model.p.a4', 'model.p.z0', 'model.p.ä1']);
+    });
+});
+
+describe('files read by a literal path', () => {
+    const files: GraphData = {
+        nodes: [
+            { id: 'file.csv.x%2ecsv', kind: 'file', name: 'x.csv', attrs: { format: 'csv' } },
+            { id: 'model.m', kind: 'model', name: 'm', attrs: {} },
+        ],
+        edges: [{ source: 'file.csv.x%2ecsv', target: 'model.m', kind: 'feeds' }],
+    };
+
+    it('are relations the viewer shows and gives a page', () => {
+        for (const kinds of [VIEW_KINDS, RELATION_KINDS, PAGE_KINDS]) expect(kinds).toContain('file');
+        const m = new GraphModel(files);
+        expect(m.viewNodes.map(n => n.id)).toContain('file.csv.x%2ecsv');
     });
 });

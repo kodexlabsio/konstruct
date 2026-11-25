@@ -50,6 +50,7 @@ const WEIGHTS: Record<string, number> = {
     seed: 1.5,
     snapshot: 1.5,
     table: 1.5,
+    file: 1.5,
     exposure: 1.5,
     dag: 1,
     task: 1,

@@ -187,6 +187,7 @@ AREAS: dict[str, tuple[str, ...]] = {
     ),
     'fuzz_jinja': (*FUZZED, 'konstruct/inputs/jinja.py', 'tests/fuzz_targets/fuzz_jinja.py'),
     'fuzz_manifest': (*FUZZED, 'konstruct/inputs/dbt.py', 'tests/fuzz_targets/fuzz_manifest.py'),
+    'fuzz_datafile': (*FUZZED, 'tests/fuzz_targets/fuzz_datafile.py'),
 }
 
 NAMES = (*GUARDS, *AREAS)

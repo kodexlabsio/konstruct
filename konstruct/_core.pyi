@@ -631,6 +631,42 @@ def folder_files(folder: StrPath, extension: str) -> tuple[str, list[tuple[str, 
 def folder_digest(folder: StrPath, extension: str) -> str:
     """The first of what :func:`folder_files` gives, alone."""
 
+class TrackedFiles:
+    """The files a repository tracks, made once for a build, from their paths from its root with
+    ``/`` between the parts. A name that is not a plain relative path (an empty, ``.``, ``..`` or
+    drive part), or that a file system reads as ``.git``, is not kept."""
+
+    def __init__(self, names: list[str]) -> None: ...
+    def __len__(self) -> int: ...
+    def matching(self, pattern: str) -> list[str]:
+        """The tracked files ``pattern`` matches, in name order: none for a pattern DuckDB
+        refuses (more than one ``**``) or of over 64 parts or 1,024 bytes; a trailing ``**`` is
+        every file below; ``?`` is one byte."""
+
+    def first(self, pattern: str, format: str) -> str | None:
+        """The first tracked file ``pattern`` matches that has an extension of ``format``
+        (``parquet``, or ``csv`` for ``.csv`` and ``.tsv``); None when there is none."""
+
+def data_file_columns(
+    root: StrPath,
+    pattern: str,
+    format: str,
+    tracked: TrackedFiles,
+    *,
+    delimiter: str | None = None,
+    header: bool = True,
+) -> tuple[str, list[tuple[str, str]]] | None:
+    """The first file ``pattern`` (a path from ``root``, with shell patterns and ``**`` in its
+    parts) matches among the ``tracked`` files that has an extension of ``format`` (``parquet``:
+    ``.parquet``; ``csv``: ``.csv`` and ``.tsv``), as a path from ``root``, and its columns, each a
+    name and its DuckDB type (empty where the file does not say); None when there is none, it is
+    not a regular file under real directories, or it cannot be read as ``format``. The pattern is
+    matched against the tracked names, not the file system: names in the pattern's literal first
+    folders are found by search. A CSV file is read with ``delimiter``, by default the one its
+    first record suggests, and its first record names the columns unless ``header`` is false.
+    Footers over 16 MiB, schemas of over 100,000 elements and CSV headers of over 20,000 fields
+    are not read."""
+
 def files_under(folder: StrPath) -> list[tuple[str, list[int]]]:
     """Every regular file under ``folder`` at any depth, with its path from ``folder`` and its
     identity."""
@@ -664,6 +700,15 @@ def split_reading(name: str) -> tuple[str, str]:
 
 def relation_key(*parts: str | None) -> str:
     """Canonical, case-insensitive key for a warehouse relation, e.g. ``jaffle.main.orders``."""
+
+def file_key(format: str, paths: list[str]) -> str:
+    """The relation key of the files a table function reads (``read_parquet('data/*.parquet')``):
+    ``file.<format>.<paths>``, each path a :func:`key_part` with ``,`` written ``%2c``, joined by
+    ``,``, so that two reads of the same files have one key and no other files share it."""
+
+def key_part(text: str) -> str:
+    """``text`` as one part of a relation key, in lower case: ``.``, ``#``, ``%`` and the quotes
+    and brackets a key's parts are stripped of are written ``%`` and two hexadecimal digits."""
 
 class Node:
     __dataclass_fields__: ClassVar[dict[str, Field[Any]]]

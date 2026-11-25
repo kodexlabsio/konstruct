@@ -16,9 +16,11 @@ conditions. It then reports:
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import subprocess
+import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 from konstruct.analysis.query import Walk, impact
 from konstruct.analysis.verify import defining_sql_file
 from konstruct.core.graph import RELATION_KINDS, Graph, Node
+from konstruct.engine.snapshot import LFS_POINTER, filtered
 from konstruct.inputs import airflow, dbt
 from konstruct.semantics.definitions import FILE_NAMES as DEFINITION_FILES
 
@@ -147,6 +150,120 @@ def file_at(repository: Path, ref: str | None, path: str) -> str | None:
         check=False,
     )
     return result.stdout if result.returncode == 0 else None
+
+
+DATA_FILE_LIMIT = 256 * 1024 * 1024
+"""The most bytes of a data file taken from a commit to read its columns."""
+
+_DATA_EXTENSIONS = {'parquet': ('.parquet',), 'csv': ('.csv', '.tsv')}
+
+
+class DataFilesAt:
+    """The Parquet and CSV files git holds at one side of a comparison (a commit, or the working
+    tree as its index lists it), by their paths from the project's root, and the columns of the
+    first file a path matches there, as a build reads them.
+
+    A file is read as the build reads it: only a regular file git tracks, never a link or a
+    submodule's, and for a commit only from its blob after its mode and size are known, so a blob
+    over :data:`DATA_FILE_LIMIT` or a Git LFS pointer is not taken for the data."""
+
+    def __init__(self, repository: Path, root: Path, ref: str | None) -> None:
+        from konstruct._core import TrackedFiles
+
+        self.repository, self.root, self.ref = repository, root, ref
+        self.files: dict[str, tuple[str, int]] = {}
+        self._filtered: set[str] | None = None
+        if ref is None:
+            listing = subprocess.run(
+                ['git', '--literal-pathspecs', '-C', str(root), 'ls-files', '-z', '--stage', '--'],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            scope = root.resolve().relative_to(repository.resolve()).as_posix()
+            listing = subprocess.run(
+                [
+                    *('git', '--literal-pathspecs', '-C', str(repository), 'ls-tree', '-r', '-z', '-l'),
+                    *(
+                        '--full-tree',
+                        f'{check_ref(ref)}^{{commit}}',
+                        *([] if scope == '.' else ['--', scope]),
+                    ),
+                ],
+                capture_output=True,
+                check=False,
+            )
+        if listing.returncode != 0:
+            raise DiffError(f'git cannot list the files at {ref or "the working tree"}')
+        prefix = '' if ref is None or scope == '.' else scope + '/'
+        for record in listing.stdout.split(b'\0'):
+            info, _, raw = record.partition(b'\t')
+            fields = info.split()
+            try:
+                name = raw.decode('utf-8')
+            except UnicodeDecodeError:
+                continue
+            if ref is None:
+                regular = bool(fields) and fields[0] in (b'100644', b'100755')
+                found = ('', 0)
+            else:
+                regular = len(fields) == 4 and fields[1] == b'blob' and fields[0] in (b'100644', b'100755')
+                found = (fields[2].decode(), int(fields[3])) if regular else ('', 0)
+            if regular and name.startswith(prefix):
+                self.files[name[len(prefix) :]] = found
+        self.tracked = TrackedFiles(sorted(self.files))
+
+    def columns(self, paths: list[str], fmt: str) -> tuple[bool, list[tuple[str, str]] | None]:
+        """Whether a file is there for ``paths`` (the first that matches one, in order) and its
+        columns: None where it is there but cannot be read as ``fmt`` or taken for the data."""
+        from konstruct._core import TrackedFiles, data_file_columns
+
+        for path in paths:
+            name = self.tracked.first(path, fmt)
+            if name is None:
+                continue
+            if self.ref is None:
+                head = _head_of(self.root / name)
+                if head is None or head.startswith(LFS_POINTER):
+                    return True, None
+                found = data_file_columns(str(self.root), path, fmt, self.tracked)
+                return True, None if found is None else found[1]
+            blob, size = self.files[name]
+            if size > DATA_FILE_LIMIT or self.filtered(name):
+                return True, None
+            with tempfile.TemporaryDirectory(prefix='konstruct-data-') as scratch:
+                held = 'data.' + name.rsplit('.', 1)[-1]
+                with (Path(scratch) / held).open('xb') as target:
+                    taken = subprocess.run(
+                        ['git', '-C', str(self.repository), 'cat-file', 'blob', blob],
+                        stdout=target,
+                        check=False,
+                    )
+                if taken.returncode != 0 or (_head_of(Path(scratch) / held) or b'').startswith(LFS_POINTER):
+                    return True, None
+                found = data_file_columns(scratch, held, fmt, TrackedFiles([held]))
+            return True, None if found is None else found[1]
+        return False, None
+
+    def filtered(self, name: str) -> bool:
+        """Whether a ``filter`` attribute gives ``name`` other content in a working tree than its
+        blob (Git LFS), which is then not the data. Asked of every data file at once."""
+        if self._filtered is None:
+            scope = self.root.resolve().relative_to(self.repository.resolve()).as_posix()
+            prefix = '' if scope == '.' else scope + '/'
+            data = [prefix + n for n in self.files if n.lower().endswith(('.csv', '.tsv', '.parquet'))]
+            found = filtered(self.repository, str(self.ref), data)
+            self._filtered = {n[len(prefix) :] for n in found}
+        return name in self._filtered
+
+
+def _head_of(path: Path) -> bytes | None:
+    """The first bytes of a file, None where it cannot be read."""
+    try:
+        with path.open('rb') as handle:
+            return handle.read(len(LFS_POINTER))
+    except OSError:
+        return None
 
 
 # Results
@@ -770,6 +887,21 @@ class Context:
                     schema[node.relation] = columns
         return schema
 
+    def with_columns(self, relation: str, columns: dict[str, str]) -> Context:
+        """This context with ``relation`` as having exactly ``columns``, which is how a change to
+        a relation's columns is read through the SQL that reads it."""
+        other = copy.copy(self)
+        other.schema = {**self.schema, relation: dict(columns)}
+        other.guessed = [r for r in self.guessed if r != relation]
+        return other
+
+    def restricted_to(self, relations: set[str | None]) -> Context:
+        """This context with the schema of only these relations."""
+        other = copy.copy(self)
+        other.schema = {k: v for k, v in self.schema.items() if k in relations}
+        other.guessed = [r for r in self.guessed if r in relations]
+        return other
+
     def model_sql(self, node: Node, text: str) -> tuple[str, str | None, str | None]:
         from konstruct.inputs.jinja import render_model
 
@@ -817,6 +949,7 @@ def diff(graph: Graph, root: Path, *, base: str | None = None, head: str | None 
         sql_path = node.attrs.get('sql_path')
         if sql_path:
             by_path.setdefault(str(sql_path), []).append(node)
+    covered = _compare_data_files(context, result, repository, prefix, base, head, files)
     for path in sorted(files):
         relative = Path(path)
         if set(relative.parts) & dbt.SKIP_DIRS:
@@ -829,6 +962,8 @@ def diff(graph: Graph, root: Path, *, base: str | None = None, head: str | None 
         after = file_at(repository, head, path)
         nodes = by_path.get(in_project, [])
         models = [n for n in nodes if n.kind in ('model', 'snapshot') and 'dbt' in n.origins]
+        if in_project in covered:
+            continue
         if models:
             for model in models:
                 result.relations.append(compare_model(context, model, in_project, before, after))
@@ -1069,6 +1204,177 @@ def compare_sql_file(
     return changes
 
 
+def _compare_data_files(
+    context: Context,
+    result: Diff,
+    repository: Path,
+    prefix: Path,
+    base: str,
+    head: str | None,
+    files: dict[str, str],
+) -> set[str]:
+    """Add to ``result`` how the columns of each ``file`` relation of the graph changed, for the
+    relations that a changed file is one of the files of, and return those changed files (as
+    paths from the project's root), which the result accounts for.
+
+    A relation of files has the columns of the first file its path matches, so a file that is
+    deleted, or one added that sorts before the others, changes them as an edit of the first does:
+    each side's columns are those of the first file that side holds, read as a build reads it."""
+    from konstruct._core import TrackedFiles
+    from konstruct.core.sql import is_local_path
+
+    changed = {
+        relative
+        for path in files
+        if not set(Path(path).parts) & dbt.SKIP_DIRS and (relative := project_path(path, prefix))
+    }
+    nodes = sorted(
+        (
+            n
+            for n in context.graph.nodes.values()
+            if n.kind == 'file' and n.attrs.get('format') in _DATA_EXTENSIONS
+        ),
+        key=lambda n: n.id,
+    )
+    if not changed or not nodes:
+        return set()
+    moved = TrackedFiles(sorted(changed))
+    sides: dict[str | None, DataFilesAt] = {}
+
+    def side(ref: str | None) -> DataFilesAt:
+        if ref not in sides:
+            sides[ref] = DataFilesAt(repository, context.root, ref)
+        return sides[ref]
+
+    covered: set[str] = set()
+    for node in nodes:
+        fmt = str(node.attrs['format'])
+        paths = [p for p in node.attrs.get('paths') or [] if is_local_path(p)]
+        touched = {
+            name
+            for path in paths
+            for name in moved.matching(path)
+            if name.lower().endswith(_DATA_EXTENSIONS[fmt])
+        }
+        if not touched:
+            continue
+        covered |= touched
+        was_there, was = side(base).columns(paths, fmt)
+        is_there, now = side(head).columns(paths, fmt)
+        if was_there or is_there:
+            result.relations.append(
+                compare_data_file(
+                    context, node, ', '.join(sorted(touched)), (was_there, was), (is_there, now)
+                )
+            )
+    return covered
+
+
+def compare_data_file(
+    context: Context,
+    node: Node,
+    path: str,
+    before: tuple[bool, list[tuple[str, str]] | None],
+    after: tuple[bool, list[tuple[str, str]] | None],
+) -> RelationChange:
+    """How the columns of a ``file`` relation changed, from each side's own first file (whether
+    there is one, and its columns, None where it cannot be read): a column gone, one added, one
+    whose type changed. A column that is gone breaks the relations that read it, directly or
+    through a relation that passes every column on (``select *``)."""
+    change = RelationChange(
+        path=path,
+        label=context.graph.label(node),
+        kind=node.kind,
+        status='added' if not before[0] else 'removed' if not after[0] else 'modified',
+        node_id=node.id,
+    )
+    if (before[0] and before[1] is None) or (after[0] and after[1] is None):
+        change.note = 'the columns of the file could not be read at one side'
+        if after[0] and after[1] is not None:
+            # What the base held is not known, but a model that reads a column the head's file
+            # lacks is broken whatever it was.
+            for column, readers in _readers_of_absent(context, node, dict(after[1])).items():
+                entry = ColumnChange(column, 'removed')
+                entry.breaks = sorted(readers)
+                change.columns.append(entry)
+        return change
+    was, now = dict(before[1] or []), dict(after[1] or [])
+    lost = [c for c in was if c not in now]
+    broken = _broken_readers(context, node, now, lost)
+    for column in [*now, *lost]:
+        if column not in was:
+            change.columns.append(ColumnChange(column, 'added', after=now[column] or None))
+        elif column not in now:
+            entry = ColumnChange(column, 'removed', before=was[column] or None)
+            entry.breaks = sorted(broken[column])
+            entry.impact = _walk(context.graph, node, column)
+            change.columns.append(entry)
+        elif was[column] != now[column]:
+            entry = ColumnChange(column, 'changed', before=was[column] or None, after=now[column] or None)
+            entry.impact = _walk(context.graph, node, column)
+            change.columns.append(entry)
+    return change
+
+
+def _readers_of_absent(context: Context, node: Node, columns: dict[str, str]) -> dict[str, set[str]]:
+    """The relations whose current SQL reads a column of ``node`` that is not among ``columns``
+    (its columns now), by that column."""
+    now = context.with_columns(node.relation or '', columns)
+    have = {c.lower() for c in columns}
+    found: dict[str, set[str]] = {}
+    for consumer in _consumers(context.graph, node):
+        for relation, column in _uses(_statements(now, consumer)):
+            if relation == node.relation and column.lower() not in have:
+                found.setdefault(column, set()).add(context.graph.label(consumer))
+    return found
+
+
+def _broken_readers(
+    context: Context, node: Node, columns: dict[str, str], lost: list[str]
+) -> dict[str, set[str]]:
+    """For each of the ``lost`` columns of ``node`` (whose columns now are ``columns``), the
+    relations whose current SQL reads it and no longer finds it: those that read it, and those that
+    read it from a relation that used to pass it on (``select *``) and now does not, which no
+    longer has it. Each relation's SQL is read twice, once with the relations upstream of it as
+    they are now and once as they were, so what it passes on is what differs, however many columns
+    are lost. A relation reached again with other lost columns (two paths meet in a join) is
+    followed again for those."""
+    broken: dict[str, set[str]] = {column: set() for column in lost}
+    handled: dict[str, dict[str, set[str]]] = {}
+    work = [(node, columns, {column: {column} for column in lost})]
+    while work:
+        at, head_columns, carries = work.pop()
+        done = handled.setdefault(at.id, {})
+        fresh = {c: new for c, origins in carries.items() if (new := origins - done.get(c, set()))}
+        if not fresh or not at.relation:
+            continue
+        for column, origins in fresh.items():
+            done.setdefault(column, set()).update(origins)
+        now = context.with_columns(at.relation, head_columns)
+        was = context.with_columns(at.relation, {**head_columns, **dict.fromkeys(fresh, 'UNKNOWN')})
+        consumers = {c.id: c for column in fresh for c in _consumers(context.graph, at, column)}
+        for consumer in consumers.values():
+            after = _statements(now, consumer)
+            uses = _uses(after)
+            for column, origins in fresh.items():
+                if (at.relation, column) in uses:
+                    for origin in origins:
+                        broken[origin].add(context.graph.label(consumer))
+            outputs = {name.lower(): name for st in after for name in st.columns}
+            passed: dict[str, set[str]] = {}
+            for st in _statements(was, consumer):
+                for name, sources in st.columns.items():
+                    if name.lower() in outputs:
+                        continue
+                    for source in sources:
+                        column = source.column.split('.')[0]
+                        if source.relation == at.relation and column in fresh:
+                            passed.setdefault(name, set()).update(fresh[column])
+            if passed:
+                work.append((consumer, dict.fromkeys(outputs.values(), 'UNKNOWN'), passed))
+    return broken
+
+
 def _compare_statements(
     context: Context,
     change: RelationChange,
@@ -1122,49 +1428,60 @@ def _walk(graph: Graph, node: Node, column: str) -> dict[str, Any] | None:
     return walk.to_dict()
 
 
-def _still_read(context: Context, node: Node, column: str) -> list[str]:
-    """Downstream models and SQL-built tables whose current SQL still reads ``node.column``."""
-    from konstruct.core.sql import strip_templating
-
-    graph = context.graph
-    readers = []
+def _consumers(graph: Graph, node: Node, column: str | None = None) -> list[Node]:
+    """The relations that read ``node``, or its ``column``, by the graph's edges."""
     consumers = {e.target for e in graph.out_edges(node.id, 'feeds')}
-    target = graph.column(node.id, column)
+    target = graph.column(node.id, column) if column else None
     if target is not None:
         consumers |= {e.source.split('#')[0] for e in graph.in_edges(target.id, 'derived_from')}
         consumers |= {e.target for e in graph.out_edges(target.id, 'feeds')}
-    for consumer_id in sorted(consumers):
-        consumer = graph.nodes.get(consumer_id)
-        if consumer is None or consumer.kind not in RELATION_KINDS:
-            continue
-        current = (
-            (context.root / consumer.path)
-            if consumer.path
-            else defining_sql_file(graph, consumer, context.root)
-        )
-        if current is None or not current.is_file():
-            continue
-        text = current.read_text(encoding='utf-8')
-        if 'dbt' in consumer.origins:
-            sql, catalog, schema = context.model_sql(consumer, text)
-            statements = context.lineage(sql, catalog, schema, consumer.relation)
-        else:
-            statements = [
-                s
-                for s in context.lineage(strip_templating(text), None, None, None)
-                if s.target == consumer.relation
-            ]
-        for statement in statements:
-            uses = {
-                (s.relation, s.column.split('.')[0])
-                for sources in statement.columns.values()
-                for s in sources
-            }
-            uses |= {(relation, name.split('.')[0]) for relation, name in statement.references}
-            if (node.relation, column) in uses:
-                readers.append(graph.label(consumer))
-                break
-    return readers
+    found = (graph.nodes.get(i) for i in sorted(consumers))
+    return [n for n in found if n is not None and n.kind in RELATION_KINDS]
+
+
+def _statements(context: Context, consumer: Node) -> list[StatementLineage]:
+    """What the current SQL of ``consumer`` builds, as the context's schema reads it; none where
+    its file is gone."""
+    from konstruct.core.sql import strip_templating
+
+    graph = context.graph
+    current = (
+        (context.root / consumer.path) if consumer.path else defining_sql_file(graph, consumer, context.root)
+    )
+    if current is None or not current.is_file():
+        return []
+    # Only the relations it reads are the schema it needs, and a schema of the whole project
+    # costs every analysis its size.
+    reads = {n.relation for e in graph.in_edges(consumer.id, 'feeds') if (n := graph.nodes.get(e.source))}
+    context = context.restricted_to(reads | {consumer.relation})
+    text = current.read_text(encoding='utf-8')
+    if 'dbt' in consumer.origins:
+        sql, catalog, schema = context.model_sql(consumer, text)
+        return context.lineage(sql, catalog, schema, consumer.relation)
+    return [
+        s for s in context.lineage(strip_templating(text), None, None, None) if s.target == consumer.relation
+    ]
+
+
+def _uses(statements: list[StatementLineage]) -> set[tuple[str, str]]:
+    """The relations and columns (the part before a nested field) that the statements read."""
+    uses: set[tuple[str, str]] = set()
+    for statement in statements:
+        uses |= {
+            (s.relation, s.column.split('.')[0]) for sources in statement.columns.values() for s in sources
+        }
+        uses |= {(relation, name.split('.')[0]) for relation, name in statement.references}
+    return uses
+
+
+def _still_read(context: Context, node: Node, column: str) -> list[str]:
+    """Downstream models and SQL-built tables whose current SQL still reads ``node.column``."""
+    graph = context.graph
+    return [
+        graph.label(consumer)
+        for consumer in _consumers(graph, node, column)
+        if (node.relation, column) in _uses(_statements(context, consumer))
+    ]
 
 
 def _compare_dag_file(
