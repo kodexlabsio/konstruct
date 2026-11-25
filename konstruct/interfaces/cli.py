@@ -115,8 +115,11 @@ def cmd_build(args: argparse.Namespace, console: Console) -> int:
         console.info(f'building {config.root}')
     with progress:
         result = build(config, update=args.update)
+    from konstruct.analysis.findings import top_findings
+
     graph = result.graph
     findings = analyse(graph)
+    leads = top_findings(graph, result.outputs[0].parent, config.root)
     stats = graph.stats()
     outputs = [_relative(p) for p in result.outputs]
     if args.json:
@@ -131,15 +134,22 @@ def cmd_build(args: argparse.Namespace, console: Console) -> int:
             'lineage': {'covered': findings.lineage_covered, 'columns': findings.lineage_total},
             'cache': {'hits': result.cache_hits, 'misses': result.cache_misses},
             'warnings': graph.warnings,
+            'findings': [f.to_dict() for f in leads.findings],
         }
         console.print(json.dumps(summary, indent=2))
     else:
-        _print_build(console, config.root, result, findings, outputs, args.update)
+        _print_build(console, config.root, result, findings, outputs, args.update, leads)
     return 1 if args.strict and graph.warnings else 0
 
 
 def _print_build(
-    console: Console, root: Path, result: Any, findings: Any, outputs: list[str], update: bool
+    console: Console,
+    root: Path,
+    result: Any,
+    findings: Any,
+    outputs: list[str],
+    update: bool,
+    leads: Any = None,
 ) -> None:
     graph = result.graph
     folder = _relative(result.outputs[0].parent)
@@ -155,6 +165,7 @@ def _print_build(
         graph.warnings,
         f'{names} to {folder} in {result.seconds:.1f}s',
         outputs[1],
+        leads,
     )
     console.print(console.ui.render(lines))
 

@@ -32,7 +32,7 @@ and a `graph.json` written by a newer Konstruct raises {class}`konstruct.FormatE
 | `konstruct.inputs` | `dbt`, `dbt_commit` (a dbt manifest as a commit's files are), `jinja`, `airflow`, `dagster`, `spark`, `looker`, `powerbi`, `loaders`, `ingestion`, `hcl`, `warehouse`, `usage` |
 | `konstruct.engine` | `build`, `config`, `worker`, `snapshot` (a commit's files, and the user's private cache) |
 | `konstruct.semantics` | `definitions`, `vocabulary`, `ontology`, `world`, `world_facts` (the world as facts to compare), `ossie`, `rows` (whether a composed formula counts its column's rows), `registry` |
-| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `conflict_data`, `seedfiles`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
+| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `conflict_data`, `seedfiles`, `findings`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
 | `konstruct.outputs` | `report`, `html`, `export`, `compiled` (the ontology as tables, relationships and metrics for the platform exports), `owl`, `semantic_view`, `metric_view`, `odcs` |
 | `konstruct.interfaces` | `cli`, `project`, `mcp_server`, `skill`, `console`, `status` |
 | `konstruct.plugins` | `api` (the plugin API: protocols and types), `registry` (finding, enabling and loading plugins) |
@@ -51,6 +51,8 @@ if not project.has_graph() or project.changed_inputs():
     result = project.build(update=True)  # reuse the analysis of anything unchanged
     print(result.inputs)  # {'dbt_projects': 1, 'warehouses': 1, ...}
     print(result.graph.warnings)  # problems with the inputs, if any
+for finding in project.findings().findings:  # what `konstruct build` ends with
+    print(finding.kind, finding.text, finding.command)
 ```
 
 The repository's own warehouse connections and paths outside it are used, and dbt is run, once
@@ -67,6 +69,7 @@ The repository's own warehouse connections and paths outside it are used, and db
 .. automethod:: konstruct.Project.config
 .. automethod:: konstruct.Project.plugins
 .. automethod:: konstruct.Project.trust
+.. automethod:: konstruct.Project.findings
 .. autoproperty:: konstruct.Project.graph
 .. autoproperty:: konstruct.Project.root
 .. autoproperty:: konstruct.Project.graph_path
@@ -695,6 +698,12 @@ tables, skipped = load_seeds(con, project.root, seeds)  # into a DuckDB connecti
 
 ```{eval-rst}
 .. autoclass:: konstruct.engine.build.BuildResult
+   :members:
+
+.. autoclass:: konstruct.analysis.findings.TopFindings
+   :members:
+
+.. autoclass:: konstruct.analysis.findings.Finding
    :members:
 ```
 
