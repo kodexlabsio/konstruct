@@ -1964,6 +1964,22 @@ def two_projects(tmp_path_factory: pytest.TempPathFactory) -> tuple[Checker, str
     return Checker(Project(root).graph), str(root / 'prices.csv')
 
 
+def test_an_unqualified_name_is_read_in_the_schema_of_the_project_that_has_it(
+    two_projects: tuple[Checker, str],
+) -> None:
+    """The graph keeps the default schema of one project, alpha's; beta's SQL names its trips
+    unqualified, as beta's own default schema holds them. A name no schema holds, or names two
+    schemas hold between them, is still unknown."""
+    checker = two_projects[0]
+    assert checker.graph.meta['default_catalog'] == 'alpha'
+    assert loud(checker.check('select sum(km) as km from trips')) == []
+    assert loud(checker.check('select count(*) from orders')) == []
+    finding = only(checker.check('select * from nothing_here'), 'unknown-relation')
+    assert finding.message == 'alpha.main.nothing_here is not a relation of the project'
+    both = checker.check('select sum(km) from trips join orders on order_id = trip_id')
+    assert 'unknown-relation' in loud(both)
+
+
 def test_a_table_function_s_columns_are_those_it_lists(two_projects: tuple[Checker, str]) -> None:
     """read_csv(...) is no relation of the graph, whatever the default schema's name stands for:
     the columns read from it are those its call lists, and with none listed, those of a file the
