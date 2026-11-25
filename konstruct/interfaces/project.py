@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from konstruct.analysis.english import English
     from konstruct.analysis.erasure import ErasureMap
     from konstruct.analysis.explain import Explanation
+    from konstruct.analysis.findings import TopFindings
     from konstruct.analysis.gate import Gate
     from konstruct.analysis.history import History
     from konstruct.analysis.laws import Laws
@@ -775,6 +776,35 @@ class Project:
             jsonio.write_text(self.out_dir / 'conflicts.json', json.dumps(data, indent=1) + '\n')
             show_conflicts(self.graph, self.out_dir, graph_data, fingerprint)
         return result
+
+    def findings(self, limit: int = 6) -> TopFindings:
+        """What in the graph is most worth acting on first, as ``konstruct build`` ends with it.
+
+        At most one finding of each kind, in this order: the most consequential conflict the
+        project's own terms declare (two columns bound to one business term in definitions.yml or a
+        vocabulary, or one bound to it and the other named like it, that compute it differently),
+        with how the two differ on the data when :meth:`verify_conflicts` last ran them; an approved
+        term the code no longer matches; a claim of the graph the data contradicted when
+        :meth:`verify` last ran (or that the lineage is unchecked, where there is data to check it
+        against); and the project's own column (not a dbt package's) whose change reaches the most
+        exposures. Each says what was found
+        and the command that shows more. Only the graph and the files earlier runs wrote beside it
+        are read, never the warehouse.
+
+        Args:
+            limit: The most findings.
+
+        Returns:
+            The findings, most useful first.
+
+        Example::
+
+            for finding in project.findings().findings:
+                print(finding.kind, finding.text, finding.command)
+        """
+        from konstruct.analysis.findings import top_findings
+
+        return top_findings(self.graph, self.out_dir, self.root, limit=limit)
 
     def check_sql(self, sql: str) -> SqlCheck:
         """Check SQL against the project's definitions, keys and relationships, without running it.

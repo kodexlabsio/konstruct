@@ -754,3 +754,22 @@ def test_odcs_export_and_check_at_scale(tmp_path: Path) -> None:
     assert found['odcs_contracts'] == MODELS
     assert found['odcs_export_s'] < 10 and found['odcs_check_s'] < 10, found
     print(f'\n{MODELS} models: export {found["odcs_export_s"]}s, check {found["odcs_check_s"]}s')
+
+
+def test_the_findings_a_build_ends_with_stay_fast(tmp_path: Path) -> None:
+    """The findings walk the columns that read none of the project's own and compare the conflicting
+    pairs once, so on 2,000 models they add a second or so to a build. CPU time, bounded at about
+    ten times what a laptop takes."""
+    from konstruct.analysis.findings import top_findings
+
+    make_project(tmp_path, 2000, 20)
+    project = Project(tmp_path)
+    graph = project.build(run_dbt=False, warehouses=False).graph
+    started = cpu_seconds()
+    result = top_findings(graph, project.out_dir, project.root)
+    taken = cpu_seconds() - started
+    # The generated project defines no business term, so no conflicting pair is one it declares,
+    # and the findings lead with the widest reach.
+    assert [f.kind for f in result.findings] == ['reach']
+    assert taken < 10, f'the findings took {taken:.1f}s of CPU'
+    print(f'\n2000 models: the findings took {taken:.2f}s of CPU')

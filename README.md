@@ -231,7 +231,9 @@ Linux, macOS and Windows that do not. Konstruct runs on x86_64, aarch64, riscv64
 Then, in a repository with dbt models, SQL, DAGs or a warehouse:
 
 ```bash
-konstruct build                         # writes konstruct-out/: graph.json, REPORT.md, graph.html, ontology.yml
+konstruct trust                         # once you have reviewed the project: lets Konstruct run dbt in it
+konstruct build                         # writes konstruct-out/ and ends with the findings worth a look
+konstruct verify --conflicts            # do two definitions of one number disagree on your data, and where?
 konstruct impact stg_payments.amount    # everything downstream of a column
 konstruct explain orders.amount         # how a column is calculated, down to its sources
 konstruct history orders.amount         # when its formula changed, and who approved it
@@ -241,7 +243,25 @@ konstruct relate customer payment       # how two entities join, and how far to 
 konstruct install                       # the Konstruct skills for Claude Code and Cursor (--agent all for every agent)
 ```
 
-No configuration is needed: Konstruct finds dbt projects, Airflow and Dagster files, SQL, definitions and the warehouse each dbt profile points at. [Getting started](https://kodexlabsio.github.io/konstruct/getting-started.html) covers extras, pinning a release and the bundled example.
+No configuration is needed: Konstruct finds dbt projects, Airflow and Dagster files, SQL, definitions and the warehouse each dbt profile points at. On the bundled example the first build ends like this, and `verify --conflicts` runs the conflict it found on the data, reading the dbt seeds when nothing is built yet:
+
+```text
+Findings
+  conflict  orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way (a filter only in finance_orders.order_value, and 2 more differences); compare them on the data: `konstruct verify --conflicts`
+  reach     a change to raw_payments.amount reaches 1 exposure (customer_dashboard) and 9 columns in 5 relations; see everything downstream: `konstruct impact raw_payments.amount`
+
+$ konstruct verify --conflicts
+Order amount
+  finance_orders.order_value  vs  orders.amount
+    finance_orders.order_value and orders.amount differ: 6 rows of order_id only in orders.amount; totals 1,585 and 1,672, 87 apart (5.5% of the first)
+    - filter only in finance_orders.order_value: WHERE NOT stg_orders.status IN ('returned', 'return_pending')
+    order_id  finance_orders.order_value  orders.amount
+    23                            no row           23.0
+    8                             no row           23.0
+    next  konstruct verify --why finance_orders.order_value --where order_id=23
+```
+
+From an empty directory to that result takes about six seconds, most of it dbt compiling the project ([performance](https://kodexlabsio.github.io/konstruct/performance.html#the-first-run)). [Getting started](https://kodexlabsio.github.io/konstruct/getting-started.html) covers extras, pinning a release and the bundled example.
 
 <p align="center">
 <img src="docs/images/demo-cli.gif" alt="konstruct build and konstruct impact on the jaffle_shop example" width="100%" />

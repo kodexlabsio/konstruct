@@ -13,6 +13,25 @@ A cold build analyses dbt models in worker processes, one per CPU up to eight, a
 
 Plugins cost nothing in commands that cannot run one: only `build`, `export`, `gate`, `hook`, `mcp`, `status` and `plugins` (and a query command that builds a missing graph) read the installed distributions' entry points, once for each repository a build reads. With 170 distributions installed, reading them takes about 40 ms and building the registry from them (`Plugins.discover()`) about 85 ms, and a plugin is imported only when its group is first used. `uv run .kodex/scripts/plugin_startup.py` measures it on your machine.
 
+## The First Run
+
+From an empty directory to the first findings, on a copy of the bundled example as a repository holds it (no `target/`, no warehouse), on a four-core Intel Xeon cloud machine at 2.3 GHz with Python 3.12 and dbt-core 1.12, the median of three runs in wall-clock time:
+
+| Step | Time |
+|---|---:|
+| `konstruct trust` | 0.14 s |
+| `konstruct build`, which runs `dbt docs generate` and ends with the findings | 5.78 s |
+| `konstruct verify --conflicts`, from the seeds' CSV files | 0.51 s |
+| From the empty directory to the conflict on the data | 6.60 s |
+
+```bash
+mkdir first && git ls-files examples/jaffle_shop | tar -cf - -T - | tar -xf - -C first
+cd first/examples/jaffle_shop
+time konstruct trust && time konstruct build && time konstruct verify --conflicts
+```
+
+The findings a build ends with read only the graph: on the 2,000-model project above they take 0.5 to 0.9 s of CPU after a cold build of about 20 s, most of it comparing the conflicting pairs once (`uv run pytest tests/test_scale.py -k findings -s`).
+
 ## A Project dbt Compiles
 
 `.kodex/scripts/dbt_benchmark.py` measures Konstruct on the same 2,000 models written as a dbt project, each relation a `ref` or a `source` and each model's tag in its config, with the Airflow DAGs of the first table, compiled by dbt in DuckDB, so that dbt writes the manifest, in its own order, and the catalog. Each command runs in a fresh process, and its CPU time is that of the process and its worker processes together, the median of three runs on a four-core Intel Xeon cloud machine at 2.3 GHz with Python 3.12 and four worker processes (`uv run .kodex/scripts/dbt_benchmark.py --work DIR --repeat 3`).

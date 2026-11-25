@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from konstruct.analysis.english import English
     from konstruct.analysis.erasure import ErasureMap
     from konstruct.analysis.explain import Explanation
+    from konstruct.analysis.findings import TopFindings
     from konstruct.analysis.gate import Gate
     from konstruct.analysis.history import History
     from konstruct.analysis.integrity import KeyCheck, LinkCheck
@@ -1781,8 +1782,10 @@ def build_lines(
     warnings: list[str],
     wrote: str,
     report: str,
+    findings: TopFindings | None = None,
 ) -> Lines:
-    """The summary `konstruct build` prints: what it read, what the graph holds, what it wrote."""
+    """The summary `konstruct build` prints: what it read, what the graph holds, what it wrote,
+    and with ``findings``, what in it is most worth acting on."""
     keys = [s.get('input', '') for s in sources] + ['warnings']
     width = max(width_of(k) for k in keys)
     lines = [header('Built', root), blank()]
@@ -1840,4 +1843,15 @@ def build_lines(
     if len(warnings) > 5:
         lines.append(Text(' ' * (width + 4), (f'and {len(warnings) - 5} more in {report}', 'dim')))
     lines += pairs(style, [('wrote', wrote)], width=width)
+    if findings is not None and findings.findings:
+        lines += [blank(), *findings_lines(findings, style)]
+    return lines
+
+
+def findings_lines(result: TopFindings, style: Style) -> Lines:
+    """The findings a build ends with, each one line with the command that shows more."""
+    if not result.findings:
+        return []
+    lines = [section('Findings')]
+    lines += pairs(style, [(f.kind, _commands(f.line())) for f in result.findings])
     return lines

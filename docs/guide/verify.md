@@ -93,7 +93,7 @@ Order amount
 - **Agreement:** a pair that differs in its SQL but not on these rows is reported as agreeing, with the number of keys and the total: on this data the difference does not matter, though it may on other data.
 - **The next step:** the row that differs most comes with the `verify --why` command for it, on the side without the row where only one side has it, which lists the source rows and the filter or join that left it out.
 
-Pairs are run in the order `konstruct conflicts` ranks them; `-n/--limit` takes the first N (50 by default) and `-m/--model` only the pairs with a column of that model. The values of a sensitive column (see [Sensitive Data and Erasure](sensitivity.md)) are masked in the rows listed. The run writes `konstruct-out/conflict_data.json`; `--json` prints the same document, and `--strict` exits with status 1 when a pair disagrees.
+Pairs are run in the order `konstruct conflicts` ranks them; `-n/--limit` takes the first N (50 by default) and `-m/--model` only the pairs with a column of that model. The values of a sensitive column (see [Sensitive Data and Erasure](sensitivity.md)) are masked in the rows listed. The run writes `konstruct-out/conflict_data.json`, which the [findings a build ends with](../getting-started.md#first-findings) read for that pair while its formulas are unchanged; `--json` prints the same document, and `--strict` exits with status 1 when a pair disagrees.
 
 ## Data Laws
 
