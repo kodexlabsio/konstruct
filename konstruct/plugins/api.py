@@ -69,8 +69,8 @@ def shown(version: ApiVersion) -> str:
 # a name assigned it, or from ``dict(...)``, ``{**...}``, ``getattr`` or ``... or {}`` of it.
 _KONSTRUCT_ATTRS = frozenset(
     {
-        'aggregates_rows', 'also_via', 'approved', 'bash_command', 'broader', 'checksum', 'column', 'columns', 'columns_guessed', 'command',
-        'conditions', 'connection', 'currency', 'dag', 'dbt_name', 'declared_loader', 'definition', 'documented_only', 'error_if',
+        'aggregates_rows', 'also_via', 'approved', 'bash_command', 'broader', 'checksum', 'column', 'columns', 'columns_guessed', 'column_types', 'command',
+        'conditions', 'connection', 'currency', 'dag', 'dbt_name', 'declared_loader', 'definition', 'delimiter', 'documented_only', 'error_if',
         'entities', 'exceptions', 'expression', 'fields', 'filters', 'formula', 'formula_dialect', 'fqn', 'grain',
         'identifier_fields', 'in_warehouse', 'incremental_strategy', 'inferred', 'iri', 'kind', 'label',
         'line', 'lineage', 'loaded', 'loaded_by', 'loader', 'loader_role', 'masking_policy', 'materialized', 'materialized_view', 'maturity', 'measure_filters', 'measures', 'model',

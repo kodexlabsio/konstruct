@@ -23,3 +23,5 @@ revenue
 - **What comes first.** Conflicts are ranked by what depends on each side: exposures and dashboards, approved business terms, orchestration tasks and downstream columns.
 
 `CONFLICTS.md` (one section per conflict, with a table of both formulas and a list of differences) and `conflicts.json` are written beside the graph, and `graph.html` shows the most consequential hundred on its conflicts page until the graph changes (a build does not look for conflicts itself; run `konstruct conflicts` again after one), ready to take into a meeting where the definition gets agreed and recorded in `definitions.yml`. The `conflicts` MCP tool gives an agent the same list, so it can check whether a measure already exists before adding another.
+
+To see whether the two disagree on the data, and on which rows, run `konstruct verify --conflicts` (see [Conflicts on the Data](verify.md#conflicts-on-the-data)).

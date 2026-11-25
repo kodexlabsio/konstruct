@@ -39,6 +39,7 @@ from konstruct.interfaces.layout import (
 if TYPE_CHECKING:
     from konstruct.analysis.checksql import HistoryCheck, SqlCheck
     from konstruct.analysis.compile import Compiled
+    from konstruct.analysis.conflict_data import ConflictsOnData
     from konstruct.analysis.conflicts import Conflicts
     from konstruct.analysis.contract import ContractCheck
     from konstruct.analysis.diff import Diff
@@ -1309,6 +1310,50 @@ def conflicts_lines(result: Conflicts, style: Style) -> Lines:
                 # Values at which the two give different results, or the function they apply
                 # differently.
                 lines += paragraph(style, Text((str(difference.witness), 'dim')), indent=8)
+    return lines
+
+
+def conflict_data_lines(result: ConflictsOnData, style: Style) -> Lines:
+    from konstruct.analysis.why import show_value
+
+    lines = [Text(('Conflicting definitions on the data', 'title')), blank()]
+    counts = result.counts()
+    lines += _summary(style, Text((result.summary(), 'warn' if counts['disagree'] else 'ok')))
+    current = None
+    for pair in result.pairs:
+        if pair.idea != current:
+            current = pair.idea
+            lines += [blank(), section(pair.idea)]
+        else:
+            lines.append(blank())
+        lines += wrap(style, Text('  ', (pair.a, 'strong'), ('  vs  ', 'dim'), (pair.b, 'strong')), hanging=4)
+        role = 'dim' if pair.skipped else 'ok' if pair.agrees else 'warn'
+        lines += paragraph(style, Text((pair.summary(), role)), indent=4)
+        for difference in pair.differences:
+            lines += wrap(style, Text(('- ' + difference, 'dim')), indent=4, hanging=6)
+        if pair.examples and pair.key is not None:
+            rows: list[list[Cell]] = [
+                [
+                    show_value(e.key),
+                    show_value(e.a) if e.in_a else Text(('no row', 'dim')),
+                    show_value(e.b) if e.in_b else Text(('no row', 'dim')),
+                ]
+                for e in pair.examples
+            ]
+            lines += table(style, rows, indent=4, right=[1, 2], headers=[pair.key, pair.a, pair.b], cap=None)
+        command_text = pair.next_command()
+        if command_text:
+            lines.append(Text('    ', ('next  ', 'dim'), (command_text, 'accent')))
+    if result.pairs:
+        lines.append(blank())
+        if result.sampled:
+            lines += _note(
+                style,
+                f'A source has more than {result.max_rows} rows and only the first {result.max_rows} were '
+                'read, so the results are for a sample; raise --rows to read more.',
+                indent=0,
+            )
+        lines.append(Text((f'Run read-only against {result.warehouse} in {result.seconds:.2f}s.', 'dim')))
     return lines
 
 

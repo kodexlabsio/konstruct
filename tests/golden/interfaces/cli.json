@@ -1009,6 +1009,7 @@
  "konstruct trust <0>": "positional str, optional",
  "konstruct trust <0> default": "None",
  "konstruct verify": "command",
+ "konstruct verify --conflicts": "flag",
  "konstruct verify --effect": "flag",
  "konstruct verify --format": "option str",
  "konstruct verify --format default": "'text'",

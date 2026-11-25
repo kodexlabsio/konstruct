@@ -29,6 +29,7 @@ import random
 import re
 import time
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -594,11 +595,24 @@ class Engine:
         """Release the connection."""
 
 
-def _sandbox(con: Any) -> None:
+def _sandbox(con: Any, paths: Sequence[Path] | None = None) -> None:
     """Keep a model's SQL to the copies verify makes: no files, URLs or extensions it names, and no
-    setting the SQL could change back."""
-    for setting in ('autoinstall_known_extensions', 'autoload_known_extensions', 'enable_external_access'):
+    setting the SQL could change back. With ``paths``, the files DuckDB may still open (each with
+    its write-ahead log), before anything is attached, and the configuration stays unlocked for
+    :func:`_lock`; a warehouse file then cannot make DuckDB load an extension or read another file
+    while it is attached."""
+    for setting in ('autoinstall_known_extensions', 'autoload_known_extensions'):
         con.execute(f'SET {setting} = false')
+    if paths is not None:
+        allowed = [str(p) for path in paths for p in (path.resolve(), Path(f'{path.resolve()}.wal'))]
+        con.execute(f'SET allowed_paths = [{", ".join(_literal(p) for p in allowed)}]')
+    con.execute('SET enable_external_access = false')
+    if paths is None:
+        _lock(con)
+
+
+def _lock(con: Any) -> None:
+    """Lock the configuration, so the SQL run cannot change it back."""
     con.execute('SET lock_configuration = true')
 
 
@@ -614,6 +628,7 @@ class DuckDBEngine(Engine):
 
         self.label = str(warehouse)
         self.con = duckdb.connect()
+        _sandbox(self.con, [warehouse])
         self.con.execute(f'ATTACH {_literal(str(warehouse))} (READ_ONLY)')
         row = self.con.execute(
             'SELECT database_name FROM duckdb_databases() WHERE path = ?', [str(warehouse.resolve())]
@@ -621,7 +636,7 @@ class DuckDBEngine(Engine):
         self.database = (row[0] if row else warehouse.stem).lower()
         if memory_limit is not None:
             self.con.execute(f'SET memory_limit = {_literal(memory_limit)}')
-        _sandbox(self.con)
+        _lock(self.con)
 
     def start(self) -> None:
         self.con.execute('DROP SCHEMA IF EXISTS kp CASCADE')

@@ -57,6 +57,13 @@ def _incremental(config: dict[str, Any]) -> dict[str, Any]:
     return found
 
 
+def _seed(config: dict[str, Any]) -> dict[str, Any]:
+    """A seed's delimiter and column types, which say how its CSV file is read."""
+    if config.get('materialized') != 'seed':
+        return {}
+    return {k: config[k] for k in ('delimiter', 'column_types') if config.get(k)}
+
+
 def _description(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
@@ -180,6 +187,7 @@ def load(
                     'tags': item.get('tags', []),
                     'dbt_name': item['name'],
                     'checksum': (item.get('checksum') or {}).get('checksum'),
+                    **_seed(config),
                     **_incremental(config),
                 },
             )
