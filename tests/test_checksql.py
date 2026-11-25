@@ -1923,6 +1923,138 @@ def test_an_average_grouped_by_a_key_that_can_be_null_is_a_fan_out(accounts: Che
     )
 
 
+@pytest.fixture(scope='module')
+def two_projects(tmp_path_factory: pytest.TempPathFactory) -> tuple[Checker, str]:
+    """A repository of two dbt projects, each building its models in its own DuckDB file: alpha's
+    orders, with prices read from a CSV file, and beta's trips."""
+    from konstruct.engine.build import build
+    from konstruct.engine.config import load_config
+
+    dbt = dbt_executable()
+    if dbt is None:
+        pytest.skip('dbt is not installed')
+    root = tmp_path_factory.mktemp('two_projects')
+    (root / 'prices.csv').write_text('sku,price,valid_from\na,10,2026-01-01\n')
+    models = {
+        'alpha': {
+            'orders.sql': "select 1 as order_id, 'a' as sku, date '2026-02-01' as ordered_at",
+            'order_prices.sql': (
+                f"select o.order_id, p.price from read_csv('{root / 'prices.csv'}', columns = "
+                "{'sku': 'VARCHAR', 'price': 'INT', 'valid_from': 'DATE'}) p "
+                "join {{ ref('orders') }} o using (sku) where o.ordered_at >= p.valid_from"
+            ),
+        },
+        'beta': {'trips.sql': 'select 1 as trip_id, 3 as km'},
+    }
+    for name, files in models.items():
+        project = root / name
+        (project / 'models').mkdir(parents=True)
+        (project / 'dbt_project.yml').write_text(
+            f"name: {name}\nversion: '1.0'\nprofile: {name}\nmodel-paths: [models]\n"
+        )
+        (project / 'profiles.yml').write_text(
+            f'{name}:\n  target: dev\n  outputs:\n    dev:\n      type: duckdb\n      path: {name}.duckdb\n'
+        )
+        for file, sql in files.items():
+            (project / 'models' / file).write_text(sql)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv('PATH', f'{Path(dbt).parent}{os.pathsep}{os.environ.get("PATH", "")}')
+        patch.setenv('DBT_SEND_ANONYMOUS_USAGE_STATS', 'false')
+        build(load_config(root, trusted=True))
+    return Checker(Project(root).graph), str(root / 'prices.csv')
+
+
+def test_a_table_function_s_columns_are_those_it_lists(two_projects: tuple[Checker, str]) -> None:
+    """read_csv(...) is no relation of the graph, whatever the default schema's name stands for:
+    the columns read from it are those its call lists, and with none listed, those of a file the
+    check does not read."""
+    checker, csv = two_projects
+    listed = (
+        f"select p.price, o.order_id from read_csv('{csv}', columns = {{'sku': 'VARCHAR', 'price': 'INT', "
+        "'valid_from': 'DATE'}) p join orders o using (sku) where o.ordered_at >= p.valid_from"
+    )
+    assert checker.check(listed).findings == []
+    assert checker.check(listed.replace(', columns = {', ', types = {')).findings == []
+    finding = only(checker.check(listed.replace('p.price', 'p.cost')), 'unknown-column')
+    assert finding.severity == 'warning' and finding.message == 'read_csv(...) has no column cost'
+    unqualified = listed.replace('p.price', 'price').replace('p.valid_from', 'valid_from')
+    assert checker.check(unqualified).findings == []
+    assert only(checker.check(unqualified.replace('select price', 'select cost')), 'unknown-column')
+
+
+def test_a_column_the_graph_may_not_list_is_only_a_note(tmp_path: Path) -> None:
+    """Events are in no warehouse the build read: the graph has the columns a model was seen to
+    read of them, which may be fewer than they have, so another column is a note, not a warning.
+    A CTE that unnests a struct in its select list has the struct's fields as columns."""
+    root = tmp_path / 'shop'
+    root.mkdir()
+    make_shop(root)
+    (root / 'mart' / 'clicks.sql').write_text(
+        "create table mart.clicks as select e.event_id, e.kind from raw.events e where e.kind = 'click'"
+    )
+    checker = Checker(Project(root).build(run_dbt=False).graph)
+    finding = only(checker.check('select e.page from raw.events e'), 'unknown-column')
+    assert finding.severity == 'info'
+    assert finding.message.startswith('events has no column page that the graph knows of')
+    # A name close to one the graph lists is likely misspelt.
+    finding = only(checker.check('select e.kinds from raw.events e'), 'unknown-column')
+    assert (
+        finding.severity == 'warning' and finding.message == 'events has no column kinds; did you mean kind?'
+    )
+    assert only(checker.check('select o.page from raw.orders o'), 'unknown-column').severity == 'warning'
+    struct = (
+        "with c as (select o.order_id, unnest([{'a': 1, 'b': 2}], recursive := true) from raw.orders o) "
+        'select c.order_id, c.a, c.b from c'
+    )
+    assert 'unknown-column' not in rules(checker.check(struct))
+    assert 'unknown-column' in rules(
+        checker.check('with c as (select order_id from raw.orders) select c.a from c')
+    )
+
+
+def test_a_column_that_only_chooses_the_rows_a_sum_adds_up_repeats_nothing(
+    shop: Checker, shop_db: Path
+) -> None:
+    """Joined to its order, each payment is one row: a sum of the payments of completed orders adds
+    each payment once, though the order's status repeats on every payment. The order's amount, as
+    the value, repeats; and so does a count whose value is a constant, of rows the order's status
+    chooses."""
+    sql = (
+        "select sum(case when o.status = 'completed' then p.amount end) as paid from raw.orders o "
+        'join raw.payments p on p.order_id = o.order_id'
+    )
+    assert 'fan-out' not in rules(shop.check(sql))
+    con = duckdb.connect(str(shop_db), read_only=True)
+    assert (
+        con.execute(sql).fetchall()
+        == con.execute(
+            "select sum(amount) from raw.payments where order_id in (select order_id from raw.orders where status = 'completed')"
+        ).fetchall()
+    )
+    con.close()
+    assert 'fan-out' in rules(shop.check(sql.replace('p.amount', 'o.amount')))
+    assert 'fan-out' in rules(
+        shop.check(sql.replace('sum(case', 'count(case').replace('then p.amount end', 'then 1 end'))
+    )
+
+
+def test_a_file_read_by_its_path_is_an_unknown_relation(shop: Checker, tmp_path: Path) -> None:
+    """DuckDB reads a quoted path as a table, but nothing says what the file holds: joined to
+    orders, a file with two rows for one order adds its amount twice, so the read is a warning,
+    as for any relation the project does not have."""
+    tags = tmp_path / 'tags.csv'
+    tags.write_text('order_id,tag\n1,a\n1,b\n2,c\n')
+    sql = f"select sum(o.amount) from raw.orders o join '{tags}' t on t.order_id = o.order_id"
+    con = duckdb.connect()
+    con.execute(
+        'create schema raw; create table raw.orders as select * from (values (1, 100), (2, 50)) v(order_id, amount)'
+    )
+    assert con.execute(sql).fetchall() != con.execute('select sum(amount) from raw.orders').fetchall()
+    for read in (f"'{tags}'", f'"{tags}"', "'tags.parquet'", '"events_*"'):
+        finding = only(shop.check(sql.replace(f"'{tags}'", read)), 'unknown-relation')
+        assert finding.severity == 'warning' and 'is not a relation of the project' in finding.message
+
+
 def test_a_named_window_is_the_window_it_names(shop: Checker) -> None:
     """``OVER w`` with ``WINDOW w AS (PARTITION BY ...)`` runs over the partition the WINDOW clause
     gives: the first row of each order's payments is one row per order, and of each method's is

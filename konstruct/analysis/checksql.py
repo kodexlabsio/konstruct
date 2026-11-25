@@ -1943,6 +1943,26 @@ def _subtotals(group: exp.Group) -> bool:
     )
 
 
+def _listed(table: exp.Table) -> list[str] | None:
+    """The columns a table function names as all it returns (``read_csv(..., columns = {'a':
+    'INT'})``), lower case, or None when it names none: its columns are then those of a file the
+    check does not read."""
+    function = table.this
+    if not isinstance(function, exp.Func):
+        return None
+    for argument in function.iter_expressions():
+        if (
+            isinstance(argument, (exp.EQ, exp.PropertyEQ))
+            and argument.this.name.lower() == 'columns'
+            and isinstance(argument.expression, exp.Struct)
+        ):
+            items = argument.expression.expressions
+            if not all(isinstance(i, exp.PropertyEQ) for i in items):
+                return None
+            return [i.this.name.lower() for i in items]
+    return None
+
+
 def _valued(agg: exp.AggFunc, select: exp.Select) -> list[exp.Column]:
     """The columns of ``select`` whose values ``agg`` adds up: not those of a CASE or IF that only
     choose which rows count (``SUM(CASE WHEN c.region = 'EU' THEN o.amount END)`` adds up only
@@ -2188,10 +2208,44 @@ class _Run:
             for t in query.find_all(exp.Table)
             if t.args.get('pivots') or any(s.args.get('pivots') for s in _ancestors(t, exp.Subquery))
         }
+        # The lineage gives a table function's columns the key of the default schema itself; they
+        # are checked against the columns the function lists, when the query reads only one.
+        functions = [t for t in query.find_all(exp.Table) if not t.name]
+        called = {table_key(t, self.checker.default_catalog, self.checker.default_db) for t in functions}
+        named = {
+            table_key(t, self.checker.default_catalog, self.checker.default_db)
+            for t in query.find_all(exp.Table)
+            if t.name
+        }
+        listed = _listed(functions[0]) if len(functions) == 1 else None
         used = [(s.relation, s.column) for sources in lineage.columns.values() for s in sources]
         for relation_key, column in [*used, *lineage.references]:
-            if relation_key not in pivoted:
-                self.unknown_column(self.graph.node_for_relation(relation_key), column.split('.', 1)[0])
+            name = column.split('.', 1)[0]
+            if relation_key in called and relation_key not in named:
+                if listed is not None:
+                    self.unlisted(functions[0], listed, name)
+            elif relation_key not in pivoted:
+                self.unknown_column(self.graph.node_for_relation(relation_key), name)
+
+    def unlisted(self, function: exp.Table, listed: list[str], name: str) -> None:
+        """A column the query reads from a table function that lists its columns without it."""
+        if name.lower() in listed:
+            return
+        call = function.this.sql(dialect=self.checker.sqlglot)
+        called = function.this
+        shown = f'{called.name if isinstance(called, exp.Anonymous) else called.sql_name()}(...)'.lower()
+        close = difflib.get_close_matches(name.lower(), listed, n=3)
+        hint = f'; did you mean {", ".join(close)}?' if close else ''
+        self.add(
+            Finding(
+                'unknown-column',
+                'warning',
+                f'{shown} has no column {name}{hint}',
+                f'Read one of the columns {shown} lists, or list {name} among its columns.',
+            ),
+            f'function:{call}',
+            name.lower(),
+        )
 
     def unknown_column(self, relation: Node | None, name: str) -> None:
         graph = self.graph
@@ -2202,30 +2256,54 @@ class _Run:
             return
         close = difflib.get_close_matches(name, [c.name for c in columns], n=3)
         hint = f'; did you mean {", ".join(close)}?' if close else ''
-        self.add(
-            Finding(
+        label = graph.label(relation)
+        if not close and (
+            relation.attrs.get('columns_guessed') or all(c.attrs.get('documented_only') for c in columns)
+        ):
+            # The graph lists the columns queries were seen to read or documentation names, which
+            # may be fewer than the relation has; a name close to one of them is likely misspelt.
+            finding = Finding(
+                'unknown-column',
+                'info',
+                f'{label} has no column {name} that the graph knows of, but the graph may not list all '
+                'its columns',
+                f'Build the graph with the warehouse or a dbt catalog, so that it lists every column of {label}.',
+            )
+        else:
+            finding = Finding(
                 'unknown-column',
                 'warning',
-                f'{graph.label(relation)} has no column {name}{hint}',
-                f'Read one of the columns of {graph.label(relation)}.',
-            ),
-            relation.id,
-            name.lower(),
-        )
+                f'{label} has no column {name}{hint}',
+                f'Read one of the columns of {label}.',
+            )
+        self.add(finding, relation.id, name.lower())
 
     def unknown_qualified(self, scope: Scope) -> None:
         """A column the query names by its relation's alias (``o.amount_total``), which the
         lineage leaves out when the relation has no such column."""
         for column in scope.columns:
             source = scope.sources.get(column.table)
-            if isinstance(source, exp.Table) and not source.args.get('pivots'):
+            if isinstance(source, exp.Table) and not source.name:
+                listed = _listed(source)
+                if listed is not None:
+                    self.unlisted(source, listed, column.name)
+            elif isinstance(source, exp.Table) and not source.args.get('pivots'):
                 self.unknown_column(self.relation_of(source), column.name)
             elif isinstance(source, Scope) and column.table:
                 # A CTE or subquery has the columns it selects, unless it selects * from something.
                 branches = _branches(source)
+                # An UNNEST of a struct in the select list returns the struct's fields as columns.
                 if not branches or any(
                     isinstance(b.expression, exp.Select)
-                    and (b.expression.is_star or b.expression.args.get('pivots'))
+                    and (
+                        b.expression.is_star
+                        or b.expression.args.get('pivots')
+                        or any(
+                            _owner(u) is b.expression
+                            for e in b.expression.expressions
+                            for u in e.find_all(exp.Unnest, exp.Explode)
+                        )
+                    )
                     for b in branches
                 ):
                     continue
@@ -3223,7 +3301,9 @@ class _Run:
         return None
 
     def relation_of(self, source: Any) -> Node | None:
-        if isinstance(source, exp.Table):
+        # A table function (read_csv(...)) has no name: it is no relation of the graph, whatever
+        # relation the default schema's own name stands for.
+        if isinstance(source, exp.Table) and source.name:
             return self.graph.node_for_relation(
                 table_key(source, self.checker.default_catalog, self.checker.default_db)
             )
