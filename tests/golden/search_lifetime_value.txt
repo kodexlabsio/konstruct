@@ -4,5 +4,5 @@ customers.customer_lifetime_value  model DOUBLE            models/customers.sql
 customer_ltv.lifetime_value        table DOUBLE
 Order amount                       term          approved  definitions.yml
     Total of all payments recorded against an order, in Australian dollars.
-customer_dashboard                 exposure                models/exposures.yml
-    Weekly view of customers, their orders and lifetime value.
+finance_orders.order_value         model DOUBLE            models/finance_orders.sql
+    Total payments (AUD) on the order, for orders not returned or awaiting return

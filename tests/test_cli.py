@@ -33,12 +33,12 @@ def test_build_prints_what_it_found(
     lines = out.splitlines()
     assert lines[0] == f'Built {jaffle}'
     assert (
-        '  dbt          jaffle_shop (.)            5 models, 3 seeds, 24 tests, 1 exposure  '
+        '  dbt          jaffle_shop (.)            6 models, 3 seeds, 26 tests, 1 exposure  '
         '(ran dbt docs generate)' in lines
     )
-    assert '  duckdb       duckdb jaffle_shop.duckdb  9 relations  (dbt profile jaffle_shop)' in lines
+    assert '  duckdb       duckdb jaffle_shop.duckdb  10 relations  (dbt profile jaffle_shop)' in lines
     assert '  airflow      dags/jaffle_shop_daily.py  1 DAG, 6 tasks' in lines
-    assert '  lineage      32 of 32 columns of models and built tables (100%)' in lines
+    assert '  lineage      36 of 36 columns of models and built tables (100%)' in lines
     assert '  warnings     none' in lines
     assert any(
         line.startswith('  wrote        graph.json, REPORT.md, graph.html, ontology.yml, explain.json to ')
@@ -47,13 +47,13 @@ def test_build_prints_what_it_found(
 
     code, out, _ = run(capsys, 'build', str(jaffle), '--update')
     assert code == 0
-    assert '  reused       7 of 7 cached analyses' in out.splitlines()
+    assert '  reused       8 of 8 cached analyses' in out.splitlines()
 
     code, out, _ = run(capsys, 'build', '-C', str(jaffle), '--json', '-u')
     data = json.loads(out)
-    assert data['nodes']['model'] == 5
-    assert data['lineage'] == {'covered': 32, 'columns': 32}
-    assert data['cache'] == {'hits': 7, 'misses': 0}
+    assert data['nodes']['model'] == 6
+    assert data['lineage'] == {'covered': 36, 'columns': 36}
+    assert data['cache'] == {'hits': 8, 'misses': 0}
     assert {i['input'] for i in data['inputs']} == {'dbt', 'duckdb', 'airflow', 'definitions'}
 
 
@@ -64,7 +64,7 @@ def test_query_commands(jaffle_built_graph: Path, capsys: pytest.CaptureFixture[
     assert code == 0
     assert out.splitlines()[:2] == [
         'Downstream of stg_payments.amount (model, DOUBLE)',
-        '7 columns, 3 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.',
+        '8 columns, 4 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.',
     ]
     code, out, _ = run(capsys, '-C', project, 'trace', 'orders.amount', '--json')
     assert code == 0 and json.loads(out)['direction'] == 'upstream'

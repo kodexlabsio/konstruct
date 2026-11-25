@@ -423,7 +423,7 @@ def test_column_aware_selection_is_sound(built_jaffle: Path, tmp_path: Path) -> 
     project = Project(root)
     project.build(run_dbt=False)
     selection = project.diff(base='HEAD').selection
-    assert changed_tables == {'stg_payments', 'orders', 'customers'}
+    assert changed_tables == {'stg_payments', 'orders', 'customers', 'finance_orders'}
     assert changed_tables <= set(selection.models)
     assert 'stg_customers' not in selection.models
     assert 'stg_customers' in selection.modified_plus

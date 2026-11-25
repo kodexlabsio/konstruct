@@ -413,8 +413,8 @@ def test_verify_on_postgres_with_dbt(tmp_path: Path) -> None:
         result = project.verify(warehouse=dsn)
         totals = result.totals()
         assert result.warehouse.startswith('postgres database')
-        assert totals['models'] == 5 and totals['skipped'] == 0
-        assert totals['confirmed'] == totals['claimed'] == 31
+        assert totals['models'] == 6 and totals['skipped'] == 0
+        assert totals['confirmed'] == totals['claimed'] == 35
         assert totals['unexplained'] == 0
         with psycopg.connect(dsn) as con:
             leftovers = con.execute("select count(*) from pg_class where relname like 'kp_%'").fetchone()

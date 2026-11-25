@@ -301,7 +301,7 @@ def test_the_skills_describe_real_output(jaffle_repo: Path, capsys: pytest.Captu
     )
 
     _, out = claims.run('conflicts', '--no-write')
-    claims.hold('reconcile', out, 'No conflicting definitions')
+    claims.hold('reconcile', out, 'conflicting definition among', 'filter', 'join')
     assert not (jaffle_repo / 'konstruct-out' / 'CONFLICTS.md').exists()
 
     _, out = claims.run('list', 'tasks')
@@ -332,7 +332,9 @@ def test_the_skills_describe_real_output(jaffle_repo: Path, capsys: pytest.Captu
     assert 'Gate failed' in out and 'Gate failed' in toolkit.skill('review-change')
     for field in ('file', 'fix'):
         assert f'`{field}`' in toolkit.skill('safe-change') and re.search(rf'\n  {field} ', out), field
-    assert 'breaking: stg_payments.amount is removed but still read by customers, orders' in out
+    assert (
+        'breaking: stg_payments.amount is removed but still read by customers, finance_orders, orders' in out
+    )
     git(jaffle_repo, 'checkout', '--', '.')
 
     # Changing an approved term's column asks for its owner.

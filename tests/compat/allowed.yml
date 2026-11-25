@@ -5,4 +5,27 @@
 # - where: v0.11.13/jaffle_shop/explain_customers_customer_lifetime_value   # fnmatch patterns work
 #   path: .steps          # the JSON path of the difference, or of the object or list holding it
 #   reason: Explain lists every step on the way, not only the first.
-[]
+- where: "v0.11.13/jaffle_shop/diff"
+  path: .dbt.state_modified_plus
+  reason: The example gained finance_orders after 0.13.25, which also reads stg_payments; the graphs of the releases up to 0.13.25 do not have it.
+- where: "v0.11.13/jaffle_shop/diff"
+  path: .dbt.summary
+  reason: The example gained finance_orders after 0.13.25, so state:modified+ selects one model fewer than in the graphs of the releases up to 0.13.25.
+- where: "v0.13.[0-9]/jaffle_shop/diff"
+  path: .dbt.state_modified_plus
+  reason: The example gained finance_orders after 0.13.25, which also reads stg_payments; the graphs of the releases up to 0.13.25 do not have it.
+- where: "v0.13.[0-9]/jaffle_shop/diff"
+  path: .dbt.summary
+  reason: The example gained finance_orders after 0.13.25, so state:modified+ selects one model fewer than in the graphs of the releases up to 0.13.25.
+- where: "v0.13.1[0-9]/jaffle_shop/diff"
+  path: .dbt.state_modified_plus
+  reason: The example gained finance_orders after 0.13.25, which also reads stg_payments; the graphs of the releases up to 0.13.25 do not have it.
+- where: "v0.13.1[0-9]/jaffle_shop/diff"
+  path: .dbt.summary
+  reason: The example gained finance_orders after 0.13.25, so state:modified+ selects one model fewer than in the graphs of the releases up to 0.13.25.
+- where: "v0.13.2[0-5]/jaffle_shop/diff"
+  path: .dbt.state_modified_plus
+  reason: The example gained finance_orders after 0.13.25, which also reads stg_payments; the graphs of the releases up to 0.13.25 do not have it.
+- where: "v0.13.2[0-5]/jaffle_shop/diff"
+  path: .dbt.summary
+  reason: The example gained finance_orders after 0.13.25, so state:modified+ selects one model fewer than in the graphs of the releases up to 0.13.25.

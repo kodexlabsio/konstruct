@@ -32,8 +32,9 @@ konstruct conflicts --no-write
 Konstruct compares computed columns whose names mean the same thing, or that are named like or
 bound to the same business term. Each conflict shows both formulas in terms of source columns, then
 one line per difference: a filter, join or source column on one side only, or a different
-aggregation, with the file it is in. If the two columns are listed, those lines are the answer.
-"No conflicting definitions" means no pair was found, not that the two columns agree.
+aggregation, with the file it is in. The first line counts the pairs (`1 conflicting definition
+among 12 computed columns`); if the two columns are listed, those lines are the answer. "No
+conflicting definitions" means no pair was found, not that the two columns agree.
 
 ## 3. Explain Each Side
 

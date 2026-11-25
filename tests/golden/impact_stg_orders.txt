@@ -1,16 +1,20 @@
 Downstream of stg_orders (model)
-9 columns, 3 relations, 11 tests, 1 exposure, 4 tasks and 1 business term downstream.
+12 columns, 4 relations, 13 tests, 1 exposure, 4 tasks and 1 business term downstream.
 
 Lineage
   stg_orders          model  models/staging/stg_orders.sql
   |- customers        model  models/customers.sql
   |  `- customer_ltv  table  via jaffle_shop_daily.build_customer_ltv
+  |- finance_orders   model  models/finance_orders.sql
   `- orders           model  models/orders.sql
 
-Columns (9)
+Columns (12)
   1  customers.first_order          transformed  model  DATE     models/customers.sql
   1  customers.most_recent_order    transformed  model  DATE     models/customers.sql
   1  customers.number_of_orders     transformed  model  BIGINT   models/customers.sql
+  1  finance_orders.customer_id     direct       model  INTEGER  models/finance_orders.sql
+  1  finance_orders.order_date      direct       model  DATE     models/finance_orders.sql
+  1  finance_orders.order_id        direct       model  INTEGER  models/finance_orders.sql
   1  orders.customer_id             direct       model  INTEGER  models/orders.sql
   1  orders.order_date              direct       model  DATE     models/orders.sql
   1  orders.order_id                direct       model  INTEGER  models/orders.sql
@@ -18,18 +22,20 @@ Columns (9)
   2  customer_ltv.number_of_orders  direct       table  BIGINT   via jaffle_shop_daily.build_customer_ltv
   2  customer_ltv.segment           transformed  table  VARCHAR  via jaffle_shop_daily.build_customer_ltv
 
-Tests (11)
+Tests (13)
   1  accepted_values_stg_orders_status__placed__shipped__completed__return_pending__returned  models/staging/schema.yml
-  1  not_null_stg_orders_customer_id  models/staging/schema.yml
-  1  not_null_stg_orders_order_id     models/staging/schema.yml
+  1  not_null_stg_orders_customer_id   models/staging/schema.yml
+  1  not_null_stg_orders_order_id      models/staging/schema.yml
   1  relationships_stg_orders_customer_id__customer_id__ref_stg_customers_  models/staging/schema.yml
   1  relationships_stg_payments_order_id__order_id__ref_stg_orders_  models/staging/schema.yml
-  1  unique_stg_orders_order_id       models/staging/schema.yml
+  1  unique_stg_orders_order_id        models/staging/schema.yml
   2  accepted_values_orders_status__placed__shipped__completed__return_pending__returned  models/schema.yml
-  2  not_null_orders_customer_id      models/schema.yml
-  2  not_null_orders_order_id         models/schema.yml
+  2  not_null_finance_orders_order_id  models/schema.yml
+  2  not_null_orders_customer_id       models/schema.yml
+  2  not_null_orders_order_id          models/schema.yml
   2  relationships_orders_customer_id__customer_id__ref_customers_  models/schema.yml
-  2  unique_orders_order_id           models/schema.yml
+  2  unique_finance_orders_order_id    models/schema.yml
+  2  unique_orders_order_id            models/schema.yml
 
 Exposures (1)
   2  customer_dashboard  models/exposures.yml
@@ -45,4 +51,4 @@ Business terms (1)
 
 Business entities (2)
   customer  customers
-  order     orders, stg_orders
+  order     finance_orders, orders, stg_orders

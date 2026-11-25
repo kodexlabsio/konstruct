@@ -90,13 +90,14 @@ So the gate fails such a change until its holder is marked on the base, in a cha
 ```text
 $ konstruct erasure customer
 Erasure map for customers.customer_id (customer)
-9 relations hold the rows of a customer (3 delete, 3 none, 3 rebuild); 1 exposure shows it.
+10 relations hold the rows of a customer (3 delete, 3 none, 4 rebuild); 1 exposure shows it.
 
-  relation       action   key                                        personal data
-  customer_ltv   rebuild  customer_id (copy)                         first_name
-  customers      rebuild  customer_id (key)                          first_name, last_name
-  orders         rebuild  customer_id (foreign key); order_id (key)
-  raw_customers  delete   id (copy)                                  first_name, last_name
+  relation        action   key                                        personal data
+  customer_ltv    rebuild  customer_id (copy)                         first_name
+  customers       rebuild  customer_id (key)                          first_name, last_name
+  finance_orders  rebuild  customer_id (copy); order_id (key)
+  orders          rebuild  customer_id (foreign key); order_id (key)
+  raw_customers   delete   id (copy)                                  first_name, last_name
   ...
 ```
 

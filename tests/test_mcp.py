@@ -107,7 +107,8 @@ async def _exercise(client: Client) -> None:
     assert meaning['results'][0]['matched'] == 'words'
     describe = structured(await client.call_tool('describe', {'ref': 'customers'}))
     assert describe['kind'] == 'model'
-    assert structured(await client.call_tool('conflicts', {}))['conflicts'] == []
+    [conflict] = structured(await client.call_tool('conflicts', {}))['conflicts']
+    assert (conflict['a']['label'], conflict['b']['label']) == ('finance_orders.order_value', 'orders.amount')
     # Acceptance: "define lifetime value" returns the approved definition and its bound column.
     defined = structured(await client.call_tool('define', {'ref': 'lifetime value'}))
     [term] = defined['terms']
@@ -220,7 +221,7 @@ async def _prompts_and_resources(client: Client) -> None:
     assert [e['name'] for e in ontology['entities']] == ['customer', 'order', 'payment']
     summary = json.loads((await client.read_resource('konstruct://summary')).contents[0].text)  # type: ignore[union-attr]
     assert summary['untrusted_content'] == UNTRUSTED_CONTENT
-    assert summary['nodes']['model'] == 5 and summary['edges']['derived_from'] > 0
+    assert summary['nodes']['model'] == 6 and summary['edges']['derived_from'] > 0
     assert summary['graph'] == 'konstruct-out/graph.json' and 'root' not in summary
     assert summary['lineage']['covered'] <= summary['lineage']['columns'] and summary['changed_inputs'] == []
 

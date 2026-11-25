@@ -50,7 +50,7 @@ def test_example_builds_every_output(jaffle_built_graph: Path, jaffle_graph: Gra
     assert jaffle_graph.meta['inputs'] == {
         'dbt_projects': 1,
         'warehouses': 1,
-        'dbt_models': 5,
+        'dbt_models': 6,
         'airflow_dags': 1,
         'dagster_assets': 0,
         'dagster_ops': 0,
@@ -119,7 +119,7 @@ def test_example_airflow_tasks_run_dbt_nodes(jaffle_graph: Graph) -> None:
     assert (task + 'dbt_run_staging', 'model.jaffle_shop.orders') not in runs
     assert (task + 'dbt_run_marts', 'model.jaffle_shop.orders') in runs
     tested = {target for source, target in runs if source == task + 'dbt_test'}
-    assert len(tested) == 24
+    assert len(tested) == 26
     assert ('dag.jaffle_shop_daily', task + 'notify_crm') in runs
     assert (task + 'dbt_test', task + 'build_customer_ltv') in edges(jaffle_graph, 'precedes')
 

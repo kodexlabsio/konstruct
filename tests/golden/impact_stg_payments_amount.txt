@@ -1,20 +1,22 @@
 Downstream of stg_payments.amount (model, DOUBLE)
-7 columns, 3 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.
+8 columns, 4 relations, 5 tests, 1 exposure, 2 tasks and 2 business terms downstream.
 
 Lineage
   stg_payments.amount                                model  DOUBLE  models/staging/stg_payments.sql
   |- customers.customer_lifetime_value  transformed  model  DOUBLE  models/customers.sql
   |  |- customer_ltv                    reference    table          via jaffle_shop_daily.build_customer_ltv
   |  `- customer_ltv.lifetime_value     direct       table  DOUBLE  via jaffle_shop_daily.build_customer_ltv
+  |- finance_orders.order_value         transformed  model  DOUBLE  models/finance_orders.sql
   |- orders.amount                      transformed  model  DOUBLE  models/orders.sql
   |- orders.bank_transfer_amount        transformed  model  DOUBLE  models/orders.sql
   |- orders.coupon_amount               transformed  model  DOUBLE  models/orders.sql
   |- orders.credit_card_amount          transformed  model  DOUBLE  models/orders.sql
   `- orders.gift_card_amount            transformed  model  DOUBLE  models/orders.sql
 
-Relations (2)
-  customers  model  models/customers.sql
-  orders     model  models/orders.sql
+Relations (3)
+  customers       model  models/customers.sql
+  finance_orders  model  models/finance_orders.sql
+  orders          model  models/orders.sql
 
 Tests (5)
   2  not_null_orders_amount                models/schema.yml
@@ -36,5 +38,5 @@ Business terms (2)
 
 Business entities (3)
   customer  customers
-  order     orders
+  order     finance_orders, orders
   payment   stg_payments

@@ -146,7 +146,7 @@ Poor data quality is expensive, by the industry's own surveys, most of them by v
 
 **Reading every model downstream becomes a query.** "What breaks if I change this column?" takes about 9 ms on a generated 2,000-model project once the graph is loaded, as the MCP server and the Python API keep it, and about half a second of CPU time from the command line. With the GitHub Action it is asked again on every pull request, before anything ships.
 
-**Claims become evidence.** On the bundled example, every one of its 36 claimed column edges is confirmed against the data, and 300 generated queries on generated data leave nothing unexplained. A lineage graph you can prove is one an auditor, a regulator or an agent can rely on.
+**Claims become evidence.** On the bundled example, every one of its 40 claimed column edges is confirmed against the data, and 300 generated queries on generated data leave nothing unexplained. A lineage graph you can prove is one an auditor, a regulator or an agent can rely on.
 
 **An illustration, not a measurement.** At the UK median advertised data engineer salary of GBP 70,000 ([IT Jobs Watch, six months to November 2026](https://www.itjobswatch.co.uk/jobs/uk/data%20engineer.do), salary only), the 40% of time that Monte Carlo's 2022 survey reports for checking data quality would be GBP 280,000 a year for a ten-person team.
 
@@ -253,9 +253,9 @@ Lineage tools usually assert their lineage. Konstruct measures it, and every num
 
 | Lineage checked against the data (seed 1729) | Claimed column edges | Confirmed | Unexplained |
 |----------------------------------------------|---------------------:|----------:|------------:|
-| The bundled `jaffle_shop` example | 36 | 36 | 0 |
+| The bundled `jaffle_shop` example | 40 | 40 | 0 |
 | dbt Labs' jaffle-shop, at a pinned commit | 87 | 87 | 0 |
-| The example on Postgres | 31 | 31 | 0 |
+| The example on Postgres | 35 | 35 | 0 |
 | Generated queries on generated data (25 on every commit, 300 in a full run) | | | 0 |
 
 | Generated dbt project | Column edges | Cold build | Update, one model edited | Query |

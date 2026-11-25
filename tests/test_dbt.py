@@ -115,7 +115,7 @@ def test_exposures(loaded: tuple[Graph, dbt.DbtLoad]) -> None:
         (['customers', 'orders'], [], {'customers', 'orders'}),
         (['+orders'], [], {'orders', 'stg_orders', 'stg_payments', 'raw_orders', 'raw_payments'}),
         (['1+orders'], [], {'orders', 'stg_orders', 'stg_payments'}),
-        (['stg_payments+'], [], {'stg_payments', 'orders', 'customers'}),
+        (['stg_payments+'], [], {'stg_payments', 'orders', 'customers', 'finance_orders'}),
         (['path:models/staging'], [], {'stg_customers', 'stg_orders', 'stg_payments'}),
         (['models/staging/stg_orders.sql'], [], {'stg_orders'}),
         (['resource_type:seed'], [], {'raw_customers', 'raw_orders', 'raw_payments'}),
@@ -181,7 +181,7 @@ def test_selection_sees_a_path_given_in_place_after_it() -> None:
 
 def test_select_nothing_means_everything(loaded: tuple[Graph, dbt.DbtLoad]) -> None:
     graph, _ = loaded
-    assert len(dbt.select_nodes(graph, [], [])) == 8
+    assert len(dbt.select_nodes(graph, [], [])) == 9
 
 
 def test_stale_manifest_is_regenerated(jaffle: Path, dbt_on_path: None) -> None:
