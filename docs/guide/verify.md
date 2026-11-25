@@ -62,6 +62,39 @@ Column lineage says which columns a value is computed from; `konstruct verify --
 
 `konstruct verify --effect --since REF` runs each changed model as it was before and after each commit in the range on today's data, and prints the release notes with the difference: the rows each version returns, the sum of a changed column in each and, with a key, how many rows changed value (see [The Effect on Today's Data](release-notes.md#the-effect-on-todays-data)). `--until`, `-m/--model`, `--rows` and `--format markdown` or `json` apply.
 
+## Conflicts on the Data
+
+[`konstruct conflicts`](conflicts.md) says how two columns that compute one idea differ in their SQL. `konstruct verify --conflicts` says what that does to the numbers: it runs both columns of each pair on the same rows and reports where they disagree.
+
+```text
+$ konstruct verify --conflicts
+Conflicting definitions on the data
+
+1 conflicting pair run on jaffle_shop.duckdb: 1 disagrees on the data, 0 agree, 0 not run.
+
+Order amount
+  finance_orders.order_value  vs  orders.amount
+    finance_orders.order_value and orders.amount differ: 6 rows of order_id only in orders.amount; totals 1,585 and 1,672, 87 apart (5.5% of the first)
+    - filter only in finance_orders.order_value: WHERE NOT stg_orders.status IN ('returned', 'return_pending')
+    - join only in finance_orders.order_value: JOIN ON stg_payments.order_id = stg_orders.order_id
+    - join only in orders.amount: LEFT JOIN ON stg_orders.order_id = stg_payments.order_id
+    order_id  finance_orders.order_value  orders.amount
+    23                            no row           23.0
+    8                             no row           23.0
+    52                            no row           15.0
+    18                            no row           13.0
+    1                             no row           10.0
+    next  konstruct verify --why finance_orders.order_value --where order_id=23
+```
+
+- **The same rows:** each side's model is composed down to source tables, every model it reads inlined, as `--why` composes one, and each source table is copied once, up to `--rows` rows (a million by default), into the same engines as `verify`. Both sides read the same copies, so a difference is the two definitions' alone. Nothing runs unless every model on the way is a single query that only reads, and nothing is written to the warehouse.
+- **Seeds:** a dbt seed the DuckDB warehouse does not hold is read from its CSV file, with the seed's `delimiter` and `column_types` from its dbt config and the types DuckDB infers for the other columns, and with no warehouse at all the project's seeds alone are read. A project whose sources are seeds is checked before `dbt seed` or `dbt build` has run; `verify --why` reads seeds the same way, so the command each pair ends with runs too. The result names what was read. A seed is read only from a regular file inside the project, of at most 256 MB, reached without a symbolic link and not through `.git`; a seed path that leaves the project, or runs through a link, is left out. The file is copied to a private temporary folder and read there, so its name is never read as a pattern, and the run then reads no file at all.
+- **Matching rows:** the two outputs are matched by one column that identifies the rows of both: a key of either relation in the [ontology](ontology.md), or else a column named like an identifier, present in both outputs, unique and never null in each. By that key the run counts the keys whose values differ and the keys only one side has, gives both totals, and lists up to five rows that differ, the largest difference first, a row one side lacks counting as zero. Values compare as in `--effect`: 1 and 1.0 are one number, and NULL equals NULL. With no such column, as for a total per customer against one per order, only the row counts and the totals are compared, and the result says so. Totals are given only for amounts that add up over rows: a sum, a count, or an amount per row that is not an average, a ratio, a rate, a price, a minimum or a maximum. Two averages with no shared key are reported as *not comparable without a shared key* (`additive` is false in the JSON, and `agrees` is null).
+- **Agreement:** a pair that differs in its SQL but not on these rows is reported as agreeing, with the number of keys and the total: on this data the difference does not matter, though it may on other data.
+- **The next step:** the row that differs most comes with the `verify --why` command for it, on the side without the row where only one side has it, which lists the source rows and the filter or join that left it out.
+
+Pairs are run in the order `konstruct conflicts` ranks them; `-n/--limit` takes the first N (50 by default) and `-m/--model` only the pairs with a column of that model. The values of a sensitive column (see [Sensitive Data and Erasure](sensitivity.md)) are masked in the rows listed. The run writes `konstruct-out/conflict_data.json`; `--json` prints the same document, and `--strict` exits with status 1 when a pair disagrees.
+
 ## Data Laws
 
 Column lineage says which columns a value comes from; the shape of each model's SQL says more. Where a model sums an amount through joins that can neither repeat nor drop a row, the total of its output must equal the total of its input. `konstruct verify --laws` reads each dbt model's compiled SQL and each SQL-built table, proposes the laws that follow, and checks them against the data, read-only:

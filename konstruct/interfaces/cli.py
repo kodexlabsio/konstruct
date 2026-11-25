@@ -481,6 +481,11 @@ def cmd_query(args: argparse.Namespace, console: Console) -> int:
 
 
 def cmd_verify(args: argparse.Namespace, console: Console) -> int:
+    if args.conflicts:
+        others = [f'--{m}' for m in ('mutate', 'why', 'effect', 'laws') if getattr(args, m)]
+        if others:
+            console.error(f'--conflicts and {" and ".join(others)} are separate modes of verify; give one')
+            return 2
     # --mutate with --why runs the mutation tests, as it always has; --effect is new, so it refuses both.
     others = [f'--{m}' for m in ('mutate', 'why') if getattr(args, m)]
     if args.effect and others:
@@ -502,6 +507,8 @@ def cmd_verify(args: argparse.Namespace, console: Console) -> int:
     project = _ready(_project(args), args, console)
     if args.mutate:
         return _mutate(project, args, console)
+    if args.conflicts:
+        return _conflicts(project, args, console)
     if args.why:
         return _why(project, args, console)
     if args.effect:
@@ -566,6 +573,26 @@ def _mutate(project: Project, args: argparse.Namespace, console: Console) -> int
         extra = f', and the report to {args.markdown}' if args.markdown else ''
         console.print('\n' + console.ui.line(Text((f'{wrote}{extra}.', 'dim'))))
     return 0 if result.checked else 1
+
+
+def _conflicts(project: Project, args: argparse.Namespace, console: Console) -> int:
+    """`verify --conflicts`: each conflicting pair run on the same rows."""
+    if not args.json:
+        console.info(
+            'running both sides of each conflicting pair; this reads the warehouse but never writes to it'
+        )
+    with console.progress('Running the conflicting definitions on the data'):
+        result = project.verify_conflicts(
+            warehouse=args.warehouse,
+            limit=args.limit,
+            max_rows=_rows(args, 1_000_000),
+            models=args.model,
+        )
+    _emit(console, result, args.json)
+    if not args.json:
+        wrote = f'Wrote conflict_data.json to {_relative(project.out_dir)}.'
+        console.print('\n' + console.ui.line(Text((wrote, 'dim'))))
+    return 1 if args.strict and result.counts()['disagree'] else 0
 
 
 def _why(project: Project, args: argparse.Namespace, console: Console) -> int:
@@ -1041,6 +1068,7 @@ EXAMPLES: dict[str, tuple[tuple[str, str], ...]] = {
             'konstruct verify --effect --timeline --since v1.4',
             "the timeline, with what each metric's change does on today's data",
         ),
+        ('konstruct verify --conflicts', 'do the conflicting definitions disagree on the data, and where?'),
         ('konstruct verify --laws', 'the totals the lineage says must agree, checked per day'),
         ('konstruct verify --laws --propose', 'the laws alone, reading no warehouse'),
     ),
@@ -1785,7 +1813,8 @@ def parser() -> argparse.ArgumentParser:
         default=10000,
         action=_StoreGiven,
         metavar='N',
-        help='rows copied per input (default 10000, 1000 with --mutate, 1000000 with --why or --effect)',
+        help='rows copied per input (default 10000, 1000 with --mutate, 1000000 with --why, --effect or '
+        '--conflicts)',
     )
     verify.add_argument(
         '--warehouse',
@@ -1844,7 +1873,17 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=50,
         metavar='N',
-        help='the most rows listed in each table (default 50)',
+        help='the most rows listed in each table (default 50); with --conflicts, the most pairs run',
+    )
+    conflicting_data = verify.add_argument_group(
+        'conflicts on the data', 'with --conflicts: do two definitions of one idea disagree on the data?'
+    )
+    conflicting_data.add_argument(
+        '--conflicts',
+        action='store_true',
+        help='run both columns of each pair `konstruct conflicts` finds on the same rows, and count the '
+        'rows where they differ, with their totals and the rows that differ most; writes '
+        'conflict_data.json. --strict exits 1 when a pair disagrees',
     )
     affecting = verify.add_argument_group(
         'the effect of a change', "with --effect: what each formula change does on today's data"

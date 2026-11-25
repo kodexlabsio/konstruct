@@ -680,6 +680,8 @@ def test_exit_statuses(
             patch.setattr(cli, 'cmd_list', lambda args, console: (_ for _ in ()).throw(KeyboardInterrupt))
             return status('-C', str(small), 'list')
 
+    jaffle = tmp_path / 'jaffle_conflicts'
+    shutil.copytree(jaffle_built_graph, jaffle)
     quiet = tmp_path / 'quiet'  # one measure, so nothing to conflict with
     quiet.mkdir()
     (quiet / 'orders.sql').write_text('create table shop.orders as select 1 as amount')
@@ -715,6 +717,11 @@ def test_exit_statuses(
         'conflicts --fail-on-conflict finds none': status(
             '-C', str(quiet), 'conflicts', '--no-write', '--fail-on-conflict'
         ),
+        'verify --conflicts with a pair that disagrees': status('-C', str(jaffle), 'verify', '--conflicts'),
+        'verify --conflicts --strict with a pair that disagrees': status(
+            '-C', str(jaffle), 'verify', '--conflicts', '--strict'
+        ),
+        'verify --conflicts with --laws': status('-C', str(jaffle), 'verify', '--conflicts', '--laws'),
         'ontology with a broken rule': status('-C', str(misbound), 'ontology'),
         'ontology --strict with a broken rule': status('-C', str(misbound), 'ontology', '--strict'),
         'verify finds no warehouse': status('-C', str(small), 'verify', '--no-build'),
@@ -1095,6 +1102,20 @@ def test_json_documents(
     add('entity', '-C', str(copy), 'entity', 'customer', '--json')
     add('relate', '-C', str(copy), 'relate', 'customer', 'payment', '--json')
     add('verify', '-C', str(copy), 'verify', '-m', 'orders', '--json')  # a run limited to one model
+    add('verify --conflicts', '-C', str(copy), 'verify', '--conflicts', '--json')
+    from tests.test_conflict_data import SALES
+    from tests.test_conflict_data import make_shop as make_revenue_shop
+
+    gross = (
+        'create table main.gross as select id as order_id, amount / 100.0 * 1.1 as revenue from raw.orders'
+    )
+    shop = make_revenue_shop(tmp_path / 'revenue_shop', {'sales.sql': SALES, 'gross.sql': gross}).root
+    add('verify --conflicts', '-C', str(shop), 'verify', '--conflicts', '--json')  # values on both sides
+    import duckdb
+
+    duckdb.connect(str(tmp_path / 'empty.duckdb')).close()
+    empty = ['--warehouse', str(tmp_path / 'empty.duckdb')]
+    add('verify --conflicts', '-C', str(shop), 'verify', '--conflicts', *empty, '--json')  # a pair not run
     add('verify', '-C', str(unexplained), 'verify', '--json')
     from tests.test_verify import make_project
 
@@ -1338,6 +1359,7 @@ def test_the_documented_format_versions_are_the_ones_written() -> None:
         'conform.json': 'conform',
         'verify.json': 'verify',
         'laws.json': 'verify --laws',
+        'conflict_data.json': 'verify --conflicts',
     }
     assert {files.get(k, k): v for k, v in documented.items()} == written
 

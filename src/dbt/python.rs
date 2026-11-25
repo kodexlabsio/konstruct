@@ -611,6 +611,14 @@ fn relation_attrs<'py>(
     let checksum = present(doc, item, "checksum").and_then(|c| get(doc, c, "checksum"));
     attrs.set_item("checksum", checksum.map(|v| to_py(py, doc, v)).transpose()?)?;
     // An incremental model's key and strategy, which decide what a run keeps of earlier rows.
+    // A seed's delimiter and column types, which say how its CSV file is read.
+    if setting("materialized").is_some_and(|m| doc.is(m, "seed")) {
+        for key in ["delimiter", "column_types"] {
+            if let Some(value) = setting(key).filter(|v| truthy(doc, *v)) {
+                attrs.set_item(key, to_py(py, doc, value)?)?;
+            }
+        }
+    }
     if setting("materialized").is_some_and(|m| doc.is(m, "incremental")) {
         for key in ["unique_key", "incremental_strategy"] {
             if let Some(value) = setting(key).filter(|v| truthy(doc, *v)) {

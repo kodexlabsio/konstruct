@@ -36,6 +36,17 @@ aggregation, with the file it is in. The first line counts the pairs (`1 conflic
 among 12 computed columns`); if the two columns are listed, those lines are the answer. "No
 conflicting definitions" means no pair was found, not that the two columns agree.
 
+```bash
+konstruct verify --conflicts
+```
+
+Runs both columns of each pair on the same rows, read-only, from the warehouse or the project's dbt
+seeds. A pair that disagrees on the data shows, by a key both share, how many rows give different
+values and how many only one side has, both totals, the rows that differ most, and the command that
+lists the source rows behind the first of them, with the filter or join that left a row out
+(`konstruct verify --why <table.column> --where <key>=<value>`). A pair that agrees on the data says
+so.
+
 ## 3. Explain Each Side
 
 ```bash

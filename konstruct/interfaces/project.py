@@ -28,6 +28,7 @@ from konstruct.core.graph import Graph
 if TYPE_CHECKING:
     from konstruct.analysis.checksql import HistoryCheck, SqlCheck
     from konstruct.analysis.compile import Compiled
+    from konstruct.analysis.conflict_data import ConflictsOnData
     from konstruct.analysis.conflicts import Conflicts
     from konstruct.analysis.contract import ContractCheck
     from konstruct.analysis.diff import Diff
@@ -1693,7 +1694,8 @@ class Project:
         Args:
             column: A column, such as ``customer_ltv.lifetime_value``.
             where: Output columns of the model and the values that pick one row.
-            warehouse: As for :meth:`verify`.
+            warehouse: As for :meth:`verify`. A dbt seed a DuckDB warehouse does not hold is read
+                from its CSV file, and with no warehouse at all, the project's seeds alone.
             limit: The most rows listed in each table.
             max_rows: The most rows copied from any source.
 
@@ -1714,7 +1716,7 @@ class Project:
         """
         from konstruct.analysis.why import why
 
-        target = self._target(warehouse)
+        target = self._seeded(warehouse)
         result = why(
             self.graph,
             self.root,
@@ -1726,6 +1728,86 @@ class Project:
             settings=self._sensitivity_settings(),
         )
         result.warehouse = self._shown(target, result.warehouse)
+        return result
+
+    def verify_conflicts(
+        self,
+        *,
+        warehouse: str | Path | None = None,
+        limit: int | None = 50,
+        max_rows: int = 1_000_000,
+        models: Sequence[str] | None = None,
+        write: bool = True,
+    ) -> ConflictsOnData:
+        """Run each pair :meth:`conflicts` finds on the same rows, and say whether, and where, the
+        two definitions disagree on the data.
+
+        Both sides' models are composed down to source tables and run read-only in verify's
+        engines, on one copy of each source. The rows are matched by a column that identifies the
+        rows of both (a key in the derived ontology, or a column named like an identifier, unique
+        in both outputs); the run counts the rows whose values differ and the rows only one side
+        has, gives both totals and lists up to five rows that differ most. A dbt seed the warehouse
+        does not hold is read from its CSV file, so a project with seeds runs with no warehouse at
+        all.
+
+        Args:
+            warehouse: As for :meth:`verify`; by default the warehouse the build read, or else the
+                project's dbt seeds alone.
+            limit: The most pairs run, the most consequential first.
+            max_rows: The most rows copied from any source.
+            models: Only the pairs with a column of one of these models or tables.
+            write: Write ``conflict_data.json`` beside the graph, which the findings after a build
+                read.
+
+        Returns:
+            One result per pair, with ``counts()`` across them.
+
+        Raises:
+            konstruct.QueryError: There are pairs to run but no warehouse and no seeds, or a model
+                named in ``models`` is not in the graph.
+
+        Example::
+
+            for pair in project.verify_conflicts().pairs:
+                print(pair.a, pair.b, pair.summary())
+        """
+        from konstruct.analysis.conflict_data import conflicts_on_data, remote
+        from konstruct.analysis.conflicts import find_conflicts
+
+        graph = self.graph
+        touching: set[str] | None = None
+        if models:
+            touching = set()
+            for name in models:
+                found = [n for n in graph.relations() if name in (n.name, n.id, graph.label(n))]
+                if not found:
+                    raise query.QueryError(f'no model or table named {name!r}')
+                touching |= {c.id for n in found for c in graph.columns_of(n.id)}
+        target: str | Engine | None
+        try:
+            target = self._target(warehouse)
+        except query.QueryError:
+            if warehouse is not None:
+                raise
+            target = None  # the seeds alone, if there are any
+        if warehouse is None and isinstance(target, str) and not remote(target) and not Path(target).exists():
+            target = None
+        result = conflicts_on_data(
+            graph,
+            self.root,
+            target,
+            conflicts=find_conflicts(graph, touching=touching),
+            limit=limit,
+            max_rows=max_rows,
+            settings=self._sensitivity_settings(),
+        )
+        if isinstance(target, str) and not remote(target):
+            shown = self._shown(target, str(target))
+            result.warehouse = result.warehouse.replace(str(target), shown, 1)
+        if write:
+            jsonio.write_text(
+                self.out_dir / 'conflict_data.json', json.dumps(document(result), indent=1) + '\n'
+            )
         return result
 
     def release_notes(
@@ -2068,6 +2150,26 @@ class Project:
         if warehouse:
             return str(warehouse)
         return self._verification_warehouse()
+
+    def _seeded(self, warehouse: str | Path | None) -> str | Engine:
+        """:meth:`_target`, with each dbt seed a DuckDB warehouse lacks read from its CSV file, and
+        with the seeds alone when no warehouse was found: a project whose seeds are its sources can
+        be checked before anything is built."""
+        from konstruct.analysis.conflict_data import SEED_MEMORY, SeedEngine, remote
+        from konstruct.analysis.seedfiles import seed_files
+
+        seeds = seed_files(self.graph, self.root)
+        try:
+            target = self._target(warehouse)
+        except query.QueryError:
+            if warehouse is not None or not seeds:
+                raise
+            return SeedEngine(None, self.root, seeds, memory_limit=SEED_MEMORY)
+        if not seeds or not isinstance(target, str) or remote(target):
+            return target
+        path = Path(target)
+        found = path if warehouse is not None or path.exists() else None
+        return SeedEngine(found, self.root, seeds, memory_limit=SEED_MEMORY)
 
     def _shown(self, target: str | Engine, label: str) -> str:
         """A DuckDB file inside the project, named relative to it."""

@@ -32,7 +32,7 @@ and a `graph.json` written by a newer Konstruct raises {class}`konstruct.FormatE
 | `konstruct.inputs` | `dbt`, `dbt_commit` (a dbt manifest as a commit's files are), `jinja`, `airflow`, `dagster`, `spark`, `looker`, `powerbi`, `loaders`, `ingestion`, `hcl`, `warehouse`, `usage` |
 | `konstruct.engine` | `build`, `config`, `worker`, `snapshot` (a commit's files, and the user's private cache) |
 | `konstruct.semantics` | `definitions`, `vocabulary`, `ontology`, `world`, `world_facts` (the world as facts to compare), `ossie`, `rows` (whether a composed formula counts its column's rows), `registry` |
-| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
+| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `conflict_data`, `seedfiles`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
 | `konstruct.outputs` | `report`, `html`, `export`, `compiled` (the ontology as tables, relationships and metrics for the platform exports), `owl`, `semantic_view`, `metric_view`, `odcs` |
 | `konstruct.interfaces` | `cli`, `project`, `mcp_server`, `skill`, `console`, `status` |
 | `konstruct.plugins` | `api` (the plugin API: protocols and types), `registry` (finding, enabling and loading plugins) |
@@ -202,6 +202,9 @@ for survivor in tests.models[0].survivors:
 rows = project.why('customer_ltv.lifetime_value', {'customer_id': '3'})
 print(rows.value, [c.values for c in rows.contributions])
 
+for pair in project.verify_conflicts().pairs:  # each conflicting pair, run on the same rows
+    print(pair.a, pair.b, pair.summary())
+
 notes = project.release_notes('v1.4')
 print(notes.markdown())
 effects = project.effect('v1.4', models=['customers'])
@@ -236,6 +239,7 @@ for finding in checked.findings:
 .. automethod:: konstruct.Project.verify
 .. automethod:: konstruct.Project.mutate
 .. automethod:: konstruct.Project.why
+.. automethod:: konstruct.Project.verify_conflicts
 .. automethod:: konstruct.Project.release_notes
 .. automethod:: konstruct.Project.effect
 .. automethod:: konstruct.Project.timeline
@@ -440,6 +444,34 @@ for finding in checked.findings:
 
 .. autoclass:: konstruct.analysis.conflicts.Difference
    :members:
+```
+
+### Conflicts on the Data
+
+```{eval-rst}
+.. autoclass:: konstruct.analysis.conflict_data.ConflictsOnData
+   :members:
+
+.. autoclass:: konstruct.analysis.conflict_data.PairOnData
+   :members:
+
+.. autoclass:: konstruct.analysis.conflict_data.ExampleRow
+   :members:
+```
+
+A dbt seed is read from its file by {mod}`konstruct.analysis.seedfiles`, which checks the path and
+opens it without following a link, and hands DuckDB a private copy, never the project's path:
+
+```python
+from konstruct.analysis.seedfiles import load_seeds, read_seed, seed_files
+
+seeds = seed_files(project.graph, project.root)  # {relation: SeedFile}, only files inside the project
+tables, skipped = load_seeds(con, project.root, seeds)  # into a DuckDB connection not yet locked
+```
+
+```{eval-rst}
+.. automodule:: konstruct.analysis.seedfiles
+   :members: seed_files, read_seed, load_seeds, SeedFile
 ```
 
 ### Changes
