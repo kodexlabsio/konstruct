@@ -1510,6 +1510,29 @@ def test_every_name_in_canonical_text_reads_back_as_the_name_it_is(dialect: str)
         assert isinstance(bare, exp.Column) and bare.name == name and not bare.table, name
 
 
+def test_a_column_of_a_table_function_is_named_without_a_relation() -> None:
+    """A table function's rows have no relation, as an UNNEST's or VALUES' have none: its column is
+    named alone, not as a column of the default schema (``db.main.country``), which reads back as a
+    relation ``main`` that a reading of the query would then be put on."""
+    result = one(
+        "select a.country, a.n * 2 as n2 from read_parquet('x/*.parquet') a "
+        "join read_csv('y.csv') b on b.id = a.id",
+        schema={},
+    )
+    assert result.expressions == {'country': 'country', 'n2': 'n * 2'}
+    assert all(relation for relation, _ in result.references)
+    assert one("select country from read_parquet('x/*.parquet')", schema={}).expressions == {
+        'country': 'country'
+    }
+    # Its conditions name it as its formula does, quoted where it would read back as a literal.
+    made = one(
+        'select a.x, "2024" * 2 as y, "true" as t from read_parquet(\'p\') a where a.x > 1 and "end" = 1',
+        schema={},
+    )
+    assert made.expressions == {'x': 'x', 'y': '"2024" * 2', 't': '"true"'}
+    assert made.conditions == ["ROWS FROM: READ_PARQUET('p')", 'WHERE: x > 1 AND "end" = 1']
+
+
 def test_a_cte_read_by_two_others_names_each_reference_and_moving_a_filter_between_them_shows() -> None:
     """jaffle_shop's customers reads stg_orders through one CTE that two others read, each joined to
     customers on its own: the two readings meet through customers, so each is named, and a filter
