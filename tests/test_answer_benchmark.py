@@ -552,7 +552,7 @@ def test_a_run_scores_every_arm_repeats_and_resumes(corpora: Path, tmp_path: Pat
         assert document['arms'][arm]['correct'] == 6 and document['arms'][arm]['confidently_wrong_rate'] == 0
     assert set(document['by_template']) == {q.template for q in selected}
     lines = [json.loads(line) for line in (out / 'results.jsonl').read_text().splitlines()]
-    assert len(lines) == 24 and lines[0]['input_tokens'] == 20 and lines[0]['graph'] == graph
+    assert len(lines) == 30 and lines[0]['input_tokens'] == 20 and lines[0]['graph'] == graph
     assert {line['repeat'] for line in lines} == {1, 2}
     assert (out / 'transcripts' / 'konstruct' / f'{selected[0].id}.2.json').is_file()
     summary = (out / 'summary.md').read_text()
@@ -625,6 +625,32 @@ def test_the_konstruct_arm_reaches_only_konstruct_s_read_tools(corpora: Path, tm
     assert ab.graph_digest(root) == before
 
 
+def test_the_guard_arm_returns_the_check_s_findings_with_the_rows(corpora: Path) -> None:
+    root = _root(corpora)
+
+    async def main() -> list[tuple[str, bool]]:
+        async with ab.arm_settings('jaffle_shop', root, ['definitions', 'guard']) as made:
+            calls = []
+            for sql in (
+                'select sum(amount) as net_revenue from orders',
+                "select sum(amount) as net_revenue from orders where status = 'completed'",
+                'select nothing from nowhere',
+            ):
+                for arm in ('definitions', 'guard'):
+                    calls.append(await made[arm].call('run_sql', {'sql': sql}))
+            calls.append(await made['guard'].call('gate', {}))
+            return calls
+
+    unchecked, flagged, plain, clean, failed, failed_checked, gate = anyio.run(main)
+    assert unchecked == ('{"net_revenue": 1672.0}', False)
+    findings, _, rows = flagged[0].partition('\n\nThe query was run anyway; its result:\n')
+    assert rows == unchecked[0] and not flagged[1]
+    assert 'missing-filter' in findings and "orders.status = 'completed'" in findings
+    assert plain == clean == ('{"net_revenue": 1103.0}', False)
+    assert failed[1] and failed_checked[1] and failed_checked[0].endswith(failed[0])
+    assert gate == ('there is no tool named gate', True)
+
+
 def test_the_project_arm_reads_the_dbt_project_s_files(tmp_path: Path) -> None:
     for path in (
         'dbt_project.yml',
@@ -663,18 +689,21 @@ def test_each_arm_sees_what_it_should(corpora: Path) -> None:
     root = _root(corpora)
 
     async def main() -> dict[str, Any]:
-        async with ab.arm_settings('jaffle_shop', root, ['schema', 'definitions', 'project']) as made:
+        async with ab.arm_settings(
+            'jaffle_shop', root, ['schema', 'definitions', 'guard', 'project']
+        ) as made:
             return dict(made)
 
     made = anyio.run(main)
-    schema, definitions, project = made['schema'], made['definitions'], made['project']
+    schema, definitions, guard, project = made['schema'], made['definitions'], made['guard'], made['project']
     assert 'main.orders(' in schema.system and 'Net revenue' not in schema.system
     assert definitions.system.startswith(schema.system) and 'Net revenue' in definitions.system
+    assert guard.system == definitions.system + ab.GUARD_CONTEXT
     assert project.system.startswith(definitions.system)
     assert '# models/orders.sql\n' in project.system and '# dags/sql/customer_ltv.sql\n' in project.system
     assert '# dbt_project.yml\n' in project.system and 'raw_payments.csv' not in project.system
-    names = [[t['name'] for t in s.tools] for s in (schema, definitions, project)]
-    assert names == [['run_sql', 'submit_answer']] * 3
+    names = [[t['name'] for t in s.tools] for s in (schema, definitions, guard, project)]
+    assert names == [['run_sql', 'submit_answer']] * 4
     with pytest.raises(ValueError, match='needs the MCP server'):
         anyio.run(
             ab.settings, 'jaffle_shop', root, ab.Warehouse(root / 'jaffle_shop.duckdb'), ['konstruct'], None
@@ -689,7 +718,7 @@ def test_the_plan_lists_every_question_without_a_warehouse(capsys: pytest.Captur
     out = capsys.readouterr().out
     questions = ab.load_questions()
     assert f'fingerprint {questions.fingerprint}' in out
-    assert f'{len(questions.questions)} questions in 4 arms' in out
+    assert f'{len(questions.questions)} questions in {len(ab.ARMS)} arms' in out
     assert all(q.id in out for q in questions.questions)
     ab.main(['--plan', '--corpus', 'jaffle-shop', '--arms', 'schema', '--repeats', '3'])
     count = len(questions.for_corpora(['jaffle-shop']))
@@ -845,7 +874,7 @@ def test_the_paper_counts_the_questions_and_runs_the_benchmark_only_when_asked(
     generate.answers(numbers)
     assert calls == []
     assert numbers.values['answerQuestions']['value'] == str(len(ab.load_questions().questions))
-    assert numbers.values['answerArms']['value'] == '4' and 'answerKonstructCorrect' not in numbers.values
+    assert numbers.values['answerArms']['value'] == '5' and 'answerKonstructCorrect' not in numbers.values
 
     monkeypatch.setenv(generate.ANSWER_BENCHMARK_FLAG, '1')
     generate.answers(numbers)
