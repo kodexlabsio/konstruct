@@ -26,7 +26,7 @@ from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, build_scope
 from sqlglot.schema import MappingSchema
 
-from konstruct.core.graph import file_key, reading_key, relation_key, split_reading
+from konstruct.core.graph import file_key, key_part, reading_key, relation_key, split_reading
 
 # What parsing SQL can raise: sqlglot's parse functions can fail with TypeError, ValueError,
 # AttributeError or RecursionError rather than a SqlglotError, for example on `->` in DuckDB, `#>`
@@ -2329,7 +2329,7 @@ class Canonical:
         """A reading of ``table`` through the CTE references ``path`` names: its relation, and the
         token that stands for this reading where the statement reads the relation more than once,
         else the relation again, as one reading of a relation read once is any other."""
-        key = table_key(table, self.default_catalog, self.default_db)
+        key = self.key(table)
         return (key, self.relation(table, path) if id(table) in self.repeated else key)
 
     def reading_name(self, reading: Reading) -> str:
@@ -2345,7 +2345,7 @@ class Canonical:
         alias = column.table
         found = scope.selected_sources.get(alias)
         source = found[1] if found else None
-        if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+        if isinstance(source, exp.Table) and isinstance(source.this, (exp.Identifier, exp.Func)):
             return frozenset({self.reading(source, path)})
         if isinstance(source, Scope):
             try:
@@ -2369,7 +2369,7 @@ class Canonical:
                     referrers[id(source)].append(scope)
                     references[id(table)] = id(source)
             for source in scope.sources.values():
-                if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+                if isinstance(source, exp.Table) and isinstance(source.this, (exp.Identifier, exp.Func)):
                     tables.setdefault(id(source), (source, scope))
         if not tables:
             return
@@ -2386,17 +2386,26 @@ class Canonical:
                     reach[id(scope)] = reached(scope.parent)
             return reach[id(scope)]
 
-        keys = {i: table_key(t, self.default_catalog, self.default_db) for i, (t, _) in tables.items()}
+        keys = {i: self.key(t) for i, (t, _) in tables.items()}
         totals: Counter[str] = Counter()
         for i, (_, scope) in tables.items():
             totals[keys[i]] += reached(scope)
         self.repeated = {i for i in tables if totals[keys[i]] > 1}
 
+    def key(self, table: exp.Table) -> str:
+        """The key canonical text names ``table`` by: its relation's, or for a table function that
+        reads no files by a literal path (``range(3)``, ``read_parquet($path)``), whose rows are of
+        no relation, its call as one part of a key (``range(0, 3)``), so that the columns of two such
+        functions in one query, or of two readings of one, are named apart."""
+        if table.name:
+            return table_key(table, self.default_catalog, self.default_db)
+        return key_part(table.this.sql(dialect=self.dialect))
+
     def relation(self, table: exp.Table, path: str = '') -> str:
         """How ``table``, read through the CTE references ``path`` names, is named in a canonical
         expression: by its relation, or, where the statement reads that relation more than once,
         by a token for this reading, named later (see :meth:`name_readings`)."""
-        key = table_key(table, self.default_catalog, self.default_db)
+        key = self.key(table)
         if id(table) not in self.repeated:
             return _sql_name(reading_key(key), self.dialect)
         token = self.tokens.get((path, id(table)))
@@ -2407,10 +2416,9 @@ class Canonical:
 
     def column(self, table: exp.Table, name: str, path: str = '') -> str:
         """How the column ``name`` of ``table``, read through the CTE references ``path`` names, is
-        named in canonical text: by its relation (see :meth:`relation`), and alone for a table
-        function's, whose rows are of no relation, as the rows of an UNNEST or VALUES are not."""
-        column = sql_part(name, self.dialect)
-        return f'{self.relation(table, path)}.{column}' if table.name else column
+        named in canonical text: by its relation, or a table function's by its call (see
+        :meth:`key`), as :meth:`relation` names either."""
+        return f'{self.relation(table, path)}.{sql_part(name, self.dialect)}'
 
     def segment(self, reference: exp.Expr) -> str:
         """The path segment of ``reference``, a reference to a CTE, if the CTE is referenced more

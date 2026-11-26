@@ -611,10 +611,10 @@ def test_a_quoted_name_is_read_as_the_parser_reads_it(dialect: str) -> None:
 def test_a_reading_of_a_relation_built_from_a_table_function_is_not_put_on_its_schema(
     tmp_path: Path,
 ) -> None:
-    """A table function's column is of no relation where it reads no files by a literal path, so
-    composing through a reading of the model that reads it names no schema as that reading
-    (``main#(base#1)``), and each reading still names its own rows: the gap is not a column less
-    itself. A lambda's parameter is no column read."""
+    """A table function's column is of no relation where it reads no files by a literal path: it
+    is named by the call, so composing through a reading of the model that reads it names no schema
+    as that reading (``main#(base#1)``), and each reading still names its own rows: the gap is not
+    a column less itself. A lambda's parameter is no column read."""
     (tmp_path / 'base.sql').write_text(
         'create table main.base as select id, amount * 2 as amount, '
         "list_transform(tags, x -> x || 'a') as tags from read_parquet(getvariable('x'))"
@@ -625,8 +625,14 @@ def test_a_reading_of_a_relation_built_from_a_table_function_is_not_put_on_its_s
     )
     project = Project(tmp_path)
     project.build(dialect='duckdb', warehouses=False, run_dbt=False)
-    assert project.explain('pairs.gap').composed == 'MAX(("#(base#1)".amount * 2) - ("#(base#2)".amount * 2))'
-    assert project.explain('pairs.tags').composed == 'LIST_TRANSFORM("#(base#1)".tags, LAMBDA x : x || \'a\')'
+    rows = "read_parquet(getvariable('x'))"
+    assert project.explain('pairs.gap').composed == (
+        f'MAX(("{rows}#(base#1)".amount * 2) - ("{rows}#(base#2)".amount * 2))'
+    )
+    assert (
+        project.explain('pairs.tags').composed
+        == f'LIST_TRANSFORM("{rows}#(base#1)".tags, LAMBDA x : x || \'a\')'
+    )
 
 
 def test_a_formula_composes_down_to_the_files_a_model_reads(tmp_path: Path) -> None:
