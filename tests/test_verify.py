@@ -180,6 +180,7 @@ def test_runs_are_reproducible_and_seeded(project: Project) -> None:
     second = run(project, seed=7).to_dict()
     for data in (first, second):
         data.pop('seconds')
+        data.pop('ontology_seconds')
         for model in data['models']:
             model.pop('seconds')
     assert first == second
