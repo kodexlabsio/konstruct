@@ -1,0 +1,95 @@
+{
+ "format_version": 1,
+ "root": "<root>",
+ "outputs": [
+  "konstruct-out/graph.json",
+  "konstruct-out/REPORT.md",
+  "konstruct-out/graph.html",
+  "konstruct-out/ontology.yml",
+  "konstruct-out/explain.json"
+ ],
+ "seconds": 0,
+ "inputs": [
+  {
+   "input": "dbt",
+   "name": "jaffle_shop",
+   "path": ".",
+   "note": "ran dbt docs generate",
+   "detail": "6 models, 3 seeds, 26 tests, 1 exposure"
+  },
+  {
+   "input": "duckdb",
+   "name": "duckdb jaffle_shop.duckdb",
+   "detail": "10 relations",
+   "note": "dbt profile jaffle_shop"
+  },
+  {
+   "input": "airflow",
+   "path": "dags/jaffle_shop_daily.py",
+   "detail": "1 DAG, 6 tasks"
+  },
+  {
+   "input": "definitions",
+   "path": "definitions.yml",
+   "detail": "6 terms"
+  }
+ ],
+ "nodes": {
+  "model": 6,
+  "column": 48,
+  "seed": 3,
+  "exposure": 1,
+  "test": 26,
+  "table": 1,
+  "dag": 1,
+  "task": 6,
+  "term": 6
+ },
+ "edges": {
+  "contains": 48,
+  "feeds": 28,
+  "tests": 29,
+  "derived_from": 40,
+  "runs": 40,
+  "precedes": 5,
+  "defines": 8,
+  "relates_to": 3
+ },
+ "lineage": {
+  "covered": 36,
+  "columns": 36
+ },
+ "cache": {
+  "hits": 0,
+  "misses": 8
+ },
+ "warnings": [],
+ "findings": [
+  {
+   "kind": "conflict",
+   "text": "orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way: finance_orders.order_value counts only the rows where stg_orders.status NOT IN ('returned', 'return_pending')",
+   "action": "compare them on the data",
+   "command": "konstruct verify --conflicts",
+   "subjects": [
+    "finance_orders.order_value",
+    "orders.amount"
+   ]
+  },
+  {
+   "kind": "claim",
+   "text": "the lineage claims 40 column edges, none yet checked against the data",
+   "action": "check each one by rerunning the models",
+   "command": "konstruct verify",
+   "subjects": []
+  },
+  {
+   "kind": "reach",
+   "text": "a change to raw_payments.amount reaches 1 exposure (customer_dashboard) and 9 columns in 5 relations",
+   "action": "see everything downstream",
+   "command": "konstruct impact raw_payments.amount",
+   "subjects": [
+    "raw_payments.amount"
+   ]
+  }
+ ]
+}
