@@ -1,3 +1,9 @@
+## v0.13.29 (2026-11-26)
+
+### Fix
+
+- **build**: Keep file text out of the problems a build reports
+
 ## v0.13.28 (2026-11-26)
 
 ### Feat
