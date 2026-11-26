@@ -1674,6 +1674,14 @@ _ATOM = re.compile(rf'{_PART}(?:\.{_PART})*(?:\.\*)?')
 
 
 _TOKEN = re.compile(r'__kreading\d+__')
+
+
+def _names(text: str, reading: str) -> bool:
+    """Whether canonical ``text`` names ``reading``, a relation's name or a reading's token, as a
+    whole name: ``db.main.u.id`` names ``db.main.u``, and ``db.main.users.id`` does not."""
+    return re.search(rf'(?<![\w$#."`]){re.escape(reading)}(?![\w$#"`])', text) is not None
+
+
 _V = TypeVar('_V')
 
 
@@ -2776,11 +2784,15 @@ class Canonical:
                 found.add(condition)
                 if clause.join is not None:
                     # A join whose ON does not name the reading it joins, as ``ON TRUE`` does not,
-                    # names it in its label too: which reading it is is which rows it joins.
+                    # names it in its label too: which reading it is is which rows it joins, and
+                    # two such joins to other relations are two conditions, not one. A relation
+                    # read once only tells the join apart, which an ON naming any reading of what
+                    # it joins already does.
                     joined = scope.selected_sources.get(clause.join.this.alias_or_name)
                     readings = self._readings_in(joined[1], self.segment(joined[0])) if joined else []
-                    for reading in readings:
-                        if reading not in text:
+                    unnamed = [r for r in readings if not _names(text, r)]
+                    for reading in unnamed:
+                        if _TOKEN.fullmatch(reading) or len(unnamed) == len(readings):
                             label = clause.label.replace('JOIN ON', f'JOIN {reading} ON')
                             found.add(in_context(f'{label}: {text}', side, steps + before))
                 filtered = {
@@ -2808,10 +2820,10 @@ class Canonical:
         return sorted(found)
 
     def _readings_in(self, source: exp.Table | Scope, path: str) -> list[str]:
-        """The readings of relations the statement reads more than once that ``source``, read
-        through the CTE references ``path`` names, reads."""
+        """The readings of relations that ``source``, read through the CTE references ``path``
+        names, reads: a relation the statement reads once by its name, another by its token."""
         if isinstance(source, exp.Table):
-            return [self.relation(source, path)] if id(source) in self.repeated else []
+            return [self.relation(source, path)]
         found: list[str] = []
         for branch in source.set_operation_scopes if isinstance(source.expression, exp.SetOperation) else []:
             found += self._readings_in(branch, path)

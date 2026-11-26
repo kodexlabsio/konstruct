@@ -1869,6 +1869,34 @@ def test_a_correlated_subquery_names_the_outer_column() -> None:
     assert 'WHERE: db.main.payments.order_id = db.main.orders.id' in one(sql, schema={}).conditions
 
 
+@pytest.mark.parametrize(
+    ('joins', 'conditions'),
+    [
+        ('join payments p on true', ['JOIN ON: TRUE', 'JOIN db.main.payments ON: TRUE']),
+        (
+            'join payments p on true join customers c on true',
+            ['JOIN ON: TRUE', 'JOIN db.main.customers ON: TRUE', 'JOIN db.main.payments ON: TRUE'],
+        ),
+        (
+            'join payments p on o.id > 0',
+            ['JOIN ON: db.main.orders.id > 0', 'JOIN db.main.payments ON: db.main.orders.id > 0'],
+        ),
+        (
+            'join (select order_id from payments) p on true',
+            ['JOIN ON: TRUE', 'JOIN db.main.payments ON: TRUE'],
+        ),
+        ('join payments p on p.order_id = o.id', ['JOIN ON: db.main.payments.order_id = db.main.orders.id']),
+    ],
+    ids=['on true', 'two on true', 'on the other side', 'a subquery', 'named by its on'],
+)
+def test_a_join_whose_on_does_not_name_a_relation_read_once_names_it(
+    joins: str, conditions: list[str]
+) -> None:
+    """Each join multiplies the rows by what it joins: two joins ON TRUE to other relations are two
+    conditions, and one to a relation is not one to another."""
+    assert one(f'select count(*) from orders o {joins}').conditions == conditions
+
+
 @pytest.mark.parametrize('schema', [SCHEMA, {}], ids=['known columns', 'unknown columns'])
 @pytest.mark.parametrize(
     'join',
@@ -2566,6 +2594,19 @@ def _left_self_join(item: str, unknown: bool) -> dict[str, Any]:
     }
 
 
+def _count_on_true(relations: list[str]) -> dict[str, Any]:
+    """``select count(*) from t a join <relation> b on TRUE ...``: each relation after the first
+    joined on an ON that names no reading, so that how many are joined decides the rows."""
+    return {
+        'relations': relations,
+        'joins': [('', 'TRUE')] * (len(relations) - 1),
+        'filter': '',
+        'items': ['count(*)'],
+        'form': 'plain',
+        'unknown': False,
+    }
+
+
 def _union_self_join(first: str, second: str) -> dict[str, Any]:
     """``with q as (select * from t union all select * from t), r as (select * from q) select
     <first>.amount as c0, <second>.id as c1 from r a left join r b on b.amount > a.amount where
@@ -2660,6 +2701,7 @@ def self_join_pairs(draw: st.DrawFn) -> tuple[dict[str, Any], dict[str, Any]]:
 @example((_left_self_join('a.id', False), _left_self_join('b.id', False)))
 @example((_left_self_join('a.id', True), _left_self_join('b.id', True)))
 @example((_union_self_join('a', 'b'), _union_self_join('b', 'a')))
+@example((_count_on_true(['t', 't']), _count_on_true(['t', 't', 'u'])))
 def test_self_joins_that_return_other_rows_print_differently(
     pair: tuple[dict[str, Any], dict[str, Any]],
 ) -> None:
