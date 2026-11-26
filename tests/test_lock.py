@@ -1580,12 +1580,13 @@ def test_rows_from_a_table_function_or_values_are_pinned(
     tmp_path: Path, ltv: str, changed: tuple[str, str]
 ) -> None:
     """Rows a model makes itself, which no source column describes, are pinned by the SQL that
-    makes them."""
+    makes them, and a condition on a table function's column names the call it reads."""
     sql = f'create table main.ltv as {ltv}'
     result, same = _changes(tmp_path, {'ltv.sql': sql}, {'ltv.sql': sql.replace(*changed)}, 'ltv.amount')
     assert not same
     [change] = result.changes
-    assert change.reasons == ['conditions'] and change.conditions_added[0].startswith('ROWS FROM: ')
+    assert change.reasons == ['conditions']
+    assert any(c.startswith('ROWS FROM: ') for c in change.conditions_added)
 
 
 def test_a_measure_formula_is_part_of_a_terms_meaning() -> None:

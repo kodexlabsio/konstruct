@@ -12,6 +12,7 @@ import pytest
 from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
 
+from konstruct.analysis.identity import equivalent
 from konstruct.core.sql import (
     LINEAGE_FAILED,
     ColumnSource,
@@ -1525,16 +1526,20 @@ def test_a_column_of_a_table_function_is_named_without_a_relation() -> None:
         'join generate_series(1, 3) b(id) on b.id = a.id',
         schema={},
     )
-    assert result.expressions == {'country': 'country', 'n2': 'n * 2'}
-    assert all(relation for relation, _ in result.references)
-    assert one('select country from read_parquet($path)', schema={}).expressions == {'country': 'country'}
+    named = '"read_parquet(getvariable(\'x\'))"'
+    assert result.expressions == {'country': f'{named}.country', 'n2': f'{named}.n * 2'}
+    assert result.references == []
+    assert one('select country from read_parquet($path)', schema={}).expressions == {
+        'country': '"read_parquet($path)".country'
+    }
     # Its conditions name it as its formula does, quoted where it would read back as a literal.
     made = one(
         'select a.x, "2024" * 2 as y, "true" as t from read_parquet($p) a where a.x > 1 and "end" = 1',
         schema={},
     )
-    assert made.expressions == {'x': 'x', 'y': '"2024" * 2', 't': '"true"'}
-    assert made.conditions == ['ROWS FROM: READ_PARQUET($p)', 'WHERE: x > 1 AND "end" = 1']
+    rows = '"read_parquet($p)"'
+    assert made.expressions == {'x': f'{rows}.x', 'y': f'{rows}."2024" * 2', 't': f'{rows}."true"'}
+    assert made.conditions == ['ROWS FROM: READ_PARQUET($p)', f'WHERE: {rows}.x > 1 AND {rows}."end" = 1']
 
 
 SALES = 'file.parquet.data/sales/*%2eparquet'
@@ -1621,6 +1626,36 @@ def test_the_columns_a_csv_read_lists_are_its_columns() -> None:
 def test_a_path_that_is_not_a_literal_reads_no_relation(path: str) -> None:
     result = one(f'select amount from read_parquet({path})', schema={})
     assert (result.reads, result.files, result.columns) == ([], {}, {'amount': []})
+
+
+def test_two_table_functions_in_one_query_name_their_columns_apart() -> None:
+    """The rows of a table function that reads no files by a literal path are of no relation, but
+    two such functions are not one: each is named by its call, and two readings of one call by a
+    number, so ``a.n - b.n`` is not ``n - n``, which is 0."""
+    apart = one(
+        "select a.n - b.n as d from read_parquet(getvariable('a')) a "
+        "join read_parquet(getvariable('b')) b on a.id = b.id",
+        schema={},
+    )
+    a, b = '"read_parquet(getvariable(\'a\'))"', '"read_parquet(getvariable(\'b\'))"'
+    assert apart.expressions == {'d': f'{a}.n - {b}.n'}
+    assert f'JOIN ON: {a}.id = {b}.id' in apart.conditions
+    assert (apart.reads, apart.references, apart.columns) == ([], [], {'d': []})
+    twice = one('select a.x - b.x as d from range(3) a(x) join range(3) b(x) on a.x < b.x', schema={})
+    assert twice.expressions == {'d': '"range(0, 3)#2".x - "range(0, 3)#1".x'}
+    assert 'JOIN ON: "range(0, 3)#1".x > "range(0, 3)#2".x' in twice.conditions or (
+        'JOIN ON: "range(0, 3)#2".x < "range(0, 3)#1".x' in twice.conditions
+    )
+    for formula in (*apart.expressions.values(), *twice.expressions.values()):
+        assert not equivalent(formula, '0', dialect='duckdb').equal_without_nulls
+    # Files read by a literal path are relations, and two of them are two.
+    files = one(
+        "select a.n - b.n as d from read_parquet('a') a join read_parquet('b') b on a.id = b.id", schema={}
+    )
+    assert files.expressions == {'d': 'file.parquet.a.n - file.parquet.b.n'}
+    assert files.columns == {
+        'd': [src('file.parquet.a', 'n', 'transformed'), src('file.parquet.b', 'n', 'transformed')]
+    }
 
 
 def test_a_local_path_is_taken_from_the_repository_root() -> None:
