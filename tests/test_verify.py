@@ -791,3 +791,28 @@ def test_models_cannot_reach_files_urls_or_extensions(tmp_path: Path) -> None:
     )
     [model] = run(project).models
     assert model.skipped is not None and 'access' in model.skipped.lower()
+
+
+def test_no_statement_can_attach_the_warehouse_again_with_writes(tmp_path: Path) -> None:
+    """DuckDB lets a statement DETACH the warehouse and ATTACH its file again with writes: every
+    statement run is first checked to be one query that reads."""
+    import hashlib
+
+    path = tmp_path / 'w.duckdb'
+    con = duckdb.connect(str(path))
+    con.execute('create table orders as select 1 as id')
+    con.close()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    engine = DuckDBEngine(path)
+    for statement in (
+        f'DETACH {engine.database}',
+        f"ATTACH '{path}' AS again",
+        'CREATE TABLE w.main.planted AS SELECT 2',
+        'SELECT 1; DETACH w',
+    ):
+        with pytest.raises(ValueError, match='only'):
+            engine.run(statement)
+    assert engine.run('SELECT count(*) FROM w.main.orders')[1] == [(1,)]
+    engine.close()
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+    assert not Path(f'{path}.wal').exists()

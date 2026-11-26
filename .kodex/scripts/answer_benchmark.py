@@ -386,7 +386,8 @@ class Warehouse:
         from konstruct.analysis.verify import DuckDBEngine, quote
 
         self.engine = DuckDBEngine(path, memory_limit=MEMORY_LIMIT)
-        self.engine.run(f'USE {quote(self.engine.database)}')
+        # The engine runs only queries that read; the default database is the harness's to set.
+        self.engine.con.execute(f'USE {quote(self.engine.database)}')
 
     def query(self, sql: str, limit: int) -> tuple[list[str], list[tuple[Any, ...]]]:
         """The first ``limit`` rows of a query, stopped when it runs too long."""
