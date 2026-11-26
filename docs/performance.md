@@ -30,7 +30,7 @@ cd first/examples/jaffle_shop
 time konstruct trust && time konstruct build && time konstruct verify --conflicts
 ```
 
-The findings a build ends with read only the graph: on the 2,000-model project above they take 0.5 to 0.9 s of CPU after a cold build of about 20 s, most of it comparing the conflicting pairs once (`uv run pytest tests/test_scale.py -k findings -s`).
+The findings a build ends with read only the graph: on the 2,000-model project above they take about 1 s of CPU after a cold build of about 20 s, most of it comparing the conflicting pairs once (`uv run pytest tests/test_scale.py -k findings -s`).
 
 ## A Project dbt Compiles
 
@@ -179,8 +179,10 @@ On a repository of SQL tables with the same five measures, each table reading it
 
 | Tables | Conflicts | `conflicts` | Gate checks |
 |---:|---:|---:|---:|
-| 100 | 24,750 | 0.8 s | 0.09 s |
-| 400 | 399,000 | 9.55 s | 0.34 s |
+| 100 | 24,750 | 0.99 s | 0.17 s |
+| 400 | 399,000 | 12.66 s | 0.44 s |
+
+Of each pair, only one whose two values are made of a source column in common is read further for its kind (the filters each side counts by, conjunct by conjunct, and its grain), so the pairs that share only a name, most of them, cost one comparison of two formulas. Each condition is parsed once, and one of more than 50,000 characters (a generated list) is compared by its text alone.
 
 On the 2,000-model project of the first table, `conflicts` over every candidate column takes 0.85 s of wall time after the graph is loaded (`uv run .kodex/scripts/benchmark.py 2000`). `konstruct conflicts` then shows what it found in `graph.html` and `explain.json`. The gate's copy of the graph, which the MCP `gate` tool and the coding agent hook bring up to date, holds no `graph.html`, `REPORT.md` or `ontology.yml`.
 

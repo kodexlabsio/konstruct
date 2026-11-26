@@ -30,11 +30,16 @@ konstruct conflicts --no-write
 ```
 
 Konstruct compares computed columns whose names mean the same thing, or that are named like or
-bound to the same business term. Each conflict shows both formulas in terms of source columns, then
-one line per difference: a filter, join or source column on one side only, or a different
-aggregation, with the file it is in. The first line counts the pairs (`1 conflicting definition
-among 12 computed columns`); if the two columns are listed, those lines are the answer. "No
-conflicting definitions" means no pair was found, not that the two columns agree.
+bound to the same business term, and lists the pairs likely to be two definitions of one number:
+values made of the same columns that count something else. They are likely, not certain, so check
+each; most pairs that look alike differ on purpose, by grain or segment. `--all` adds the other
+pairs: other measure conflicts, segments, one measure at another grain and those that share only a
+name. Each conflict starts with a sentence that says what matters most in the difference, shows
+both formulas in terms of source columns, then one line per difference: a filter, join or source
+column on one side only, or a different aggregation, with the file it is in. The first line counts
+the pairs (`1 likely conflicting definition (check each) among 12 computed columns`); if the two
+columns are listed, those lines are the answer. "No likely conflicting definitions" means no such
+pair was found, not that the two columns agree: run it with `--all`.
 
 ```bash
 konstruct verify --conflicts

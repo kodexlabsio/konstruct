@@ -768,8 +768,8 @@ def test_the_findings_a_build_ends_with_stay_fast(tmp_path: Path) -> None:
     started = cpu_seconds()
     result = top_findings(graph, project.out_dir, project.root)
     taken = cpu_seconds() - started
-    # The generated project defines no business term, so no conflicting pair is one it declares,
-    # and the findings lead with the widest reach.
+    # The generated measures differ by grain and joins, none by what it counts: no conflict is
+    # confident, so the findings lead with the widest reach.
     assert [f.kind for f in result.findings] == ['reach']
     assert taken < 10, f'the findings took {taken:.1f}s of CPU'
     print(f'\n2000 models: the findings took {taken:.2f}s of CPU')

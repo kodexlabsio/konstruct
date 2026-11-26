@@ -219,7 +219,8 @@ class ConflictsOnData:
     pairs: list[PairOnData] = field(default_factory=list)
     """One result per conflicting pair, most consequential first."""
     conflicts: int = 0
-    """Conflicting pairs found; more than ``pairs`` when the run was limited."""
+    """Conflicting pairs that could be run (the measure conflicts, or every pair with ``--all``);
+    more than ``pairs`` when the run was limited."""
     sources: list[str] = field(default_factory=list)
     """The source tables copied, by relation key: each once, for every pair that reads it."""
     sampled: bool = False
@@ -404,12 +405,8 @@ def _additive(side: Side, graph: Graph) -> bool:
     import sqlglot
     from sqlglot import exp
 
+    from konstruct.analysis.measures import _unwrap
     from konstruct.core.sql import PARSE_ERRORS
-
-    def _unwrap(node: exp.Expr) -> exp.Expr:
-        while isinstance(node, (exp.Paren, exp.Coalesce, exp.Round, exp.Cast, exp.Window, exp.Abs)):
-            node = node.this
-        return node
 
     dialect = graph.meta.get('dialect')
     try:
@@ -471,6 +468,7 @@ def conflicts_on_data(
     conflicts: Conflicts | None = None,
     touching: Collection[str] | None = None,
     limit: int | None = 50,
+    every: bool = False,
     max_rows: int = 1_000_000,
     seeds: Mapping[str, SeedFile] | None = None,
     settings: Settings | None = None,
@@ -478,18 +476,20 @@ def conflicts_on_data(
     """Run each conflicting pair on the same rows, read-only (see the module docstring).
 
     ``conflicts`` are the pairs to run, by default :func:`~konstruct.analysis.conflicts.find_conflicts`
-    of the graph (with ``touching``, only the pairs with a column in it), the first ``limit`` of
-    them. ``warehouse`` is a DuckDB file, a Postgres URL or an engine; with a DuckDB file or none,
-    the ``seeds`` (by default :func:`~konstruct.analysis.seedfiles.seed_files`) the warehouse does
-    not hold are read from their files.
+    of the graph (with ``touching``, only the pairs with a column in it): its measure conflicts, or
+    with ``every`` every pair, the first ``limit`` of them. ``warehouse`` is a DuckDB file, a
+    Postgres URL or an engine; with a DuckDB file or none, the ``seeds`` (by default
+    :func:`~konstruct.analysis.seedfiles.seed_files`) the warehouse does not hold are read from
+    their files.
 
     Raises:
         QueryError: There are pairs to run, but no warehouse and no seed to run them on.
     """
     started = time.perf_counter()
     found = conflicts if conflicts is not None else find_conflicts(graph, touching=touching)
-    chosen = found.conflicts[:limit] if limit is not None else list(found.conflicts)
-    result = ConflictsOnData('', max_rows, conflicts=len(found.conflicts))
+    pool = list(found.conflicts) if every else found.measures
+    chosen = pool[:limit] if limit is not None else pool
+    result = ConflictsOnData('', max_rows, conflicts=len(pool))
     if not chosen:
         return result
     seeds = seed_files(graph, root) if seeds is None else seeds

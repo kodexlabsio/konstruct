@@ -2,15 +2,16 @@
 
 A graph answers questions, but a first build has asked none yet. These findings are the answers
 most likely to matter, each one line that says what was found and the exact command that shows
-more, at most one of each kind, in this order:
+more, in this order:
 
-* ``conflict``: the most consequential pair of columns that the project itself says hold one
-  business term and that compute it differently (:mod:`konstruct.analysis.conflicts`): both bound
-  to the term (by definitions.yml or a vocabulary), or one bound to it and the other, bound to no
-  term of its own and named like it, compared with it; with how they differ on the data when the
-  last ``konstruct verify --conflicts`` ran this same pair. A pair that only a name links is never
-  one: in public projects those are rarely two definitions of one number, and most differ on
-  purpose, by grain or segment;
+* ``conflict``: up to three pairs of columns that the project itself says hold one business term
+  and that compute it differently (:mod:`konstruct.analysis.conflicts`), the most consequential
+  first: both columns bound to the term (by definitions.yml or a vocabulary), or one bound to it
+  and the other, bound to no term of its own and named like it or one of its synonyms, a likely
+  measure conflict with it (``confident``). Each has a plain explanation of the difference
+  and how the two differ on the data when the last ``konstruct verify --conflicts`` ran this same
+  pair. A pair that only a name links is never one: in public projects those are rarely two
+  definitions of one number, and most differ on purpose, by grain or segment;
 * ``definition``: an approved business term the code no longer matches: a column its definition
   names that no model builds any more, or a column ``konstruct.lock`` pins that changed; none when
   a dbt project was found but not read, whose models the graph then lacks;
@@ -20,6 +21,9 @@ more, at most one of each kind, in this order:
 * ``reach``: the project's own column (not a package's, such as elementary's) whose change
   reaches the most exposures, and then the most of the project's own columns.
 
+Each kind but ``conflict`` gives at most one finding. A finding that cannot be made (a file an
+earlier run wrote that this Konstruct cannot read) is left out with a note, never raised.
+
 They read only the graph and what earlier runs wrote beside it, never the warehouse, so a project
 with no definitions and no warehouse still gets the static ones.
 """
@@ -27,6 +31,7 @@ with no definitions and no warehouse still gets the static ones.
 from __future__ import annotations
 
 import json
+import math
 import re
 import shlex
 import time
@@ -43,15 +48,18 @@ if TYPE_CHECKING:
     from konstruct.analysis.conflicts import Conflict
     from konstruct.interfaces.layout import Style
 
-LIMIT = 4
+LIMIT = 6
 """The most findings shown."""
 
+CONFLICTS = 3
+"""The most conflicts among them."""
+
 KEY_LENGTH = 200
-"""The longest name taken from ``verify.json``."""
+"""The longest name or key value taken from ``conflict_data.json`` or ``verify.json``."""
 
 LARGEST = 10**18
-"""The largest count taken from it: no check counts more, and a larger number would run the line
-to hundreds of digits."""
+"""The largest count or total taken from them: no check counts more, and a larger number would run
+the line to hundreds of digits."""
 
 
 @dataclass
@@ -82,9 +90,11 @@ class TopFindings:
     """The findings a build ends with, most useful first."""
 
     findings: list[Finding] = field(default_factory=list)
-    """At most one of each kind."""
+    """Up to three conflicts, then at most one of each other kind."""
     seconds: float = 0.0
     """Time taken."""
+    notes: list[str] = field(default_factory=list)
+    """What could not be read, such as a ``conflict_data.json`` written by a newer Konstruct."""
 
     def summary(self) -> str:
         count = len(self.findings)
@@ -93,7 +103,10 @@ class TopFindings:
         return f'{count} finding{"s" if count != 1 else ""} worth a look.'
 
     def to_dict(self) -> dict[str, Any]:
-        return {'summary': self.summary(), 'findings': [f.to_dict() for f in self.findings]}
+        data: dict[str, Any] = {'summary': self.summary(), 'findings': [f.to_dict() for f in self.findings]}
+        if self.notes:
+            data['notes'] = list(self.notes)
+        return data
 
     def text(self, style: Style | None = None) -> str:
         """The result as the CLI prints it: plain text, as ``str()`` gives, or drawn for a
@@ -113,14 +126,28 @@ def top_findings(
     runs wrote ``verify.json`` and ``conflict_data.json``; ``root``, the project, for its seeds and
     ``konstruct.lock``."""
     started = time.perf_counter()
-    built = _has_warehouse(graph)
+    notes: list[str] = []
+
+    def made(kind: str, make: Callable[[], list[Finding] | Finding | None]) -> list[Finding]:
+        # The findings explain a build; one that cannot be made is a note, never a failed build.
+        try:
+            found = make()
+        except Exception as error:
+            notes.append(f'the {kind} findings could not be made: {type(error).__name__}: {error}')
+            return []
+        return found if isinstance(found, list) else [found] if found is not None else []
+
     found = [
-        _conflict(graph, out_dir, built or _has_seeds(graph, root)),
-        _definition(graph, root),
-        _claim(graph, out_dir, built),
-        _reach(graph),
+        # Each reads the graph's record of its sources inside made(), as a graph.json written by
+        # hand can hold anything there.
+        *made(
+            'conflict', lambda: _conflicts(graph, out_dir, _has_warehouse(graph), _seeds(graph, root), notes)
+        ),
+        *made('definition', lambda: _definition(graph, root)),
+        *made('claim', lambda: _claim(graph, out_dir, _has_warehouse(graph))),
+        *made('reach', lambda: _reach(graph)),
     ]
-    result = TopFindings([f for f in found if f is not None][:limit])
+    result = TopFindings(found[:limit], notes=notes)
     result.seconds = time.perf_counter() - started
     return result
 
@@ -148,13 +175,39 @@ def _has_warehouse(graph: Graph) -> bool:
     return False
 
 
-def _has_seeds(graph: Graph, root: Path | None) -> bool:
-    """Whether ``verify --conflicts`` can run on the project's seeds."""
+def _seeds(graph: Graph, root: Path | None) -> frozenset[str]:
+    """The relations ``verify --conflicts`` can read from the project's seed files."""
     if root is None:
-        return False
+        return frozenset()
     from konstruct.analysis.seedfiles import seed_files
 
-    return bool(seed_files(graph, root))
+    return frozenset(seed_files(graph, root))
+
+
+def _runs(graph: Graph, conflict: Conflict, built: bool, seeds: frozenset[str]) -> bool:
+    """Whether ``verify --conflicts`` can run the pair, without running anything: each side is
+    built by SQL (a dbt model or a SQL file), and each relation its lineage starts from is in the warehouse the
+    build read or is a seed."""
+    for side in (conflict.a, conflict.b):
+        column = graph.nodes.get(side.column)
+        owner = graph.parent_of(column) if column is not None else None
+        if owner is None or not (owner.path or '').endswith('.sql'):
+            return False
+        if built:
+            continue
+        stack, seen = [side.column], {side.column}
+        while stack:
+            current = stack.pop()
+            inputs = graph.out_edges(current, 'derived_from')
+            if not inputs:
+                parent = graph.parent_of(graph.nodes[current])
+                if parent is None or parent.relation not in seeds:
+                    return False
+            for edge in inputs:
+                if edge.target not in seen:
+                    seen.add(edge.target)
+                    stack.append(edge.target)
+    return True
 
 
 def _count(value: Any) -> bool:
@@ -169,36 +222,69 @@ def _phrase(count: int, noun: str) -> str:
 # conflict
 
 
-def _conflict(graph: Graph, out_dir: Path | None, data: bool) -> Finding | None:
-    """The most consequential conflict the project's own terms declare (:func:`_declared`). A pair
-    only a name links is never one."""
+def _conflicts(
+    graph: Graph, out_dir: Path | None, built: bool, seeds: frozenset[str], notes: list[str]
+) -> list[Finding]:
+    """The conflicts the project's own terms declare (:func:`_declared`), the most consequential
+    first, each with a plain explanation of the difference and, once ``verify --conflicts`` has
+    run it, how the two differ on the data. A pair only a name links is never one of them."""
     from konstruct.analysis.conflicts import find_conflicts
 
     declared = [(c, said) for c in find_conflicts(graph).conflicts if (said := _declared(graph, c))]
-    if not declared:
-        return None
-    top, said = declared[0]
-    subjects = [top.a.label, top.b.label]
-    more = f' ({_phrase(len(declared) - 1, "more such pair")})' if len(declared) > 1 else ''
-    run = _recorded(top, out_dir)
-    if run is not None:
-        if run.agrees:
-            text = f'{said}, but agree on the data{more}'
-            return Finding(
-                'conflict', text, 'see how they differ in the SQL', 'konstruct conflicts', subjects
+    recorded = _recorded(out_dir, notes) if declared else {}
+    found = []
+    for index, (conflict, said) in enumerate(declared[:CONFLICTS]):
+        subjects = [conflict.a.label, conflict.b.label]
+        text = f'{said}: {conflict.explanation()}'
+        rest = len(declared) - CONFLICTS
+        more = f' ({_phrase(rest, "more such pair")})' if rest > 0 and index == CONFLICTS - 1 else ''
+        entry = recorded.get((conflict.a.column, conflict.b.column, conflict.a.composed, conflict.b.composed))
+        run = _pair(graph, entry, conflict) if entry is not None else None
+        if run is not None and run.skipped is None and run.agrees:
+            found.append(
+                Finding(
+                    'conflict',
+                    f'{text}; they agree on the data{more}',
+                    'see every difference',
+                    'konstruct conflicts',
+                    subjects,
+                )
             )
-        found = run.summary().split(': ', 1)[-1]
-        text = f'{said}, and differ on the data: {found}{more}'
-        command = run.next_command()
-        if command is not None:
-            return Finding(
-                'conflict', text, 'see the source rows behind the row that differs most', command, subjects
+        elif run is not None and run.skipped is None:
+            shown = run.summary().split(': ', 1)[-1]
+            command = run.next_command()
+            action = 'see the source rows behind the row that differs most' if command else 'see the rows'
+            found.append(
+                Finding(
+                    'conflict',
+                    f'{text}; on the data, {shown}{more}',
+                    action,
+                    command or 'konstruct verify --conflicts',
+                    subjects,
+                )
             )
-        return Finding('conflict', text, 'see the rows', 'konstruct verify --conflicts', subjects)
-    text = f'{said} ({_differs(top)}){more}'
-    if data:
-        return Finding('conflict', text, 'compare them on the data', 'konstruct verify --conflicts', subjects)
-    return Finding('conflict', text, 'see what differs and where', 'konstruct conflicts', subjects)
+        elif entry is None and _runs(graph, conflict, built, seeds):
+            found.append(
+                Finding(
+                    'conflict',
+                    text + more,
+                    'compare them on the data',
+                    'konstruct verify --conflicts',
+                    subjects,
+                )
+            )
+        else:
+            # Not runnable on the data, or the last run could not run it: the SQL says the rest.
+            found.append(
+                Finding(
+                    'conflict',
+                    text + more,
+                    'see every difference and its file',
+                    'konstruct conflicts',
+                    subjects,
+                )
+            )
+    return found
 
 
 def _terms(graph: Graph, column_id: str) -> dict[str, Node]:
@@ -216,14 +302,17 @@ def _terms(graph: Graph, column_id: str) -> dict[str, Node]:
 def _declared(graph: Graph, conflict: Conflict) -> str | None:
     """What the project says of the pair, as the start of a sentence, when it says the two hold
     one business term: both are bound to it, or one is and the other, bound to no term of its
-    own and named like it, has a formula compared with the bound one's. None when only a name
-    links them."""
+    own and named like it or one of its synonyms, is a likely measure conflict with it
+    (``confident``). None when only a name links them: a roll-up, a running total, a subset or a
+    count named for a synonym shares the name and differs on purpose."""
     a, b = conflict.a, conflict.b
     mine, theirs = _terms(graph, a.column), _terms(graph, b.column)
     both = sorted(mine.keys() & theirs.keys())
     if both:
         term = mine[both[0]]
         return f"{a.label} and {b.label} are both '{term.name}' in {term.path}, but compute it two ways"
+    if conflict.kind != 'measure' or not conflict.confident:
+        return None
     if not conflict.reason.startswith(('are named like the business term', 'are bound to the business term')):
         return None
     for bound, other, terms, others in ((a, b, mine, theirs), (b, a, theirs, mine)):
@@ -237,44 +326,175 @@ def _declared(graph: Graph, conflict: Conflict) -> str | None:
     return None
 
 
-def _differs(conflict: Conflict) -> str:
-    """The first difference between the two, as a phrase."""
-    difference = conflict.differences[0]
-    who = ''
-    if difference.side:
-        who = f' only in {conflict.a.label if difference.side == "a" else conflict.b.label}'
-    rest = len(conflict.differences) - 1
-    return f'a {difference.kind}{who}' + (
-        f', and {rest} more difference{"s" if rest != 1 else ""}' if rest else ''
-    )
+_TEXT = ('idea', 'a', 'b', 'a_column', 'b_column')
+_OPTIONAL_TEXT = ('a_formula', 'b_formula', 'key', 'skipped')
+_COUNTS = ('rows_a', 'rows_b', 'matched', 'differ', 'only_a', 'only_b')
+_TOTALS = ('total_a', 'total_b')
+_SCALARS = (str, int, float, bool, type(None))
 
 
-def _recorded(conflict: Conflict, out_dir: Path | None) -> PairOnData | None:
-    """The pair as the last ``verify --conflicts`` ran it, if it ran these same two formulas."""
+def _recorded(out_dir: Path | None, notes: list[str]) -> dict[tuple[Any, ...], dict[str, Any]]:
+    """The pairs the last ``verify --conflicts`` wrote, by their columns and formulas. A file this
+    Konstruct cannot read (malformed, or written by a newer one) is left out, with a note: the
+    findings never fail over it."""
+    from konstruct.core.formats import FIELD, FIRST
+
+    path = out_dir / 'conflict_data.json' if out_dir is not None else None
+    if path is None or not path.is_file():
+        return {}
+    data = _read(path)
+    version = data.get(FIELD, FIRST) if data is not None else None
+    if data is None or not isinstance(data.get('pairs', []), list):
+        notes.append(f'{path.name} could not be read, so the findings leave out what it recorded')
+        return {}
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        notes.append(f'{path.name} could not be read, so the findings leave out what it recorded')
+        return {}
+    if version > FIRST:
+        notes.append(
+            f'{path.name} was written by a newer Konstruct, so the findings leave out what it recorded'
+        )
+        return {}
+    found: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for entry in data.get('pairs', []):
+        if isinstance(entry, dict):
+            key = tuple(entry.get(k) for k in ('a_column', 'b_column', 'a_formula', 'b_formula'))
+            if all(isinstance(k, (str, type(None))) for k in key):
+                found.setdefault(key, entry)
+    return found
+
+
+def _pair(graph: Graph, entry: dict[str, Any], conflict: Conflict) -> PairOnData | None:
+    """The pair as the last ``verify --conflicts`` ran it, when every field read has its type and
+    a value it can have; None otherwise. The file is the project's, so only its numbers are taken
+    from it: the columns named are the conflict's own, the key must be a column of both sides'
+    relations, and every command made from it quotes what it reads."""
     from konstruct.analysis.conflict_data import ExampleRow, PairOnData
 
-    data = _read(out_dir / 'conflict_data.json' if out_dir is not None else None)
-    for entry in (data or {}).get('pairs', []):
-        if not isinstance(entry, dict) or entry.get('skipped'):
-            continue
-        same = (entry.get('a_column'), entry.get('b_column')) == (conflict.a.column, conflict.b.column)
-        formulas = (entry.get('a_formula'), entry.get('b_formula')) == (
-            conflict.a.composed,
-            conflict.b.composed,
+    def count(value: Any) -> bool:
+        return value is None or _count(value)
+
+    def total(value: Any) -> bool:
+        # A total may be negative (refunds), but never NaN, infinite or of hundreds of digits.
+        return value is None or (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and abs(value) <= LARGEST
         )
-        if not (same and formulas):
-            continue
-        fields = set(PairOnData.__dataclass_fields__) - {'examples'}
-        pair = PairOnData(**{k: v for k, v in entry.items() if k in fields})
-        # The file is the project's, so only its numbers are taken from it: the columns named are
-        # the conflict's own, and every command made from it quotes what it reads.
-        pair.a, pair.b = conflict.a.label, conflict.b.label
-        rows = set(ExampleRow.__dataclass_fields__)
-        pair.examples = [
-            ExampleRow(**{k: v for k, v in e.items() if k in rows}) for e in entry.get('examples', [])
-        ]
-        return pair
+
+    key = entry.get('key')
+    if not (
+        all(isinstance(entry.get(k, ''), str) for k in _TEXT)
+        and all(isinstance(entry.get(k), (str, type(None))) for k in _OPTIONAL_TEXT)
+        and (key is None or (len(key) <= KEY_LENGTH and _column_of_both(graph, conflict, key)))
+        and all(count(entry.get(k)) for k in _COUNTS)
+        and all(total(entry.get(k)) for k in _TOTALS)
+        and isinstance(entry.get('additive', True), bool)
+        and isinstance(entry.get('differences', []), list)
+        and all(isinstance(d, str) for d in entry.get('differences', []))
+        and isinstance(entry.get('examples', []), list)
+    ):
+        return None
+    fields = set(PairOnData.__dataclass_fields__) - {'examples'}
+    pair = PairOnData(**{k: v for k, v in entry.items() if k in fields})
+    pair.a, pair.b = conflict.a.label, conflict.b.label
+    family = _family(graph, conflict, key) if key is not None else None
+    for example in entry.get('examples', []):
+        if not isinstance(example, dict) or not all(
+            isinstance(example.get(k), _SCALARS) for k in ('key', 'a', 'b')
+        ):
+            return None
+        if not _key_value(example.get('key'), family):
+            return None
+        if not all(isinstance(example.get(k, True), bool) for k in ('in_a', 'in_b')):
+            return None
+        pair.examples.append(
+            ExampleRow(
+                example.get('key'),
+                example.get('a'),
+                example.get('b'),
+                example.get('in_a', True),
+                example.get('in_b', True),
+            )
+        )
+    return pair
+
+
+_INTEGERS = frozenset(
+    'TINYINT SMALLINT INTEGER INT BIGINT HUGEINT UTINYINT USMALLINT UINTEGER UBIGINT UHUGEINT INT2 INT4 '
+    'INT8 INT64 BYTEINT SERIAL BIGSERIAL'.split()
+)
+_NUMBERS = frozenset('FLOAT REAL DOUBLE DECIMAL NUMERIC NUMBER FLOAT4 FLOAT8 FLOAT64 BIGNUMERIC'.split())
+
+
+def _family(graph: Graph, conflict: Conflict, name: str) -> str | None:
+    """What values the key column holds, from the first type the graph records for it or a
+    column it copies: ``integer``, ``number``, ``boolean`` or ``time``; None for text or a type
+    not recorded."""
+    for side in (conflict.a, conflict.b):
+        column = graph.nodes.get(side.column)
+        owner = graph.parent_of(column) if column is not None else None
+        key = graph.column(owner.id, name) if owner is not None else None
+        stack, seen = ([key], {key.id}) if key is not None else ([], set())
+        while stack:
+            node = stack.pop()
+            if node.data_type:
+                base = ' '.join(re.split(r'[(<]', node.data_type.upper(), maxsplit=1)[0].split())
+                if base in _INTEGERS:
+                    return 'integer'
+                if base in _NUMBERS or base == 'DOUBLE PRECISION':
+                    return 'number'
+                if base in ('BOOLEAN', 'BOOL'):
+                    return 'boolean'
+                return 'time' if base.startswith(('DATE', 'TIME')) else None
+            for edge in graph.out_edges(node.id, 'derived_from'):
+                found = graph.nodes.get(edge.target)
+                if found is not None and found.id not in seen:
+                    seen.add(found.id)
+                    stack.append(found)
     return None
+
+
+def _key_value(value: Any, family: str | None) -> bool:
+    """Whether ``value``, a key read from ``conflict_data.json``, can be a value of a key column
+    of ``family`` (see :func:`_family`), and is short enough to print: text where the column
+    holds numbers is no key of its rows."""
+    import datetime as dt
+
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return False
+    if family == 'integer':
+        return isinstance(value, int) and not isinstance(value, bool) and abs(value) <= LARGEST
+    if family == 'number':
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and abs(value) <= LARGEST
+    if family == 'boolean':
+        return isinstance(value, bool)
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > LARGEST:
+        return False
+    if len(str(value)) > KEY_LENGTH:
+        return False
+    if family == 'time':
+        if not isinstance(value, str):
+            return False
+        for kind in (dt.datetime, dt.date, dt.time):
+            try:
+                kind.fromisoformat(value)
+            except ValueError:
+                continue
+            return True
+        return False
+    return True
+
+
+def _column_of_both(graph: Graph, conflict: Conflict, name: str) -> bool:
+    """Whether ``name`` is a column of the relation of each side of the pair."""
+    for side in (conflict.a, conflict.b):
+        column = graph.nodes.get(side.column)
+        owner = graph.parent_of(column) if column is not None else None
+        if owner is None or graph.column(owner.id, name) is None:
+            return False
+    return True
 
 
 # definition

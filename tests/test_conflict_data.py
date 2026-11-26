@@ -170,7 +170,10 @@ def test_with_no_key_in_common_only_the_totals_are_compared(tmp_path: Path) -> N
         'from raw.orders group by status'
     )
     project = make_shop(tmp_path / 'shop', {'sales.sql': SALES, 'by_status.sql': by_status})
-    found = pair(run(project), 'sales.revenue', 'by_status.revenue')
+    # One revenue per order and one per status: the same measure at another grain, run with --all.
+    assert [c.kind for c in project.conflicts().conflicts] == ['grain']
+    assert run(project).pairs == []
+    found = pair(run(project, every=True), 'sales.revenue', 'by_status.revenue')
     assert found.key is None and found.matched is None and found.examples == []
     assert found.total_a == found.total_b == 94.0
     assert {found.rows_a, found.rows_b} == {6, 2}
@@ -434,6 +437,16 @@ def test_the_command_a_pair_suggests_runs_on_the_seeds_alone(
     assert {e.reason.split(': ', 1)[0] for e in rows.excluded} == {'finance_orders'}
 
 
+def test_only_measure_conflicts_run_unless_every_pair_is_asked_for(tmp_path: Path) -> None:
+    """A pair that shares only a name is not run by default: its sides read different sources."""
+    by_month = 'create table main.forecast as select 1 as order_id, 100.0 as revenue'  # reads no source
+    project = make_shop(tmp_path / 'shop', {'sales.sql': SALES, 'forecast.sql': by_month})
+    assert [c.kind for c in project.conflicts().conflicts] == ['name']
+    assert run(project).pairs == []
+    every = conflicts_on_data(project.graph, project.root, project.root / 'shop.duckdb', every=True)
+    assert [(p.a, p.b) for p in every.pairs] == [('forecast.revenue', 'sales.revenue')]
+
+
 def test_the_totals_of_averages_are_not_compared(tmp_path: Path) -> None:
     """An average or a maximum does not add up over rows: with no shared key, the two are not
     comparable, and with one, only the values by key are."""
@@ -446,7 +459,7 @@ def test_the_totals_of_averages_are_not_compared(tmp_path: Path) -> None:
         "where status <> 'returned' group by status"
     )
     project = make_shop(tmp_path / 'shop', {'c.sql': by_customer, 's.sql': by_status})
-    found = pair(run(project), 'by_customer.avg_value', 'by_status.avg_value')
+    found = pair(run(project, every=True), 'by_customer.avg_value', 'by_status.avg_value')
     assert found.additive is False and found.key is None
     assert found.agrees is None and found.totals() is None
     assert found.summary().startswith('not comparable without a shared key')

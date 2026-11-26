@@ -589,7 +589,7 @@ def test_empty_results_say_so() -> None:
         str(Definitions('zzz', column=orders))
         == 'No business term defines orders. Add one to definitions.yml.'
     )
-    assert str(Conflicts(candidates=3)) == 'No conflicting definitions among 3 computed columns.'
+    assert str(Conflicts(candidates=3)) == 'No likely conflicting definitions among 3 computed columns.'
 
 
 # Review cases: plain text is whole, widths are display widths, and the work is linear

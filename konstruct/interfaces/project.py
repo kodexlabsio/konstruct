@@ -752,7 +752,9 @@ class Project:
                 conflicts in ``graph.html``.
 
         Returns:
-            The conflicts, ranked by what depends on each side downstream.
+            The conflicts, ranked by what depends on each side downstream; each one's ``rank``
+            orders them by how likely it is two definitions of one number, and ``confident``
+            marks those the text lists by default.
 
         Example::
 
@@ -780,16 +782,19 @@ class Project:
     def findings(self, limit: int = 6) -> TopFindings:
         """What in the graph is most worth acting on first, as ``konstruct build`` ends with it.
 
-        At most one finding of each kind, in this order: the most consequential conflict the
-        project's own terms declare (two columns bound to one business term in definitions.yml or a
-        vocabulary, or one bound to it and the other named like it, that compute it differently),
-        with how the two differ on the data when :meth:`verify_conflicts` last ran them; an approved
-        term the code no longer matches; a claim of the graph the data contradicted when
+        In this order: up to three conflicts the project's own terms declare, the most
+        consequential first (two columns bound to one business term in definitions.yml or a
+        vocabulary, or one bound to it and the other, bound to no term of its own, named like it or
+        a synonym and a likely measure conflict with it, that compute it differently),
+        each with a plain explanation of the difference and how the two differ on the data when
+        :meth:`verify_conflicts` last ran them; then at most one finding of each other kind: an
+        approved term the code no longer matches, a claim of the graph the data contradicted when
         :meth:`verify` last ran (or that the lineage is unchecked, where there is data to check it
-        against); and the project's own column (not a dbt package's) whose change reaches the most
-        exposures. Each says what was found
-        and the command that shows more. Only the graph and the files earlier runs wrote beside it
-        are read, never the warehouse.
+        against), and the project's own column (not a dbt package's) whose change reaches the most
+        exposures. Each says what was found and the command that shows more. Only the graph and the
+        files earlier runs wrote beside it are read, never the warehouse, and a finding that cannot
+        be made (a file an earlier run wrote that cannot be read) is left out with a note in
+        :attr:`~konstruct.analysis.findings.TopFindings.notes`, so this never raises over one.
 
         Args:
             limit: The most findings.
@@ -1768,9 +1773,10 @@ class Project:
         max_rows: int = 1_000_000,
         models: Sequence[str] | None = None,
         write: bool = True,
+        every: bool = False,
     ) -> ConflictsOnData:
-        """Run each pair :meth:`conflicts` finds on the same rows, and say whether, and where, the
-        two definitions disagree on the data.
+        """Run each measure conflict :meth:`conflicts` finds on the same rows, and say whether, and
+        where, the two definitions disagree on the data.
 
         Both sides' models are composed down to source tables and run read-only in verify's
         engines, on one copy of each source. The rows are matched by a column that identifies the
@@ -1788,6 +1794,7 @@ class Project:
             models: Only the pairs with a column of one of these models or tables.
             write: Write ``conflict_data.json`` beside the graph, which the findings after a build
                 read.
+            every: Also run the pairs that share only a name and read no source column in common.
 
         Returns:
             One result per pair, with ``counts()`` across them.
@@ -1828,6 +1835,7 @@ class Project:
             target,
             conflicts=find_conflicts(graph, touching=touching),
             limit=limit,
+            every=every,
             max_rows=max_rows,
             settings=self._sensitivity_settings(),
         )
@@ -2319,6 +2327,7 @@ class Project:
         update: bool = True,
         run_dbt: bool | None = None,
         warehouses: bool = True,
+        measure_conflicts_only: bool = False,
     ) -> Gate:
         """The check a change must pass before it is proposed.
 
@@ -2343,6 +2352,9 @@ class Project:
                 just built.
             run_dbt: For that build, as for :meth:`build`.
             warehouses: For that build, as for :meth:`build`.
+            measure_conflicts_only: Report as a conflicting definition only a measure conflict
+                (see :meth:`conflicts`), not a pair of columns that share only a name or that are
+                one measure at another grain, which the gate otherwise reports too.
 
         Example::
 
@@ -2374,6 +2386,7 @@ class Project:
             laws_from=laws_from,
             root=self.root,
             conform=recorded_conform(self.root, self.out_dir, base),
+            measure_conflicts_only=measure_conflicts_only,
         )
 
     def query(self, question: str, depth: int = 1) -> query.QueryResult:
