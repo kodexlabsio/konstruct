@@ -30,6 +30,7 @@ import re
 import time
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -442,9 +443,20 @@ def rewrite(
 
 
 def _run(con: Any, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
+    # The warehouse is attached read-only, but a statement could DETACH it and ATTACH its file
+    # again with writes, which the sandbox allows: whatever built it, only one query that reads
+    # is ever run on the connection.
+    _read_only(sql)
     cursor = con.execute(sql)
     names = [d[0].lower() for d in cursor.description]
     return names, cursor.fetchall()
+
+
+@lru_cache(maxsize=256)
+def _read_only(sql: str) -> None:
+    """:func:`read_only_query` of DuckDB SQL, checked once for each text: verify runs one query
+    many times, once for each change it makes to an input."""
+    read_only_query(sql, 'duckdb')
 
 
 def _signature(rows: list[tuple[Any, ...]], index: int) -> Counter[str]:
