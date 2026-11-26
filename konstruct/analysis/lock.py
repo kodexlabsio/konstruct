@@ -1754,8 +1754,8 @@ class LockCheck:
     relock: int = 0
     """With a canonical form this Konstruct does not write, how many pins read differently: they
     fail the check once, as a whole, rather than one by one."""
-    reprinted: list[str] = field(default_factory=list)
-    """Those pins' columns, whose changes cannot be told apart from the change of form."""
+    reprinted: list[PinChange] = field(default_factory=list)
+    """Those pins, whose changes cannot be told apart from the change of form."""
 
     @property
     def passed(self) -> bool:
@@ -1872,7 +1872,7 @@ def check(
         for change in result.changes:
             if change.unprint():
                 result.relock += 1
-                result.reprinted.append(change.column)
+                result.reprinted.append(change)
         result.changes = [c for c in result.changes if c.reasons]
         if not result.relock:
             result.notes.append(
