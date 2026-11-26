@@ -12,6 +12,9 @@ manifest and changes it to what the commit's files say:
   whose file is new is added, with the dependencies its refs and sources name;
 - documented columns, descriptions, constraints, configuration and generic tests are those of the
   commit's YAML, and a source is there only when the commit's YAML declares it;
+- the project's exposures, semantic models and metrics are those of the commit's YAML, written
+  as dbt writes them, with the dependencies their ``ref()``, ``source()`` and ``metric()``
+  strings name, so a build without dbt has the readers and the semantic layer the commit declares;
 - the catalog's entry for a model or snapshot whose file differs from today's is left out, so its
   columns are those its SQL at the commit gives rather than today's warehouse.
 
@@ -41,6 +44,7 @@ from konstruct.inputs import dbt
 
 _CALL_REF = re.compile(r"""\bref\(\s*['"]([^'"]+)['"](?:\s*,\s*['"]([^'"]+)['"])?""")
 _CALL_SOURCE = re.compile(r"""\bsource\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]""")
+_CALL_METRIC = re.compile(r"""\bmetric\(\s*['"]([^'"]+)['"]""")
 _TO_REF = re.compile(r"""^\s*ref\(\s*['"]([^'"]+)['"]\s*(?:,\s*['"]([^'"]+)['"]\s*)?\)\s*$""")
 _TO_SOURCE = re.compile(r"""^\s*source\(\s*['"]([^'"]+)['"]\s*,\s*['"]([^'"]+)['"]\s*\)\s*$""")
 _SNAPSHOT = re.compile(r'{%-?\s*snapshot\s+(\w+)\s*-?%}(.*?){%-?\s*endsnapshot\s*-?%}', re.DOTALL)
@@ -198,6 +202,7 @@ def manifest_at(
     for node_id, header in headers.items():
         if node_id in nodes:
             nodes[node_id]['columns'] = {**header, **nodes[node_id].get('columns', {})}
+    _semantic(written, project, documents, own)
     result.package_macros.sort()
     if catalog is not None:
         kept = copy.copy(catalog)
@@ -559,6 +564,202 @@ def _test(
         'depends_on': {'nodes': targets, 'macros': []},
         'config': dict(test.config),
     }
+
+
+def _semantic(
+    manifest: dict[str, Any], project: dbt.DbtProject, documents: list[tuple[str, dict[str, Any]]], own: str
+) -> None:
+    """The project's exposures, semantic models and metrics as the commit's YAML declares them, in
+    the sections of ``manifest`` dbt writes them to. Those of installed packages, which are not in
+    git, are today's."""
+    nodes, sources = manifest['nodes'], manifest['sources']
+    sections: dict[str, dict[str, Any]] = {
+        key: {
+            k: v
+            for k, v in (manifest.get(key) or {}).items()
+            if isinstance(v, dict) and v.get('package_name', own) != own
+        }
+        for key in ('exposures', 'semantic_models', 'metrics')
+    }
+    measures: dict[str, str] = {}  # each measure's semantic model
+    for path, data in documents:
+        place = _place(project, path, own)
+        for entry in _declared(data, 'semantic_models'):
+            name = str(entry['name'])
+            unique_id = f'semantic_model.{own}.{name}'
+            upstream = _depends_on(str(entry.get('model') or ''), nodes, sources, own, None)['nodes']
+            item: dict[str, Any] = {
+                **_common(entry, 'semantic_model', unique_id, own, place),
+                'model': entry.get('model'),
+                'node_relation': _node_relation(nodes.get(upstream[0])) if upstream else None,
+                'defaults': entry.get('defaults'),
+                'primary_entity': entry.get('primary_entity'),
+                **{k: _listed(entry.get(k)) for k in ('entities', 'measures', 'dimensions')},
+                'depends_on': {'nodes': upstream[:1], 'macros': []},
+            }
+            sections['semantic_models'][unique_id] = item
+            for measure in item['measures']:
+                if not measure.get('name'):
+                    continue
+                measures[str(measure['name'])] = unique_id
+                if measure.get('create_metric'):
+                    # dbt makes a simple metric of a measure that asks for one.
+                    made = {
+                        'name': measure['name'],
+                        'label': measure.get('label') or measure['name'],
+                        'description': measure.get('description'),
+                        'type': 'simple',
+                        'type_params': {'measure': measure['name']},
+                    }
+                    sections['metrics'][f'metric.{own}.{measure["name"]}'] = _metric(made, own, place)
+        for entry in _declared(data, 'metrics'):
+            sections['metrics'][f'metric.{own}.{entry["name"]}'] = _metric(entry, own, place)
+    metrics = sections['metrics']
+    for metric in metrics.values():
+        if metric.get('package_name', own) == own:
+            params = metric['type_params']
+            params['input_measures'] = _input_measures(metric, metrics, set())
+            # A metric of a measure depends on its semantic model; any other, on its metrics.
+            if isinstance(params.get('measure'), dict):
+                found = [measures[params['measure']['name']]] if params['measure']['name'] in measures else []
+            else:
+                found = [f'metric.{own}.{m}' for m in _metric_names(params)]
+            metric['depends_on'] = {'nodes': list(dict.fromkeys(found)), 'macros': []}
+    for path, data in documents:
+        place = _place(project, path, own)
+        for entry in _declared(data, 'exposures'):
+            unique_id = f'exposure.{own}.{entry["name"]}'
+            depends = [str(d) for d in entry.get('depends_on') or [] if isinstance(d, str)]
+            upstream = _depends_on(' '.join(depends), nodes, sources, own, None)['nodes']
+            upstream += [
+                f'metric.{own}.{m[1]}'
+                for d in depends
+                if (m := _CALL_METRIC.search(d)) and f'metric.{own}.{m[1]}' in metrics
+            ]
+            owner = entry.get('owner')
+            sections['exposures'][unique_id] = {
+                **_common(entry, 'exposure', unique_id, own, place),
+                **{k: entry.get(k) for k in ('type', 'maturity', 'url')},
+                'owner': {k: owner.get(k) for k in ('name', 'email')} if isinstance(owner, dict) else {},
+                'depends_on': {'nodes': list(dict.fromkeys(upstream)), 'macros': []},
+            }
+    manifest.update(sections)
+
+
+def _declared(data: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    """The entries a YAML file declares under ``key``, each with a name and not disabled."""
+    entries = data.get(key)
+    return [
+        e
+        for e in (entries if isinstance(entries, list) else [])
+        if isinstance(e, dict) and e.get('name') and (e.get('config') or {}).get('enabled', True) is not False
+    ]
+
+
+def _place(project: dbt.DbtProject, path: str, own: str) -> tuple[str, str, list[str]]:
+    """A YAML file's path in the project, its path in the folder of the project's paths that holds
+    it, as dbt writes ``path``, and the start of the ``fqn`` of what it declares."""
+    file = project.root.resolve() / path
+    for paths in project.paths.values():
+        for base in paths:
+            if file.is_relative_to(base.resolve()):
+                inner = file.relative_to(base.resolve())
+                return path, inner.as_posix(), [own, *inner.parent.parts]
+    return path, path, [own, *Path(path).parent.parts]
+
+
+def _common(
+    entry: dict[str, Any], kind: str, unique_id: str, own: str, place: tuple[str, str, list[str]]
+) -> dict[str, Any]:
+    """What dbt writes for every exposure, semantic model and metric."""
+    original, path, fqn = place
+    config = entry.get('config')
+    return {
+        'unique_id': unique_id,
+        'resource_type': kind,
+        'name': str(entry['name']),
+        'label': entry.get('label'),
+        'description': entry.get('description') if isinstance(entry.get('description'), str) else '',
+        'package_name': own,
+        'path': path,
+        'original_file_path': original,
+        'fqn': [*fqn, str(entry['name'])],
+        'meta': entry.get('meta') or {},
+        'tags': entry.get('tags') or [],
+        'config': {'enabled': True, **(config if isinstance(config, dict) else {})},
+    }
+
+
+def _listed(value: Any) -> list[dict[str, Any]]:
+    return [dict(v) for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def _node_relation(model: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Where a semantic model's model is, as dbt writes it."""
+    if model is None:
+        return None
+    return {
+        'alias': model.get('alias') or model.get('name'),
+        'schema_name': model.get('schema'),
+        'database': model.get('database'),
+        'relation_name': model.get('relation_name'),
+    }
+
+
+def _metric(entry: dict[str, Any], own: str, place: tuple[str, str, list[str]]) -> dict[str, Any]:
+    """A metric the commit's YAML declares, as dbt writes it: each input named by a string or a
+    mapping, and each filter as its SQL templates."""
+    unique_id = f'metric.{own}.{entry["name"]}'
+    given = entry.get('type_params')
+    params = dict(given) if isinstance(given, dict) else {}
+    for key in ('measure', 'numerator', 'denominator'):
+        if key in params:
+            params[key] = _input(params[key])
+    if isinstance(params.get('metrics'), list):
+        params['metrics'] = [i for i in map(_input, params['metrics']) if i is not None]
+    return {
+        **_common(entry, 'metric', unique_id, own, place),
+        'type': str(entry.get('type') or 'simple').lower(),
+        'type_params': params,
+        'filter': _where(entry.get('filter')),
+    }
+
+
+def _input(value: Any) -> dict[str, Any] | None:
+    """A measure or metric a metric reads, named by a string or a mapping, as dbt writes it."""
+    if isinstance(value, str):
+        return {'name': value, 'filter': None, 'alias': None}
+    if isinstance(value, dict) and value.get('name'):
+        return {**value, 'name': str(value['name']), 'filter': _where(value.get('filter'))}
+    return None
+
+
+def _where(value: Any) -> dict[str, Any] | None:
+    """A filter of the semantic layer, a SQL template or a list of them, as dbt writes it."""
+    templates = [value] if isinstance(value, str) else value if isinstance(value, list) else []
+    found = [{'where_sql_template': str(t)} for t in templates if isinstance(t, str) and t.strip()]
+    return {'where_filters': found} if found else None
+
+
+def _metric_names(params: dict[str, Any]) -> list[str]:
+    """The metrics a ratio or derived metric reads."""
+    found = [params.get('numerator'), params.get('denominator'), *(params.get('metrics') or [])]
+    return [str(i['name']) for i in found if isinstance(i, dict) and i.get('name')]
+
+
+def _input_measures(metric: dict[str, Any], metrics: dict[str, Any], seen: set[str]) -> list[dict[str, Any]]:
+    """The measures a metric reads, through the metrics it reads, however far down."""
+    params = metric.get('type_params') or {}
+    measure = params.get('measure')
+    if isinstance(measure, dict):
+        return [{'name': measure['name'], 'filter': measure.get('filter'), 'alias': measure.get('alias')}]
+    found: list[dict[str, Any]] = []
+    for name in _metric_names(params):
+        upstream = next((m for m in metrics.values() if m.get('name') == name), None)
+        if upstream is not None and name not in seen:
+            seen.add(name)
+            found += [i for i in _input_measures(upstream, metrics, seen) if i not in found]
+    return found
 
 
 def installed_packages(project: dbt.DbtProject) -> set[str]:

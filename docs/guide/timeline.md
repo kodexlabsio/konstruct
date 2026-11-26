@@ -65,7 +65,7 @@ Each commit's world is the ordinary build of that commit's own files, read from 
 - A source's table, schema and database come from the commit's YAML.
 - A model, seed, snapshot or test whose file is gone is left out, and a new model or seed file is a new node, with the dependencies its refs and sources name. Tests, documented columns, descriptions, constraints, configuration and sources come from that commit's YAML. A snapshot defined in YAML keeps today's SQL. A seed's columns are its CSV header at the commit. A model the commit holds in another folder than today keeps the configuration and relation dbt gives it today, not what `dbt_project.yml` configures for the commit's folder, and a note names it.
 - A model whose file at the commit differs from today's takes its columns from its SQL at that commit rather than from dbt's catalog, and a note says so; the others keep the catalog's columns and types, which are today's. A property's type is not compared, for that reason.
-- dbt's semantic layer metrics and exposures are read as they are now.
+- Exposures, semantic models and metrics come from the commit's YAML, with the dependencies their `ref()`, `source()` and `metric()` strings name, and a measure with `create_metric: true` is a metric too, as dbt makes it. A disabled one is left out. Those of installed packages are today's.
 - A dbt project whose `dbt_project.yml` at the commit names a target or model directory outside the project is not read, and a note says so.
 - The other repositories `konstruct.toml` lists are not read at each commit.
 

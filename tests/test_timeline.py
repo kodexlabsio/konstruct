@@ -14,12 +14,13 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from konstruct import QueryError
+from konstruct import Project, QueryError
 from konstruct.analysis.diff import DiffError
 from konstruct.analysis.timeline import Timeline, effects, timeline
 from konstruct.core.graph import Graph
 from konstruct.inputs import dbt
 from konstruct.inputs.dbt_commit import manifest_at
+from konstruct.semantics.world import metrics as world_metrics
 from konstruct.semantics.world_facts import KINDS, World, WorldChange, world_diff
 from tests.test_history import commit, git
 from tests.test_release_notes import make_pairs
@@ -1803,3 +1804,156 @@ def test_a_dbt_run_that_changes_only_when_the_manifest_was_made_keeps_the_cache(
     path.write_text(json.dumps(manifest))
     timeline(shop, since='HEAD~2')
     assert built  # what the manifest says is part of every world
+
+
+EXPOSURES = """version: 2
+exposures:
+  - name: revenue_dashboard
+    label: Revenue dashboard
+    type: dashboard
+    maturity: high
+    owner: {name: Finance, email: finance@example.com}
+    depends_on:
+      - ref('orders')
+      - source('raw', 'payments')
+      - metric('revenue')
+  - name: retired
+    type: dashboard
+    owner: {name: Finance}
+    config: {enabled: false}
+    depends_on: [ref('orders')]
+"""
+SEMANTIC = """version: 2
+semantic_models:
+  - name: orders
+    model: ref('orders')
+    defaults: {agg_time_dimension: ordered_at}
+    entities: [{name: order, type: primary, expr: order_id}]
+    measures:
+      - {name: order_total, agg: sum, expr: amount}
+      - {name: order_count, agg: count, expr: order_id, create_metric: true}
+metrics:
+  - name: revenue
+    label: Revenue
+    type: simple
+    type_params:
+      measure: {name: order_total, filter: "{{ Dimension('order__status') }} <> 'void'"}
+    filter: "{{ Dimension('order__status') }} <> 'test'"
+  - name: average_order
+    type: ratio
+    type_params: {numerator: revenue, denominator: order_count}
+"""
+
+
+def test_the_manifest_at_a_commit_has_its_exposures_and_semantic_layer(tmp_path: Path) -> None:
+    """A commit's exposures, semantic models and metrics come from its YAML, as dbt writes them,
+    and an installed package's are today's."""
+    project = _project(
+        tmp_path,
+        **{
+            'models/orders.sql': 'select 1 as order_id, 2 as amount',
+            'models/sources.yml': 'version: 2\nsources: [{name: raw, tables: [{name: payments}]}]\n',
+            'models/marts/exposures.yml': EXPOSURES,
+            'models/semantic.yml': SEMANTIC,
+        },
+    )
+    packaged = {'unique_id': 'exposure.pkg.board', 'name': 'board', 'package_name': 'pkg'}
+    manifest = {
+        'nodes': {'model.shop.orders': _model('orders', raw_code='select 1 as order_id, 2 as amount')},
+        'sources': {},
+        'exposures': {
+            'exposure.shop.old': {'unique_id': 'exposure.shop.old', 'name': 'old', 'package_name': 'shop'},
+            'exposure.pkg.board': packaged,
+        },
+        'metrics': {'metric.shop.old': {'name': 'old', 'package_name': 'shop'}},
+    }
+    at = manifest_at(manifest, None, project).manifest
+    assert sorted(manifest['exposures']) == ['exposure.pkg.board', 'exposure.shop.old']  # not changed
+    # Today's exposure the commit does not declare is gone, a disabled one is left out, and a
+    # package's is kept.
+    assert sorted(at['exposures']) == ['exposure.pkg.board', 'exposure.shop.revenue_dashboard']
+    assert at['exposures']['exposure.pkg.board'] == packaged
+    dashboard = at['exposures']['exposure.shop.revenue_dashboard']
+    assert dashboard['depends_on']['nodes'] == [
+        'model.shop.orders',
+        'source.shop.raw.payments',
+        'metric.shop.revenue',
+    ]
+    assert (dashboard['path'], dashboard['original_file_path'], dashboard['fqn']) == (
+        'marts/exposures.yml',
+        'models/marts/exposures.yml',
+        ['shop', 'marts', 'revenue_dashboard'],
+    )
+    assert (dashboard['label'], dashboard['maturity'], dashboard['owner']['name']) == (
+        'Revenue dashboard',
+        'high',
+        'Finance',
+    )
+    model = at['semantic_models']['semantic_model.shop.orders']
+    assert model['depends_on']['nodes'] == ['model.shop.orders']
+    assert model['node_relation']['relation_name'] == '"wh"."main"."orders"'
+    # A measure with create_metric is a metric too, and a ratio depends on the metrics it divides.
+    assert sorted(at['metrics']) == [
+        'metric.shop.average_order',
+        'metric.shop.order_count',
+        'metric.shop.revenue',
+    ]
+    revenue = at['metrics']['metric.shop.revenue']
+    assert revenue['depends_on']['nodes'] == ['semantic_model.shop.orders']
+    assert revenue['filter'] == {
+        'where_filters': [{'where_sql_template': "{{ Dimension('order__status') }} <> 'test'"}]
+    }
+    ratio = at['metrics']['metric.shop.average_order']
+    assert ratio['depends_on']['nodes'] == ['metric.shop.revenue', 'metric.shop.order_count']
+    assert [m['name'] for m in ratio['type_params']['input_measures']] == ['order_total', 'order_count']
+    found = {m['name']: m for m in dbt.semantic_metrics(at, lambda item: item.get('original_file_path'))}
+    assert found['revenue'] == {
+        'name': 'revenue',
+        'label': 'Revenue',
+        'type': 'simple',
+        'agg': 'sum',
+        'expr': 'amount',
+        'model': 'model.shop.orders',
+        'filters': [
+            "{{ Dimension('order__status') }} <> 'test'",
+            "{{ Dimension('order__status') }} <> 'void'",
+        ],
+        'path': 'models/semantic.yml',
+    }
+    assert (found['order_count']['agg'], found['average_order']['type']) == ('count', 'ratio')
+
+
+def test_a_commit_declares_its_exposures_and_semantic_layer_without_dbt(tmp_path: Path) -> None:
+    """With a manifest that has no exposures or semantic layer, as one made from the files is, each
+    commit's world has the exposures and metrics its YAML declares."""
+    root = _varied_shop(
+        tmp_path / 'shop',
+        [
+            (
+                'Add orders',
+                {
+                    'dbt_project.yml': 'name: shop\nprofile: shop\nvars:\n  rate: 3\n',
+                    'models/orders.sql': VARIED,
+                    'models/schema.yml': KEYED.format(described='The order.'),
+                },
+            ),
+            ('Report revenue', {'models/exposures.yml': EXPOSURES, 'models/semantic.yml': SEMANTIC}),
+        ],
+        'select id as order_id, amount * 3 as amount from raw.orders',
+    )
+    result = timeline(root)
+    added = [c for e in result.entries if e.commit.subject == 'Report revenue' for c in e.changes]
+    assert {c.name for c in added if c.kind == 'metric' and c.status == 'added'} >= {'Revenue'}
+    shop = root / 'shop-copy'
+    shutil.copytree(root, shop, ignore=shutil.ignore_patterns('.git'))
+    project = dbt.read_project(shop)
+    assert project is not None
+    made = manifest_at(json.loads(project.manifest_path.read_text()), None, project)
+    project.manifest_path.write_text(json.dumps(made.manifest))
+    built = Project(shop)
+    built.build(run_dbt=False, warehouses=False)
+    graph = built.graph
+    readers = [e.target for e in graph.out_edges('model.shop.orders', 'feeds')]
+    assert 'exposure.shop.revenue_dashboard' in readers
+    revenue = next(m for m in world_metrics(graph).metrics if m.name == 'Revenue')
+    assert (revenue.source, revenue.formula) == ('dbt semantic layer', 'SUM(orders.amount)')
