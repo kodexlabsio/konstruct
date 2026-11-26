@@ -208,16 +208,18 @@ the answer by more than the tolerance; the other questions are controls.
 
 The agent answers each question in \answerArms{} arms, each with a tool that runs read-only SQL on
 the warehouse through the engine of \cref{sec:verify}: the schema alone; the schema with the
-project's definitions as text; the same with the dbt project's SQL and YAML as text too; and the
-schema with Konstruct's MCP tools that answer from the built graph. The arms differ in more than the
-definitions. Konstruct's tools also give the dbt SQL, the descriptions and the lineage, so the arm
-to compare them with is the one given the project as text, and the definitions the benchmark adds
-to each project were written for it: for jaffle-shop, from the metrics its MetricFlow files
+project's definitions as text; the same with every query first checked by \cmd{konstruct check-sql},
+its findings returned with the rows; the definitions with the dbt project's SQL and YAML as text
+too; and the schema with Konstruct's MCP tools that answer from the built graph. The checked arm
+differs from the arm given the definitions as text only by the check; the others differ in more than
+the definitions. Konstruct's tools also give the dbt SQL, the descriptions and the lineage, so the
+arm to compare them with is the one given the project as text, and the definitions the benchmark
+adds to each project were written for it: for jaffle-shop, from the metrics its MetricFlow files
 declare. The agent submits a number, or none to abstain, and says whether it is sure. The rubric is
-deterministic and committed with the questions: a number within the tolerance of the question's
-unit is correct, any other number is wrong, and a wrong number the agent said it was sure of is
-confidently wrong; a conversation that ends with no submission is counted apart from an
-abstention. No model grades an answer. The run is one command,
+deterministic and committed with the questions: a number within the tolerance of the question's unit
+is correct, any other number is wrong, and a wrong number the agent said it was sure of is
+confidently wrong; a conversation that ends with no submission is counted apart from an abstention.
+No model grades an answer. The run is one command,
 \cmd{uv run --with anthropic .kodex/scripts/answer\_benchmark.py}, which reads the model from
 \cmd{KONSTRUCT\_BENCH\_MODEL} and the API key from the environment, and records the model's
 settings, a digest of the harness and of each graph, and intervals for each rate. Its \cmd{--plan}
