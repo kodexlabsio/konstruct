@@ -717,6 +717,12 @@ def test_exit_statuses(
         'conflicts --fail-on-conflict finds none': status(
             '-C', str(quiet), 'conflicts', '--no-write', '--fail-on-conflict'
         ),
+        'conflicts --fail-on-measure-conflict finds some': status(
+            '-C', str(jaffle), 'conflicts', '--no-write', '--fail-on-measure-conflict'
+        ),
+        'conflicts --fail-on-measure-conflict finds none': status(
+            '-C', str(quiet), 'conflicts', '--no-write', '--fail-on-measure-conflict'
+        ),
         'verify --conflicts with a pair that disagrees': status('-C', str(jaffle), 'verify', '--conflicts'),
         'verify --conflicts --strict with a pair that disagrees': status(
             '-C', str(jaffle), 'verify', '--conflicts', '--strict'
@@ -734,6 +740,9 @@ def test_exit_statuses(
         ),
         'gate fails': status('-C', str(changed_jaffle), 'gate', '--base', 'HEAD', '--no-update'),
         'gate passes': status('-C', str(small), 'gate', '--base', 'HEAD', '--no-update'),
+        'gate --measure-conflicts-only passes': status(
+            '-C', str(small), 'gate', '--base', 'HEAD', '--no-update', '--measure-conflicts-only'
+        ),
         'check-sql passes': status('-C', str(checked), 'check-sql', str(checked / 'passes.sql')),
         'check-sql breaks an approved definition': status(
             '-C', str(checked), 'check-sql', str(checked / 'breaks.sql')

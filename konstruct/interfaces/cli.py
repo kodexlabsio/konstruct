@@ -248,13 +248,24 @@ def cmd_describe(args: argparse.Namespace, console: Console) -> int:
 def cmd_conflicts(args: argparse.Namespace, console: Console) -> int:
     project = _ready(_project(args), args, console)
     result = project.conflicts(args.limit, write=not args.no_write)
+    result.every = args.all
     if args.format == 'markdown':
         console.print(result.markdown().rstrip())
     else:
         _emit(console, result, args.json)
     if not args.no_write:
         console.info(f'wrote CONFLICTS.md and conflicts.json to {project.out_dir}')
-    return 1 if args.fail_on_conflict and result.conflicts else 0
+    if args.fail_on_measure_conflict and result.measures:
+        return 1
+    if args.fail_on_conflict and result.conflicts:
+        if not result.measures:
+            console.warn(
+                f'exit status 1: --fail-on-conflict counts every pair, and {len(result.conflicts)} share only '
+                'a name or are one measure at another grain; --fail-on-measure-conflict counts the '
+                'conflicting definitions alone'
+            )
+        return 1
+    return 0
 
 
 def cmd_conform(args: argparse.Namespace, console: Console) -> int:
@@ -598,6 +609,7 @@ def _conflicts(project: Project, args: argparse.Namespace, console: Console) -> 
             limit=args.limit,
             max_rows=_rows(args, 1_000_000),
             models=args.model,
+            every=args.all,
         )
     _emit(console, result, args.json)
     if not args.json:
@@ -704,7 +716,9 @@ def cmd_gate(args: argparse.Namespace, console: Console) -> int:
                 # One build, with the gate's options, rather than a default build and then an update.
                 project.build(**options)
                 update = False
-            result = project.gate(base=args.base, update=update, **options)
+            result = project.gate(
+                base=args.base, update=update, measure_conflicts_only=args.measure_conflicts_only, **options
+            )
     except DiffError as error:
         console.error(str(error))
         return 1
@@ -1466,13 +1480,25 @@ def parser() -> argparse.ArgumentParser:
     conflicting = add('conflicts', 'columns that compute the same business idea in different ways')
     conflicting.add_argument('-n', '--limit', type=int, metavar='N', help='at most N conflicts')
     conflicting.add_argument(
+        '--all',
+        action='store_true',
+        help='also list the pairs that share only a name and read no source column in common',
+    )
+    conflicting.add_argument(
         '--format', choices=['text', 'markdown'], default='text', metavar='FORMAT', help='text or markdown'
     )
     conflicting.add_argument(
         '--no-write', action='store_true', help='do not write CONFLICTS.md and conflicts.json'
     )
     conflicting.add_argument(
-        '--fail-on-conflict', action='store_true', help='exit with status 1 if any conflict is found'
+        '--fail-on-conflict',
+        action='store_true',
+        help='exit with status 1 if any pair is found, those --all adds included',
+    )
+    conflicting.add_argument(
+        '--fail-on-measure-conflict',
+        action='store_true',
+        help='exit with status 1 if a measure conflict is found, confident or not',
     )
     _query_options(conflicting)
     conflicting.set_defaults(func=cmd_conflicts)
@@ -1803,6 +1829,11 @@ def parser() -> argparse.ArgumentParser:
     gate_.add_argument('--json-file', metavar='FILE', help='also write the result as JSON to FILE (for CI)')
     gate_.add_argument('--graph', metavar='FILE', help='use this graph.json instead of finding konstruct-out')
     gate_.add_argument('--no-update', action='store_true', help='use the graph as it is (just built, say)')
+    gate_.add_argument(
+        '--measure-conflicts-only',
+        action='store_true',
+        help='fail on a measure conflict only, not on a segment, a grain or a pair that shares only a name',
+    )
     gate_.add_argument('--no-dbt', action='store_true', help='never run dbt when updating the graph')
     gate_.add_argument(
         '--no-warehouse', action='store_true', help='connect to no warehouse when updating the graph'
@@ -1895,6 +1926,11 @@ def parser() -> argparse.ArgumentParser:
         help='run both columns of each pair `konstruct conflicts` finds on the same rows, and count the '
         'rows where they differ, with their totals and the rows that differ most; writes '
         'conflict_data.json. --strict exits 1 when a pair disagrees',
+    )
+    conflicting_data.add_argument(
+        '--all',
+        action='store_true',
+        help='with --conflicts, also the pairs that share only a name and read no source column in common',
     )
     affecting = verify.add_argument_group(
         'the effect of a change', "with --effect: what each formula change does on today's data"

@@ -301,7 +301,7 @@ def test_the_skills_describe_real_output(jaffle_repo: Path, capsys: pytest.Captu
     )
 
     _, out = claims.run('conflicts', '--no-write')
-    claims.hold('reconcile', out, 'conflicting definition among', 'filter', 'join')
+    claims.hold('reconcile', out, 'likely conflicting definition (check each) among', 'filter', 'join')
     _, out = claims.run('verify', '--conflicts', '-q')
     claims.hold('reconcile', out, 'disagrees on the data', 'konstruct verify --why')
     assert not (jaffle_repo / 'konstruct-out' / 'CONFLICTS.md').exists()

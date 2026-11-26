@@ -56,6 +56,16 @@ _GLYPHS = {
 }
 
 
+def printable(value: object) -> str:
+    """``value`` as text with each control or formatting character (a newline, an ANSI escape, a
+    bidirectional override) as a space: a value read from a file or from the data cannot move the
+    cursor, colour the terminal or start a line of its own."""
+    text = str(value)
+    if text.isprintable():
+        return text
+    return ''.join(' ' if unicodedata.category(c) in ('Cc', 'Cf', 'Zl', 'Zp') else c for c in text)
+
+
 def char_width(char: str) -> int:
     """The columns one character takes in a terminal: two for East Asian wide and full-width
     characters, none for combining marks and controls, one otherwise."""

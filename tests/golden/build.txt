@@ -12,6 +12,6 @@ Built <root>
   wrote        graph.json, REPORT.md, graph.html, ontology.yml, explain.json to <root>/konstruct-out in <seconds>s
 
 Findings
-  conflict  orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way (a filter only in finance_orders.order_value, and 2 more differences); compare them on the data: `konstruct verify --conflicts`
+  conflict  orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way: finance_orders.order_value counts only the rows where stg_orders.status NOT IN ('returned', 'return_pending'); compare them on the data: `konstruct verify --conflicts`
   claim     the lineage claims 40 column edges, none yet checked against the data; check each one by rerunning the models: `konstruct verify`
   reach     a change to raw_payments.amount reaches 1 exposure (customer_dashboard) and 9 columns in 5 relations; see everything downstream: `konstruct impact raw_payments.amount`

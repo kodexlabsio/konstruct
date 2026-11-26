@@ -67,21 +67,23 @@ Built /src/jaffle_shop
   wrote        graph.json, REPORT.md, graph.html, ontology.yml, explain.json to konstruct-out in 0.7s
 
 Findings
-  conflict  orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way (a filter only in finance_orders.order_value, and 2 more differences); compare them on the data: `konstruct verify --conflicts`
+  conflict  orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, computes it another way: finance_orders.order_value counts only the rows where stg_orders.status NOT IN ('returned', 'return_pending'); compare them on the data: `konstruct verify --conflicts`
   claim     the lineage claims 40 column edges, none yet checked against the data; check each one by rerunning the models: `konstruct verify`
   reach     a change to raw_payments.amount reaches 1 exposure (customer_dashboard) and 9 columns in 5 relations; see everything downstream: `konstruct impact raw_payments.amount`
 ```
 
 ## First Findings
 
-A build ends with up to four findings, each one line that says what was found and the command that shows more, at most one of each kind:
+A build ends with up to six findings, each one line that says what was found and the command that shows more:
 
-- **conflict:** the most consequential pair of columns that the project's own terms say hold one number and that compute it in two ways (see [Finding Conflicting Definitions](guide/conflicts.md)). Both columns are bound to the term in `definitions.yml` (or a vocabulary), or one is bound to it and the other, bound to no term of its own, is named like the term or one of its synonyms. A pair that only a name links is never one: in public projects such pairs are rarely two definitions of one number, and most differ on purpose, by grain or segment; `konstruct conflicts` lists them. Once `konstruct verify --conflicts` has run the pair on the data, the line says how the two differ there, by the key both share, and gives the `verify --why` command for the row that differs most (see [Conflicts on the Data](guide/verify.md#conflicts-on-the-data)).
+- **conflict:** up to three pairs of columns that the project's own terms say hold one number and that compute it in two ways, the most consequential first, each with a sentence that explains the difference (see [Finding Conflicting Definitions](guide/conflicts.md)). Both columns are bound to the term in `definitions.yml` (or a vocabulary), or one is bound to it and the other, bound to no term of its own, is named like the term or one of its synonyms and is a likely measure conflict with it (`confident` in `konstruct conflicts --json`): a roll-up, a running total, a subset or a count named for a synonym is not one. A pair that only a name links is never one: in public projects such pairs are rarely two definitions of one number, and most differ on purpose, by grain or segment; `konstruct conflicts` lists them. Once `konstruct verify --conflicts` has run the pair on the data, the line says how the two differ there, by the key both share, and gives the `verify --why` command for the row that differs most (see [Conflicts on the Data](guide/verify.md#conflicts-on-the-data)).
 - **definition:** an approved term in `definitions.yml` that names a column no model or table builds any more, or a column `konstruct.lock` pins that changed since it was locked. There is none when a dbt project was found but not read (it is not trusted, or `--no-dbt` was given and it has no manifest), as the graph then lacks its models.
 - **claim:** what the last `konstruct verify` found the lineage or the ontology claims wrongly (an influence the lineage does not record, a key that repeats, a relationship with values its key lacks), or, where a warehouse the build read holds the models and verify has not run, that the lineage is unchecked. Seeds alone are not enough for `konstruct verify`, which reruns each model on its own inputs; run `dbt build` first.
 - **reach:** the project's own column whose change reaches the most exposures and dashboards, and then the most of the project's own columns. Models of installed dbt packages, such as elementary or dbt_project_evaluator, are left out.
 
-The findings read only the graph and what earlier `verify` runs wrote beside it, never the warehouse, so a project with no `definitions.yml` and no warehouse still gets the reach. `--json` lists them under `findings`, and `Project.findings()` returns them.
+Each kind but `conflict` gives at most one finding. A finding that cannot be made, such as one from a `verify.json` or `conflict_data.json` this Konstruct cannot read, is left out with a note under the findings; it never fails the build.
+
+The findings read only the graph and what earlier `verify` runs wrote beside it, never the warehouse, so a project with no `definitions.yml` and no warehouse still gets the reach. The explanation of a conflict comes from the SQL alone; how the two differ on the data is added once `verify --conflicts` can run them, on the warehouse or on the seeds. `--json` lists them under `findings`, and `Project.findings()` returns them.
 
 ```text
 $ konstruct verify --conflicts

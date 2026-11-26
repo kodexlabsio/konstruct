@@ -32,7 +32,7 @@ and a `graph.json` written by a newer Konstruct raises {class}`konstruct.FormatE
 | `konstruct.inputs` | `dbt`, `dbt_commit` (a dbt manifest as a commit's files are), `jinja`, `airflow`, `dagster`, `spark`, `looker`, `powerbi`, `loaders`, `ingestion`, `hcl`, `warehouse`, `usage` |
 | `konstruct.engine` | `build`, `config`, `worker`, `snapshot` (a commit's files, and the user's private cache) |
 | `konstruct.semantics` | `definitions`, `vocabulary`, `ontology`, `world`, `world_facts` (the world as facts to compare), `ossie`, `rows` (whether a composed formula counts its column's rows), `registry` |
-| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `conflict_data`, `seedfiles`, `findings`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
+| `konstruct.analysis` | `query`, `semantic`, `explain`, `english`, `conflicts`, `diff`, `gate`, `verify`, `integrity`, `mutation`, `why`, `conflict_data`, `seedfiles`, `measures`, `findings`, `release_notes`, `effect`, `timeline`, `laws`, `history`, `receipts`, `lock`, `contract`, `sensitivity`, `erasure` |
 | `konstruct.outputs` | `report`, `html`, `export`, `compiled` (the ontology as tables, relationships and metrics for the platform exports), `owl`, `semantic_view`, `metric_view`, `odcs` |
 | `konstruct.interfaces` | `cli`, `project`, `mcp_server`, `skill`, `console`, `status` |
 | `konstruct.plugins` | `api` (the plugin API: protocols and types), `registry` (finding, enabling and loading plugins) |

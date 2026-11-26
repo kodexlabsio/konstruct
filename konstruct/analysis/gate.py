@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from konstruct.analysis import sensitivity
-from konstruct.analysis.conflicts import Conflicts, find_conflicts
+from konstruct.analysis.conflicts import MEASURE, Conflicts, find_conflicts
 from konstruct.analysis.diff import Diff, RelationChange
 from konstruct.core.graph import Graph, column_id
 from konstruct.plugins.api import API_VERSION, CheckContext, Finding, finding_problem, one_line
@@ -167,6 +167,7 @@ def gate(
     laws_from: str | None = None,
     root: Path | None = None,
     conform: dict[str, Any] | None = None,
+    measure_conflicts_only: bool = False,
 ) -> Gate:
     """The gate for ``diff``, given the graph at the head: every check that ``plugins`` (default:
     Konstruct's own checks) runs. A plugin's check that raises, returns something other than
@@ -178,7 +179,9 @@ def gate(
     that Konstruct's own checks report, at a cost that grows with the change rather than with the
     square of the columns that share a name. ``laws`` are the data laws as confirmed before the
     change, from ``laws.json``, and ``laws_from`` says where they came from. ``root`` is the
-    project's, and ``conform`` the ``conform.json`` recorded before the change."""
+    project's, and ``conform`` the ``conform.json`` recorded before the change. With
+    ``measure_conflicts_only``, the checks see only the measure conflicts, not the pairs that share
+    only a name or are one measure at another grain."""
     from konstruct.plugins.registry import Plugins
 
     registry = plugins or Plugins.builtin()
@@ -186,6 +189,8 @@ def gate(
     if conflicts is None:
         touching = None if any(not p.builtin for p in checks) else set(_changed_columns(graph, diff))
         conflicts = find_conflicts(graph, touching=touching)
+    if measure_conflicts_only:
+        conflicts = replace(conflicts, conflicts=conflicts.measures)
     result = Gate(base=diff.shown_base, changed=len(diff.source_files), laws_from=laws_from)
     context = CheckContext(graph=graph, diff=diff, conflicts=conflicts, laws=laws, root=root, conform=conform)
     for plugin in checks:
@@ -337,6 +342,13 @@ def _conflicting_definition(context: CheckContext) -> list[Finding]:
                 continue
             seen.add((side.column, other.column))
             differences = '; '.join(f'{d.kind} {d.detail}' for d in conflict.differences[:2])
+            if conflict.kind != MEASURE:
+                # Kept, so the gate fails as it did; said, so a reader knows what kind of pair it is.
+                differences += (
+                    '; they share only a name'
+                    if conflict.kind == 'name'
+                    else '; one measure at another grain'
+                )
             mine, theirs = _name(graph, side.column, side.label), _name(graph, other.column, other.label)
             found.append(
                 Finding(

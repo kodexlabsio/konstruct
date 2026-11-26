@@ -28,6 +28,7 @@ from konstruct.interfaces.layout import (
     pad,
     pairs,
     paragraph,
+    printable,
     section,
     sql,
     table,
@@ -1277,18 +1278,18 @@ def conflicts_lines(result: Conflicts, style: Style) -> Lines:
     from konstruct.analysis.conflicts import _reach_text
     from konstruct.analysis.explain import split_condition
 
-    lines = _summary(style, Text((result.summary(), 'ok' if not result.conflicts else '')))
-    current = None
-    for conflict in result.conflicts:
-        if conflict.idea != current:
-            current = conflict.idea
-            lines += [blank(), section(conflict.idea)]
-        else:
-            lines.append(blank())
+    lines = _summary(style, Text((result.overview(), 'ok' if not result.confident else '')))
+    for conflict in result.shown():
+        # Pairs come most likely first, so the ideas interleave: each pair is headed by its own.
+        lines += [blank(), section(printable(conflict.title or conflict.idea))]
         pair = Text('  ', (conflict.a.label, 'strong'), ('  vs  ', 'dim'), (conflict.b.label, 'strong'))
         lines += wrap(style, pair, hanging=4)
         why = f'Compared because they {conflict.reason}; downstream weight {conflict.score}.'
         lines += paragraph(style, Text((why, 'dim')), indent=4)
+        if conflict.kind == 'name':
+            lines += paragraph(style, Text(('They read no source column in common.', 'warn')), indent=4)
+        else:
+            lines += paragraph(style, Text(f'{conflict.explanation()}.'), indent=4)
         for side, name in ((conflict.a, 'a'), (conflict.b, 'b')):
             formula_text = side.composed or side.expression
             lead = Text('    ', (name, 'accent'), '  ', side.label, (' = ', 'dim'))
@@ -1324,27 +1325,28 @@ def conflict_data_lines(result: ConflictsOnData, style: Style) -> Lines:
     for pair in result.pairs:
         if pair.idea != current:
             current = pair.idea
-            lines += [blank(), section(pair.idea)]
+            lines += [blank(), section(printable(pair.idea))]
         else:
             lines.append(blank())
         lines += wrap(style, Text('  ', (pair.a, 'strong'), ('  vs  ', 'dim'), (pair.b, 'strong')), hanging=4)
         role = 'dim' if pair.skipped else 'ok' if pair.agrees else 'warn'
-        lines += paragraph(style, Text((pair.summary(), role)), indent=4)
+        lines += paragraph(style, Text((printable(pair.summary()), role)), indent=4)
         for difference in pair.differences:
-            lines += wrap(style, Text(('- ' + difference, 'dim')), indent=4, hanging=6)
+            lines += wrap(style, Text(('- ' + printable(difference), 'dim')), indent=4, hanging=6)
         if pair.examples and pair.key is not None:
             rows: list[list[Cell]] = [
                 [
-                    show_value(e.key),
-                    show_value(e.a) if e.in_a else Text(('no row', 'dim')),
-                    show_value(e.b) if e.in_b else Text(('no row', 'dim')),
+                    printable(show_value(e.key)),
+                    printable(show_value(e.a)) if e.in_a else Text(('no row', 'dim')),
+                    printable(show_value(e.b)) if e.in_b else Text(('no row', 'dim')),
                 ]
                 for e in pair.examples
             ]
-            lines += table(style, rows, indent=4, right=[1, 2], headers=[pair.key, pair.a, pair.b], cap=None)
+            headers = [printable(pair.key), pair.a, pair.b]
+            lines += table(style, rows, indent=4, right=[1, 2], headers=headers, cap=None)
         command_text = pair.next_command()
         if command_text:
-            lines.append(Text('    ', ('next  ', 'dim'), (command_text, 'accent')))
+            lines.append(Text('    ', ('next  ', 'dim'), (printable(command_text), 'accent')))
     if result.pairs:
         lines.append(blank())
         if result.sampled:
@@ -1843,15 +1845,17 @@ def build_lines(
     if len(warnings) > 5:
         lines.append(Text(' ' * (width + 4), (f'and {len(warnings) - 5} more in {report}', 'dim')))
     lines += pairs(style, [('wrote', wrote)], width=width)
-    if findings is not None and findings.findings:
+    if findings is not None and (findings.findings or findings.notes):
         lines += [blank(), *findings_lines(findings, style)]
     return lines
 
 
 def findings_lines(result: TopFindings, style: Style) -> Lines:
     """The findings a build ends with, each one line with the command that shows more."""
-    if not result.findings:
+    if not result.findings and not result.notes:
         return []
     lines = [section('Findings')]
-    lines += pairs(style, [(f.kind, _commands(f.line())) for f in result.findings])
+    lines += pairs(style, [(f.kind, _commands(printable(f.line()))) for f in result.findings])
+    for note in result.notes:
+        lines += paragraph(style, Text((printable(note), 'dim')), indent=2)
     return lines
