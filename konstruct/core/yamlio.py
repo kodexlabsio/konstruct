@@ -6,7 +6,6 @@ classes, which callers catch, and for the writers that emit YAML; it reads nothi
 
 from __future__ import annotations
 
-import codecs
 import sys
 from pathlib import Path
 from typing import Any, NoReturn
@@ -102,27 +101,19 @@ def load_all(text: str | bytes, loader: type | None = None, *, lines: bool = Fal
 
 def _raise(failure: _core.YamlFailure, source: str | bytes) -> NoReturn:
     """The PyYAML exception that describes ``failure``: the class of the stage that refused the
-    text, so a reader that caught one still does, with the marks and the problem it carried."""
+    text, so a reader that caught one still does, with the marks and the problem it carried.
+
+    A mark gives the line and the column but not the text it points into, so the message has no
+    snippet of the file, as PyYAML's would: problems are written to REPORT.md, the ``--json``
+    output and pull request comments, and the line at fault can hold a password."""
     stage, context, context_mark, problem, problem_mark = failure.args
-    # A mark gets the text it points into, as PyYAML's do, so that a message shows the line.
-    # What the reader refused is a byte or a character it could not use, and has none.
-    buffer = None if stage == 'reader' else _decode(source) + '\0'
     name = '<byte string>' if isinstance(source, bytes) else '<unicode string>'
 
     def mark(place: tuple[int, int, int] | None) -> Mark | None:
         if place is None:
             return None
         index, line, column = place
-        return Mark(name, index, line, column, buffer, 0 if buffer is None else index)
+        return Mark(name, index, line, column, None, 0)
 
     error = _ERRORS.get(stage, yaml.MarkedYAMLError)
     raise error(context, mark(context_mark), problem, mark(problem_mark)) from None
-
-
-def _decode(source: str | bytes) -> str:
-    """The characters PyYAML's reader indexes: the text of ``source`` as it decodes, with a byte
-    order mark kept as a character."""
-    if isinstance(source, str):
-        return source
-    codec = {codecs.BOM_UTF16_LE: 'utf-16-le', codecs.BOM_UTF16_BE: 'utf-16-be'}.get(source[:2], 'utf-8')
-    return source.decode(codec, 'replace')
