@@ -178,7 +178,7 @@ def test_sixteen_times_the_text_takes_about_sixteen_times_as_long(name: str, lin
     # rather than noise, whatever the case and the machine; and the sizes are read in turn, so
     # that all see the same machine.
     megabytes = 1
-    while megabytes < 4 and min(once(sized(make, megabytes)) for _ in range(3)) < 0.02:
+    while megabytes < 8 and min(once(sized(make, megabytes)) for _ in range(3)) < 0.02:
         megabytes *= 2
     small, large = sized(make, megabytes), sized(make, 16 * megabytes)
     readings = [(once(small), once(large)) for _ in range(3)]
