@@ -162,7 +162,7 @@ GROWING: dict[str, Callable[[int], str]] = {
 
 @pytest.mark.parametrize('name', GROWING)
 @pytest.mark.parametrize('lines', [False, True])
-def test_four_times_the_text_takes_about_four_times_as_long(name: str, lines: bool) -> None:
+def test_sixteen_times_the_text_takes_about_sixteen_times_as_long(name: str, lines: bool) -> None:
     make = GROWING[name]
     read = _core.yaml_load_all if name == 'documents' else _core.yaml_load
 
@@ -174,18 +174,19 @@ def test_four_times_the_text_takes_about_four_times_as_long(name: str, lines: bo
             read(text, lines=lines)
         return time.process_time() - began
 
-    # The smaller text is made large enough to take 20 ms, so that its reading is a measurement
+    # The smallest text is made large enough to take 20 ms, so that its reading is a measurement
     # rather than noise, whatever the case and the machine; and the sizes are read in turn, so
-    # that both see the same machine.
+    # that all see the same machine.
     megabytes = 1
-    while megabytes < 64 and min(once(sized(make, megabytes)) for _ in range(3)) < 0.02:
+    while megabytes < 4 and min(once(sized(make, megabytes)) for _ in range(3)) < 0.02:
         megabytes *= 2
-    small, large = sized(make, megabytes), sized(make, 4 * megabytes)
-    readings = [(once(small), once(large)) for _ in range(5)]
-    first, second = min(r[0] for r in readings), min(r[1] for r in readings)
-    assert first >= 0.01, (name, megabytes, first)
-    # Linear is 4; quadratic is 16.
-    assert second < 10 * first, (name, megabytes, first, second)
+    small, large = sized(make, megabytes), sized(make, 16 * megabytes)
+    readings = [(once(small), once(large)) for _ in range(3)]
+    first, third = min(r[0] for r in readings), min(r[1] for r in readings)
+    assert first >= 0.005, (name, megabytes, first)
+    # Across sixteen times the text, linear is 16 and quadratic 256: the bound sits between them,
+    # far enough from both that a busy runner's noise moves neither across it.
+    assert third < 64 * first, (name, megabytes, first, third)
 
 
 def test_a_merge_chain_is_flattened_once_for_every_mapping_that_merges_it() -> None:
