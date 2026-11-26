@@ -17,11 +17,11 @@ from pathlib import Path
 import atheris
 
 with atheris.instrument_imports(include=['konstruct']):
-    from konstruct._core import data_file_columns
+    from konstruct._core import TrackedFiles, data_file_columns
 
 ROOT = Path(tempfile.mkdtemp(prefix='konstruct-fuzz-datafile-'))
 MOST_COLUMNS = 100_000
-TRACKED = {'x.parquet', 'x.csv', 'x.tsv'}
+TRACKED = TrackedFiles(['x.csv', 'x.parquet', 'x.tsv'])
 # A footer is a Thrift struct, so a mutating fuzzer takes long to reach one that parses: one that
 # does is the seed, and the cases it could not build are read once at start (a map of 2^62
 # booleans, a collection larger than the bytes left).
