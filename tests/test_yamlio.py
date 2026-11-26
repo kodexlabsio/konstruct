@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -133,7 +134,7 @@ def test_a_problem_keeps_the_line_of_its_value() -> None:
     # Python 3.14 adds the value to the message: "month must be in 1..12, not 13".
     (error,) = errors
     assert error.startswith(
-        "definitions.yml:4: not valid YAML: '2026-13-01' is not a valid timestamp: month must be in 1..12"
+        'definitions.yml:4: not valid YAML: the value is not a valid timestamp: month must be in 1..12'
     )
 
 
@@ -183,6 +184,66 @@ def test_the_build_goes_on_past_definitions_it_cannot_read(tmp_path: Path) -> No
     warnings = build(load_config(tmp_path)).graph.warnings
     assert any(w.startswith('definitions: definitions.yml:3: not valid YAML: ') for w in warnings)
     assert any(w.startswith('ossie: model.ossie.yaml: not valid YAML: ') for w in warnings)
+
+
+# Each file fails on the line of its secret, which PyYAML's message would quote under the place.
+LEAKS = {
+    'meltano.yml': 'plugins:\n  extractors:\n  - name: tap-x\n    config:\n      password: hunter2\n'
+    '      env: SF_PASSWORD=hunter2: x\n',
+    'a/meltano.yml': 'plugins:\n  extractors:\n  - api_key: konstruct-test-api-key-9f2c: x\n',
+    'b/meltano.yml': 'plugins:\n  loaders:\n  - token: konstruct-test-token-7d1e: x\n',
+    'c/meltano.yml': 'plugins:\n  loaders:\n  - url: postgres://u:secret@h/db: x\n',
+    # A value its tag cannot make, which the problem would repeat, as int() does.
+    'd/meltano.yml': 'plugins:\n  extractors:\n  - password: !!int hunter2\n',
+    'definitions.yml': 'terms:\n  - name: X\n    definition: !!bool hunter2\n',
+    # sqlglot's tokenizer quotes the text around an unclosed string, and its parser logs a
+    # statement it reads as a command.
+    'models/a.sql': "select 1 as a\nfrom t\nwhere password = 'hunter2\n",
+    'models/b.sql': "create table x as select 1 where password='hunter2' + + * from\n",
+    # A Terraform object key that is a string, which the HCL reader named.
+    'main.tf': 'resource "fivetran_connector" "pg" {\n  config = { b = 1, "hunter2" }\n}\n',
+}
+SECRETS = (
+    'hunter2',
+    'konstruct-test-api-key-9f2c',
+    'konstruct-test-token-7d1e',
+    'u:secret',
+)
+
+
+def test_a_problem_does_not_quote_the_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Warnings are committed in REPORT.md and posted in pull request comments, and what is logged
+    goes to stderr, which CI keeps in its logs, so a problem gives the file, the line and the column
+    and never the text, which can hold a secret."""
+    from konstruct.interfaces.cli import main
+
+    for name, text in LEAKS.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    with caplog.at_level(logging.WARNING):
+        assert main(['build', '-C', str(tmp_path), '--json']) == 0
+    out, err = capsys.readouterr()
+    warnings = json.loads(out)['warnings']
+    assert len([w for w in warnings if 'meltano.yml' in w]) == 5, warnings
+    assert 'meltano: c/meltano.yml: cannot read YAML: mapping values are not allowed here\n' in '\n'.join(
+        warnings
+    )
+    assert any(
+        w.startswith('definitions: definitions.yml:3: not valid YAML: the value is not') for w in warnings
+    )
+    assert 'sql models/a.sql: Error tokenizing the SQL near line 3' in warnings
+    assert any(w.startswith('terraform: main.tf:2: cannot read Terraform: ') for w in warnings), warnings
+    report = (tmp_path / 'konstruct-out' / 'REPORT.md').read_text()
+    graph = (tmp_path / 'konstruct-out' / 'graph.json').read_text()
+    shown = {'warnings': '\n'.join(warnings), '--json': out, 'stderr': err + caplog.text, 'REPORT.md': report}
+    for secret in SECRETS:
+        for where, text in shown.items():
+            assert secret not in text, (secret, where)
+    # graph.json holds each model's SQL, so only its warnings are checked.
+    for warning in json.loads(graph)['warnings']:
+        assert not any(secret in warning for secret in SECRETS), warning
 
 
 @pytest.mark.parametrize('text', CASES, ids=IDS)

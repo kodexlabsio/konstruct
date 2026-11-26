@@ -455,21 +455,18 @@ impl<'a, 't, 'py> Builder<'a, 't, 'py> {
     }
 
     /// A value PyYAML's constructor could not make from the text: what PyYAML raised, besides
-    /// its own errors, is reported as a problem at the node.
+    /// its own errors, is reported as a problem at the node. The problem names the value's place
+    /// and kind but never its text: problems reach reports and pull request comments, and the
+    /// value can be a password.
     fn unreadable<T>(&self, node: &Node<'_>, error: Unread) -> Result<T, Error> {
         let kind = node.tag.short();
         let problem = match &node.body {
-            Body::Scalar(text) => {
-                let shown = if text.chars().count() <= 40 {
-                    text.to_string()
-                } else {
-                    format!("{}...", text.chars().take(40).collect::<String>())
-                };
+            Body::Scalar(_) => {
                 let detail = match error {
                     Unread::Value(message) if !message.is_empty() => format!(": {message}"),
                     _ => String::new(),
                 };
-                format!("{} is not a valid {kind}{detail}", repr(&shown))
+                format!("the value is not a valid {kind}{detail}")
             }
             _ => format!("cannot read this {kind}"),
         };
@@ -529,9 +526,10 @@ impl<'a, 't, 'py> Builder<'a, 't, 'py> {
         if plain && let Ok(value) = u64::from_str_radix(text, base) {
             return Ok(PyInt::new(py, value).into_any());
         }
+        // Python's message would repeat the text, which a problem never quotes.
         py.get_type::<PyInt>()
             .call1((text, base))
-            .map_err(|error| unread(py, &error))
+            .map_err(|_| Unread::Other)
     }
 
     fn sexagesimal_int(&self, text: &str) -> Result<Bound<'py, PyAny>, Unread> {
@@ -576,7 +574,7 @@ impl<'a, 't, 'py> Builder<'a, 't, 'py> {
         }
         if digits.contains(':') {
             let mut total = PyFloat::new(py, 0.0).into_any();
-            // Every part is read first, from the left, so that the first bad one is named.
+            // Every part is read first, so that a bad one is refused before any is added.
             let mut parts = digits
                 .split(':')
                 .map(|part| self.parse_float(part))
@@ -616,7 +614,7 @@ impl<'a, 't, 'py> Builder<'a, 't, 'py> {
         }
         py.get_type::<PyFloat>()
             .call1((text,))
-            .map_err(|error| unread(py, &error))
+            .map_err(|_| Unread::Other)
     }
 
     /// PyYAML's `construct_yaml_timestamp`.
@@ -1061,8 +1059,9 @@ impl<'a, 't, 'py> Builder<'a, 't, 'py> {
     }
 }
 
-/// Why a scalar's text is not a value of its tag: Python's `ValueError`, whose message a problem
-/// repeats, or another error, which it does not.
+/// Why a scalar's text is not a value of its tag: Python's `ValueError` from a date or a time,
+/// whose message (a field out of its range) a problem repeats, or another error, which it does
+/// not. `int()` and `float()` refuse with `Other`, as their messages repeat the text.
 enum Unread {
     Value(String),
     Other,

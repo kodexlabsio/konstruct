@@ -275,9 +275,16 @@ def test_the_non_specific_tag_gives_a_quoted_yaml_indicator_no_value() -> None:
     assert yamlio.load('a: ! "**"') == {'a': '**'}
 
 
-def test_a_float_in_base_60_names_its_first_bad_part() -> None:
-    with pytest.raises(yaml.constructor.ConstructorError, match="could not convert string to float: 'x'"):
-        yamlio.load('a: !!float 1:x:y')
+def test_a_value_its_tag_cannot_make_is_refused_without_its_text() -> None:
+    """Python's int() and float() repeat the text they refuse, which a problem never quotes."""
+    for text in ('a: !!float 1:x:y', 'a: !!int hunter2', 'a: !!float hunter2'):
+        with pytest.raises(yaml.constructor.ConstructorError) as raised:
+            yamlio.load(text)
+        assert raised.value.problem is not None and raised.value.problem.startswith(
+            'the value is not a valid '
+        )
+        assert "'x'" not in str(raised.value) and 'hunter2' not in str(raised.value)
+        assert raised.value.problem_mark is not None and raised.value.problem_mark.column == 3
 
 
 def test_a_uri_escape_that_is_not_utf8_says_what_python_says() -> None:

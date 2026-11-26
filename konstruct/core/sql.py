@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime
 import functools
+import logging
 import posixpath
 import re
 from collections import Counter, defaultdict
@@ -19,7 +20,7 @@ from typing import Any, Literal, NamedTuple, TypeVar
 import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect, DialectType, NormalizationStrategy
-from sqlglot.errors import OptimizeError, SqlglotError
+from sqlglot.errors import OptimizeError, SqlglotError, TokenError
 from sqlglot.lineage import Node as LineageNode
 from sqlglot.lineage import lineage, to_node
 from sqlglot.optimizer.qualify import qualify
@@ -38,6 +39,11 @@ PARSE_ERRORS: tuple[type[Exception], ...] = (
     AttributeError,
     RecursionError,
 )
+
+# sqlglot's warnings quote the SQL they are about (a statement it reads as a command, an
+# expression it cannot type), and the CLI writes warnings to stderr, which CI keeps in its logs: a
+# model's SQL can hold a password. Its errors, which Konstruct reports, are raised, not logged.
+logging.getLogger('sqlglot').setLevel(logging.ERROR)
 
 Transform = Literal['direct', 'transformed']
 
@@ -527,7 +533,7 @@ def analyse(
     try:
         statements = [s for s in sqlglot.parse(sql, dialect=resolved) if s is not None]
     except PARSE_ERRORS as error:
-        return [StatementLineage(kind='unparsed', target=target, errors=[_first_line(error)])]
+        return [StatementLineage(kind='unparsed', target=target, errors=[_first_line(error, sql)])]
 
     results: list[StatementLineage] = []
     for statement in statements:
@@ -560,7 +566,15 @@ def analyse(
     return results
 
 
-def _first_line(error: Exception) -> str:
+def _first_line(error: Exception, sql: str = '') -> str:
+    """The first line of an error's message, which is what a problem shows of it. sqlglot's
+    tokenizer quotes the hundred characters around where it stopped, which can hold a password
+    and would be written to REPORT.md, so its error gives the line of ``sql`` instead."""
+    if isinstance(error, TokenError):
+        if error.start is None or error.end is None or not sql:
+            return 'Error tokenizing the SQL'
+        line = sql.count('\n', 0, (error.start + error.end) // 2) + 1
+        return f'Error tokenizing the SQL near line {line}'
     text = str(error).strip()
     return text.splitlines()[0] if text else type(error).__name__
 

@@ -68,6 +68,15 @@ class _Token:
     start: int = 0
     end: int = 0
 
+    @property
+    def shown(self) -> str:
+        """The token as a problem names it: a string or a number by its kind alone, since a
+        variables file holds passwords and keys and a problem is written to REPORT.md, and any
+        other token as written."""
+        if self.kind in ('string', 'number'):
+            return f'a {self.kind}'
+        return 'the end' if self.kind == 'end' else repr(self.text)
+
 
 def _string(text: str, start: int, line: int) -> tuple[str, int]:
     """A quoted string from the character after its opening quote, with ``${...}`` kept as text
@@ -167,7 +176,7 @@ class _Parser:
     def expect(self, text: str) -> _Token:
         token = self.take()
         if token.text != text:
-            raise HclError(f'expected {text!r}, found {token.text or "the end"!r}', token.line)
+            raise HclError(f'expected {text!r}, found {token.shown}', token.line)
         return token
 
     def body(self, closing: str | None) -> tuple[dict[str, Any], list[Block]]:
@@ -182,7 +191,7 @@ class _Parser:
                     self.take()
                 return attrs, blocks
             if token.kind not in ('name', 'string'):
-                raise HclError(f'unexpected {token.text!r}', token.line)
+                raise HclError(f'unexpected {token.shown}', token.line)
             self.take()
             name = token.value if token.kind == 'string' else token.text
             following = self.peek()
@@ -282,7 +291,7 @@ class _Parser:
                 else:
                     break
             return Ref(self.source(start))
-        raise HclError(f'unexpected {token.text or "end of file"!r}', token.line)
+        raise HclError(f'unexpected {token.shown}', token.line)
 
     def group(self) -> None:
         """Skip a bracketed group (a call's arguments or an index)."""
@@ -316,7 +325,7 @@ class _Parser:
             if separator.text == ',':
                 self.take()
             elif separator.text != ']':
-                raise HclError(f'expected , or ] in a list, found {separator.text!r}', separator.line)
+                raise HclError(f'expected , or ] in a list, found {separator.shown}', separator.line)
 
     def mapping(self) -> Any:
         start = self.i
@@ -336,11 +345,11 @@ class _Parser:
             elif token.kind in ('name', 'number'):
                 key = token.text
             else:
-                raise HclError(f'unexpected {token.text!r} as an object key', token.line)
+                raise HclError(f'unexpected {token.shown} as an object key', token.line)
             self.take()
             separator = self.take()
             if separator.text not in ('=', ':'):
-                raise HclError(f'expected = after {key!r}', separator.line)
+                raise HclError(f'expected = after {token.shown}', separator.line)
             items[key] = self.expression(stop_at_newline=True)
             following = self.peek()
             if following.text == ',':
