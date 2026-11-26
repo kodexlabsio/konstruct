@@ -437,17 +437,17 @@ def _consumer_pin_changed(context: CheckContext) -> list[Finding]:
             )
         # A pin written in another canonical form whose difference was set aside as maybe the
         # form's is still a pinned column the change alters.
-        for column in result.reprinted:
-            if reworded and not _pinned_in(graph, column, altered):
+        for pin in result.reprinted:
+            if reworded and not _pinned_in(graph, pin.column, altered):
                 continue
             found.append(
                 Finding(
                     'consumer-pin-changed',
-                    f'{consumer} pins {column} in its {FILE_NAME}, and the change alters it; the lockfile '
-                    f'was written with canonical form {result.canonical}, which this Konstruct does not '
-                    'write, so how the pin changed cannot be told apart from the change of form',
-                    None,
-                    f'Keep what {column} means, or agree the change with {consumer}, who re-lock after '
+                    f'{consumer} pins {pin.column} in its {FILE_NAME}, and the change alters it; the '
+                    f'lockfile was written with canonical form {result.canonical}, which this Konstruct '
+                    'does not write, so how the pin changed cannot be told apart from the change of form',
+                    pin.path,
+                    f'Keep what {pin.column} means, or agree the change with {consumer}, who re-lock after '
                     'review with `konstruct lock --update`.',
                 )
             )

@@ -1818,6 +1818,8 @@ def test_the_gate_names_a_pin_a_change_alters_under_another_canonical_form(tmp_p
         'with canonical form konstruct-0/sqlglot-1.0, which this Konstruct does not write, so how the pin '
         'changed cannot be told apart from the change of form'
     )
+    # Where to look, as every other consumer-pin-changed finding says: the file that builds the pin.
+    assert finding.path == 'ltv.sql'
     assert finding.fix.endswith('who re-lock after review with `konstruct lock --update`.')
 
 
