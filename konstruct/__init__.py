@@ -9,7 +9,7 @@ The main entry point is `Project`::
     print(project.impact("orders.amount"))
 """
 
-__version__ = '0.13.25'
+__version__ = '0.13.26'
 
 from typing import TYPE_CHECKING, Any
 
