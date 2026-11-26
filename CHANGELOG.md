@@ -1,3 +1,11 @@
+## v0.13.26 (2026-11-26)
+
+### Fix
+
+- **query**: Read unqualified names in the schema of the dbt project that holds them
+- **query**: Stop reporting columns check-sql cannot see as unknown
+- **query**: Check measures, units and joins in check-sql only as far as the SQL shows
+
 ## v0.13.25 (2026-11-20)
 
 ### Feat
