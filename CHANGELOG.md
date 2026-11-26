@@ -1,3 +1,20 @@
+## v0.13.28 (2026-11-26)
+
+### Feat
+
+- **sql**: Read the files a query reads by path as a relation of their own
+
+### Fix
+
+- **query**: Say which file builds a pin the gate cannot judge under another form
+- **sql**: Name the columns of two table functions apart
+- **sql**: Name a table function's column without a relation
+- **sql**: Quote each part of a name that needs quotes in formulas
+
+### Perf
+
+- **sql**: Quote a plain word without parsing it
+
 ## v0.13.27 (2026-11-26)
 
 ### Feat
