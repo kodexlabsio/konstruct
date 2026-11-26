@@ -1,0 +1,97 @@
+{
+ "format_version": 1,
+ "summary": "1 conflicting definition among 12 computed columns.",
+ "candidates": 12,
+ "groups": 2,
+ "conflicts": [
+  {
+   "idea": "Order amount",
+   "reason": "are bound to the business term 'Order amount'",
+   "score": 7,
+   "a": {
+    "column": "model.jaffle_shop.finance_orders#order_value",
+    "label": "finance_orders.order_value",
+    "relation_kind": "model",
+    "path": "models/finance_orders.sql",
+    "expression": "SUM(stg_payments.amount)",
+    "composed": "SUM(raw_payments.amount / 100)",
+    "sources": [
+     "raw_payments.amount"
+    ],
+    "filters": [
+     {
+      "relation": "finance_orders",
+      "condition": "WHERE: NOT stg_orders.status IN ('returned', 'return_pending')",
+      "path": "models/finance_orders.sql"
+     }
+    ],
+    "joins": [
+     {
+      "relation": "finance_orders",
+      "condition": "JOIN ON: stg_payments.order_id = stg_orders.order_id",
+      "path": "models/finance_orders.sql"
+     }
+    ],
+    "reach": {
+     "exposures": 0,
+     "tasks": 0,
+     "columns": 1,
+     "terms": 0
+    },
+    "terms": [],
+    "carried_into": [],
+    "weight": 1
+   },
+   "b": {
+    "column": "model.jaffle_shop.orders#amount",
+    "label": "orders.amount",
+    "relation_kind": "model",
+    "path": "models/orders.sql",
+    "expression": "SUM(stg_payments.amount)",
+    "composed": "SUM(raw_payments.amount / 100)",
+    "sources": [
+     "raw_payments.amount"
+    ],
+    "filters": [],
+    "joins": [
+     {
+      "relation": "orders",
+      "condition": "LEFT JOIN ON: stg_orders.order_id = stg_payments.order_id",
+      "path": "models/orders.sql"
+     }
+    ],
+    "reach": {
+     "exposures": 0,
+     "tasks": 0,
+     "columns": 1,
+     "terms": 1
+    },
+    "terms": [
+     "Order amount"
+    ],
+    "carried_into": [],
+    "weight": 6
+   },
+   "differences": [
+    {
+     "kind": "filter",
+     "detail": "WHERE: NOT stg_orders.status IN ('returned', 'return_pending')",
+     "side": "a",
+     "path": "models/finance_orders.sql"
+    },
+    {
+     "kind": "join",
+     "detail": "JOIN ON: stg_payments.order_id = stg_orders.order_id",
+     "side": "a",
+     "path": "models/finance_orders.sql"
+    },
+    {
+     "kind": "join",
+     "detail": "LEFT JOIN ON: stg_orders.order_id = stg_payments.order_id",
+     "side": "b",
+     "path": "models/orders.sql"
+    }
+   ]
+  }
+ ]
+}
