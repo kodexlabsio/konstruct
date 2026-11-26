@@ -1821,6 +1821,24 @@ def without_readings(text: str, dialect: DialectType = None) -> str:
     return tree.sql(dialect=dialect)
 
 
+_WORD = re.compile(r'[a-z_][a-z0-9_]*')
+
+
+@functools.cache
+def _meaningful_words(dialect: type[Dialect]) -> frozenset[str]:
+    """The lower-case words ``dialect`` reads as something other than a column: its keywords (the
+    literals ``true`` and ``null``, ``current_date`` and the other functions without brackets
+    among them), the functions it parses without brackets, and the words its printer quotes, and
+    ``while``, which sqlglot reads as the start of a loop wherever a statement can start."""
+    words = {
+        'while',
+        *dialect.tokenizer_class.KEYWORDS,
+        *dialect.parser_class.NO_PAREN_FUNCTION_PARSERS,
+        *dialect.generator_class.RESERVED_KEYWORDS,
+    }
+    return frozenset(w.lower() for w in words)
+
+
 @functools.lru_cache(maxsize=16384)
 def needs_quotes(part: str, dialect: DialectType) -> bool:
     """Whether ``part``, one part of a name in canonical text, is quoted there: where it has a
@@ -1830,8 +1848,13 @@ def needs_quotes(part: str, dialect: DialectType) -> bool:
     part must read back as itself there as well as after a relation."""
     if '#' in part:
         return True
+    resolved = Dialect.get_or_raise(dialect)
+    # A plain word reads back as itself unless the dialect gives it a meaning of its own, which
+    # spares parsing the commonest names, and the cache, which a large project's parts outgrow.
+    if _WORD.fullmatch(part) and part not in _meaningful_words(type(resolved)):
+        return False
     # The words the dialect's printer quotes itself, as a name may stand where only a name can.
-    if part.lower() in Dialect.get_or_raise(dialect).generator_class.RESERVED_KEYWORDS:
+    if part.lower() in resolved.generator_class.RESERVED_KEYWORDS:
         return True
     try:
         tree = sqlglot.parse_one(part, read=dialect)

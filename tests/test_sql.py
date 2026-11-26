@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
+import random
 import re
 import subprocess
 import sys
@@ -9,12 +11,17 @@ from typing import Any
 
 import duckdb
 import pytest
+import sqlglot
 from hypothesis import assume, example, given, settings
 from hypothesis import strategies as st
+from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
 
 from konstruct.analysis.identity import equivalent
 from konstruct.core.sql import (
+    DIALECTS,
     LINEAGE_FAILED,
+    PARSE_ERRORS,
     ColumnSource,
     StatementLineage,
     analyse,
@@ -23,6 +30,7 @@ from konstruct.core.sql import (
     file_relation,
     files_read,
     may_read_files,
+    needs_quotes,
     plain_read,
     relations_named,
     strip_templating,
@@ -1437,6 +1445,61 @@ def test_a_name_that_needs_quotes_is_quoted_in_canonical_text() -> None:
     ]
     bigquery = one('select o.price from `ds6-module-2.ingestion.orders` o', dialect='bigquery', schema={})
     assert bigquery.expressions == {'price': '`ds6-module-2`.ingestion.orders.price'}
+
+
+def _read_back(part: str, dialect: str | None) -> bool:
+    """Whether ``dialect`` reads ``part``, alone, as an unquoted column of that name and does not
+    reserve it: the rule :func:`needs_quotes` gives, parsed every time."""
+    if part.lower() in Dialect.get_or_raise(dialect).generator_class.RESERVED_KEYWORDS:
+        return False
+    try:
+        tree = sqlglot.parse_one(part, read=dialect)
+    except PARSE_ERRORS:
+        return False
+    return (
+        isinstance(tree, exp.Column)
+        and not tree.table
+        and isinstance(tree.this, exp.Identifier)
+        and not tree.this.quoted
+        and tree.name == part
+    )
+
+
+@functools.cache
+def _every_word() -> frozenset[str]:
+    """The words any dialect gives a meaning: its keywords, its functions (with brackets, without
+    them, or parsed specially), the words its printer quotes, and those that start a statement or
+    a property, in every dialect, as one dialect may read a word another does not know."""
+    found: set[str] = set()
+    for dialect in [None, *sorted(set(DIALECTS.values()))]:
+        resolved = Dialect.get_or_raise(dialect)
+        for table in (
+            resolved.tokenizer_class.KEYWORDS,
+            resolved.parser_class.FUNCTIONS,
+            resolved.parser_class.FUNCTION_PARSERS,
+            resolved.parser_class.NO_PAREN_FUNCTION_PARSERS,
+            resolved.parser_class.PROPERTY_PARSERS,
+            resolved.parser_class.STATEMENT_PARSERS,
+            resolved.generator_class.RESERVED_KEYWORDS,
+        ):
+            found.update(w.lower() for w in table if isinstance(w, str))
+    return frozenset(found)
+
+
+@pytest.mark.parametrize('dialect', [None, *sorted(set(DIALECTS.values()))])
+def test_a_plain_word_is_quoted_as_parsing_it_says(dialect: str | None) -> None:
+    """``needs_quotes`` answers a plain lower-case word without parsing it: every word any dialect
+    gives a meaning of its own (``while``, which starts a loop, among them) and others drawn at
+    random are quoted exactly where parsing each says."""
+    words = set(_every_word())
+    rng = random.Random(7)
+    words |= {
+        ''.join(rng.choice('abcdefghijklmnopqrstuvwxyz_0123456789') for _ in range(rng.randint(1, 8)))
+        for _ in range(500)
+    }
+    words |= {'amount', 'customer_id', 'range', 'date', 'value', 'user', 'level', 'rownum', 'sysdate'}
+    for word in sorted(w for w in words if re.fullmatch(r'[a-z_][a-z0-9_]*', w)):
+        assert needs_quotes(word, dialect) is not _read_back(word, dialect), (dialect, word)
 
 
 def test_conditions_quote_the_names_that_need_quotes() -> None:
