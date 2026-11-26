@@ -612,6 +612,15 @@ mod tests {
         let names: Vec<String> = (0..500_000)
             .map(|i| format!("d{:03}/f{i}.csv", i % 500))
             .collect();
+        // A pass over every name, timed in the same process, is the unit: an emulator or a debug
+        // build slows the search and the pass alike, so the bound holds wherever the test runs.
+        let started = std::time::Instant::now();
+        let folder = names
+            .iter()
+            .filter(|name| name.starts_with("d007/"))
+            .count();
+        let pass = started.elapsed();
+        assert_eq!(folder, 1000);
         let held = Tracked::new(names);
         assert_eq!(held.len(), 500_000);
         let started = std::time::Instant::now();
@@ -619,7 +628,13 @@ mod tests {
             assert_eq!(held.matching("d007/f7.csv"), ["d007/f7.csv"]);
             assert_eq!(held.matching("d007/f*.csv").len(), 1000);
         }
-        assert!(started.elapsed().as_secs() < 5, "{:?}", started.elapsed());
+        let searches = started.elapsed();
+        // 400 matches that each read every name take at least 400 passes; the search takes about
+        // 20 to 30.
+        assert!(
+            searches < pass * 200,
+            "{searches:?} for 400 matches, {pass:?} for one pass"
+        );
     }
 
     #[test]
