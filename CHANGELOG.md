@@ -1,3 +1,16 @@
+## v0.13.27 (2026-11-26)
+
+### Feat
+
+- **query**: Tell each conflicting pair's kind, and list the likely conflicts first
+- **build**: End the build with the findings worth acting on
+- **cli**: Run each conflicting pair on the data with verify --conflicts
+- **examples**: Give jaffle_shop a second order amount that leaves out returns
+
+### Fix
+
+- **warehouse**: Run only a query that reads on a DuckDB warehouse verify attaches
+
 ## v0.13.26 (2026-11-26)
 
 ### Fix
